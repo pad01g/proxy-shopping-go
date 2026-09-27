@@ -25,7 +25,7 @@ func TestLabConfigsParse(t *testing.T) {
 			continue
 		}
 		n++
-		if c.Role == RoleShopper && (c.Shopper.AcceptRulings != "always" || c.Shopper.Timelock.BTCT1Blocks != 100) {
+		if c.Role == RoleShopper && (c.Shopper.AcceptRulings != "always" || c.Shopper.Timelock.BTCT1Blocks != 100 || !c.Shopper.AllowPrivateShops) {
 			t.Errorf("%s: shopper section not read: %+v", f, c.Shopper)
 		}
 	}
@@ -56,6 +56,9 @@ func TestDefaultsAndValidation(t *testing.T) {
 		"role: shopper\nmnemonic_file: /k\nshopper: {bot_url: x, accept_rulings: sometimes}\n",
 		"role: relay\nmnemonic_file: /k\np2p: {reachability: maybe}\n",
 		"role: escrow\nmnemonic_file: /k\n",
+		// T1 too close to buy, and a payout reserve user clients refuse
+		"role: shopper\nmnemonic_file: /k\nshopper: {bot_url: x, timelock: {btc_t1_blocks: 100, btc_t2_blocks: 150, evm_t1_seconds: 3600, evm_t2_seconds: 7200}}\n",
+		"role: shopper\nmnemonic_file: /k\nshopper: {bot_url: x, payout_fee_reserve_sats: 20001}\n",
 	} {
 		if _, err := Parse([]byte(bad)); err == nil {
 			t.Errorf("accepted %q", bad)

@@ -8,66 +8,215 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
+	"net/netip"
+	"net/url"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
 )
 
+// Defaults of the pool.
+const (
+	DefaultIdleTimeout    = 5 * time.Minute
+	DefaultPublishTimeout = 15 * time.Second
+	connectTimeout        = 10 * time.Second
+)
+
+// ErrPrivateAddress is returned for relays on loopback, link-local or private addresses when they are not allowed.
+var ErrPrivateAddress = errors.New("relay address is loopback, link-local or private")
+
+// Options configure a pool.
+type Options struct {
+	TLS *tls.Config // nil: the system roots
+	Log *slog.Logger
+	// AllowPrivate permits relays on loopback, link-local, private and unique-local addresses (§4.10).
+	// The address is checked when the socket connects, so a name resolving elsewhere later does not get around it.
+	AllowPrivate bool
+	// IdleTimeout closes connections that had no subscription and no request for this long (default 5 minutes).
+	IdleTimeout time.Duration
+	// PublishTimeout bounds the wait for one relay's OK (default 15 seconds); the caller's context may end it sooner.
+	PublishTimeout time.Duration
+}
+
 // Pool is a set of relay connections sharing one TLS configuration.
 type Pool struct {
-	tls *tls.Config
-	log *slog.Logger
+	opts Options
+	log  *slog.Logger
+	hc   *http.Client
 
 	mu     sync.Mutex
-	relays map[string]*nostr.Relay
+	conns  map[string]*conn
+	dials  map[string]chan struct{} // dials in progress
+	closed bool
+	stop   chan struct{}
 }
 
-// NewPool returns an empty pool; tc may be nil for the system roots.
+// NewPool returns an empty pool that connects to any address (tools and tests); tc may be nil for the system
+// roots. Nodes use NewPoolWith and the configured private-address policy.
 func NewPool(tc *tls.Config, log *slog.Logger) *Pool {
-	if log == nil {
-		log = slog.Default()
-	}
-	return &Pool{tls: tc, log: log, relays: map[string]*nostr.Relay{}}
+	return NewPoolWith(Options{TLS: tc, Log: log, AllowPrivate: true})
 }
 
-// Relay returns a connected relay, dialing it if needed.
-func (p *Pool) Relay(ctx context.Context, url string) (*nostr.Relay, error) {
-	url = nostr.NormalizeURL(url)
-	p.mu.Lock()
-	r := p.relays[url]
-	p.mu.Unlock()
-	if r != nil && r.IsConnected() {
-		return r, nil
+// NewPoolWith returns an empty pool.
+func NewPoolWith(o Options) *Pool {
+	if o.Log == nil {
+		o.Log = slog.Default()
 	}
-	r = nostr.NewRelay(context.Background(), url)
-	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	if err := r.ConnectWithTLS(cctx, p.tls); err != nil {
-		return nil, fmt.Errorf("connect %s: %w", url, err)
+	if o.IdleTimeout <= 0 {
+		o.IdleTimeout = DefaultIdleTimeout
 	}
-	p.mu.Lock()
-	if old := p.relays[url]; old != nil && old != r && old.IsConnected() {
+	if o.PublishTimeout <= 0 {
+		o.PublishTimeout = DefaultPublishTimeout
+	}
+	d := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
+	if !o.AllowPrivate {
+		d.Control = refusePrivate
+	}
+	// no HTTP/2: the WebSocket upgrade needs HTTP/1.1
+	tr := &http.Transport{TLSClientConfig: o.TLS, DialContext: d.DialContext, Proxy: nil, TLSHandshakeTimeout: connectTimeout}
+	p := &Pool{
+		opts: o, log: o.Log, hc: &http.Client{Transport: tr},
+		conns: map[string]*conn{}, dials: map[string]chan struct{}{}, stop: make(chan struct{}),
+	}
+	go p.evictLoop()
+	return p
+}
+
+// refusePrivate is the dialer's Control hook: it sees the address actually connected to.
+func refusePrivate(_, address string, _ syscall.RawConn) error {
+	ap, err := netip.ParseAddrPort(address)
+	if err != nil {
+		return fmt.Errorf("%w: %s", ErrPrivateAddress, address)
+	}
+	if IsPrivateAddr(ap.Addr()) {
+		return fmt.Errorf("%w: %s", ErrPrivateAddress, address)
+	}
+	return nil
+}
+
+// IsPrivateAddr tells whether an address is loopback, link-local, private (RFC 1918, ULA), CGNAT or unspecified.
+func IsPrivateAddr(a netip.Addr) bool {
+	a = a.Unmap()
+	return a.IsLoopback() || a.IsPrivate() || a.IsLinkLocalUnicast() || a.IsLinkLocalMulticast() ||
+		a.IsInterfaceLocalMulticast() || a.IsUnspecified() || a.IsMulticast() || cgnat.Contains(a)
+}
+
+var cgnat = netip.MustParsePrefix("100.64.0.0/10")
+
+// relay returns a live connection, dialing it if needed. Concurrent callers for one URL share one dial, so a
+// connection is never closed while it is still being set up.
+func (p *Pool) relay(ctx context.Context, rawURL string) (*conn, error) {
+	u := nostr.NormalizeURL(rawURL)
+	if pu, err := url.Parse(u); err != nil || (pu.Scheme != "ws" && pu.Scheme != "wss") || pu.Host == "" {
+		return nil, fmt.Errorf("bad relay url %q", rawURL)
+	}
+	for {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, errors.New("pool closed")
+		}
+		if c := p.conns[u]; c != nil && c.alive() {
+			p.mu.Unlock()
+			return c, nil
+		}
+		if wait, dialing := p.dials[u]; dialing {
+			p.mu.Unlock()
+			select {
+			case <-wait:
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		done := make(chan struct{})
+		p.dials[u] = done
 		p.mu.Unlock()
-		_ = r.Close()
-		return old, nil
+
+		cctx, cancel := context.WithTimeout(ctx, connectTimeout)
+		c, err := dial(cctx, u, p.hc, p.log)
+		cancel()
+
+		p.mu.Lock()
+		delete(p.dials, u)
+		close(done)
+		if err == nil {
+			if p.closed {
+				p.mu.Unlock()
+				c.close(errors.New("pool closed"))
+				return nil, errors.New("pool closed")
+			}
+			p.conns[u] = c
+		}
+		p.mu.Unlock()
+		if err != nil {
+			return nil, fmt.Errorf("connect %s: %w", u, err)
+		}
+		return c, nil
 	}
-	p.relays[url] = r
-	p.mu.Unlock()
-	return r, nil
 }
 
 // Close closes all connections.
 func (p *Pool) Close() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, r := range p.relays {
-		_ = r.Close()
+	if p.closed {
+		p.mu.Unlock()
+		return
 	}
-	p.relays = map[string]*nostr.Relay{}
+	p.closed = true
+	close(p.stop)
+	conns := p.conns
+	p.conns = map[string]*conn{}
+	p.mu.Unlock()
+	for _, c := range conns {
+		c.close(errors.New("pool closed"))
+	}
 }
 
-// Publish sends an event to the relays concurrently and returns the relays that accepted it.
+// evictLoop closes connections that nobody used for the idle timeout (relays named once by a peer, say).
+func (p *Pool) evictLoop() {
+	t := time.NewTicker(max(p.opts.IdleTimeout/4, time.Second))
+	defer t.Stop()
+	for {
+		select {
+		case <-p.stop:
+			return
+		case <-t.C:
+		}
+		p.evictIdle(time.Now().Add(-p.opts.IdleTimeout))
+	}
+}
+
+func (p *Pool) evictIdle(before time.Time) int {
+	var idle []*conn
+	p.mu.Lock()
+	for u, c := range p.conns {
+		since := c.idleSince()
+		if !c.alive() || (!since.IsZero() && since.Before(before)) {
+			delete(p.conns, u)
+			idle = append(idle, c)
+		}
+	}
+	p.mu.Unlock()
+	for _, c := range idle {
+		c.close(errors.New("idle"))
+	}
+	return len(idle)
+}
+
+// Connections returns how many relay connections are open.
+func (p *Pool) Connections() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.conns)
+}
+
+// Publish sends an event to the relays concurrently and returns the relays that accepted it. Each relay gets at
+// most the pool's publish timeout, and ctx can end the wait sooner.
 func (p *Pool) Publish(ctx context.Context, urls []string, ev *nostr.Event) ([]string, error) {
 	type result struct {
 		url string
@@ -76,11 +225,11 @@ func (p *Pool) Publish(ctx context.Context, urls []string, ev *nostr.Event) ([]s
 	ch := make(chan result, len(urls))
 	for _, u := range urls {
 		go func(u string) {
-			pctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			pctx, cancel := context.WithTimeout(ctx, p.opts.PublishTimeout)
 			defer cancel()
-			r, err := p.Relay(pctx, u)
+			c, err := p.relay(pctx, u)
 			if err == nil {
-				err = r.Publish(pctx, *ev)
+				err = c.publish(pctx, ev)
 			}
 			ch <- result{u, err}
 		}(u)
@@ -110,12 +259,12 @@ func (p *Pool) Query(ctx context.Context, urls []string, filter nostr.Filter) []
 			defer wg.Done()
 			qctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 			defer cancel()
-			r, err := p.Relay(qctx, u)
+			c, err := p.relay(qctx, u)
 			if err != nil {
 				p.log.Debug("query: relay unavailable", "relay", u, "err", err)
 				return
 			}
-			evs, err := r.QuerySync(qctx, filter)
+			evs, err := c.query(qctx, filter)
 			if err != nil {
 				p.log.Debug("query failed", "relay", u, "err", err)
 			}
@@ -134,7 +283,10 @@ func (p *Pool) Query(ctx context.Context, urls []string, filter nostr.Filter) []
 }
 
 // Subscribe keeps a subscription open on every relay until ctx ends, reconnecting after failures.
-// After a reconnect only events of the last minutes before the drop are asked for again.
+//
+// A reconnect asks for the same filters again, without a since: gift wraps keep the created_at of their first
+// sending, so a message that reached the relay while we were away can be older than any since we could choose.
+// Stored events come again and the handler de-duplicates them by id; filters should carry a limit.
 func (p *Pool) Subscribe(ctx context.Context, urls []string, filters nostr.Filters, handle func(relay string, ev *nostr.Event)) {
 	for _, u := range urls {
 		go p.keepSubscribed(ctx, u, filters, handle)
@@ -143,23 +295,12 @@ func (p *Pool) Subscribe(ctx context.Context, urls []string, filters nostr.Filte
 
 func (p *Pool) keepSubscribed(ctx context.Context, url string, filters nostr.Filters, handle func(string, *nostr.Event)) {
 	backoff := time.Second
-	var since *nostr.Timestamp
 	for ctx.Err() == nil {
-		r, err := p.Relay(ctx, url)
-		if err != nil {
-			p.log.Debug("subscribe: relay unavailable", "relay", url, "err", err)
-			sleep(ctx, backoff)
-			backoff = min(backoff*2, 30*time.Second)
-			continue
+		c, err := p.relay(ctx, url)
+		var sub *subscription
+		if err == nil {
+			sub, err = c.subscribe(ctx, filters)
 		}
-		fs := make(nostr.Filters, len(filters))
-		for i, f := range filters {
-			fs[i] = f
-			if since != nil {
-				fs[i].Since = since
-			}
-		}
-		sub, err := r.Subscribe(ctx, fs)
 		if err != nil {
 			p.log.Debug("subscribe failed", "relay", url, "err", err)
 			sleep(ctx, backoff)
@@ -171,21 +312,16 @@ func (p *Pool) keepSubscribed(ctx context.Context, url string, filters nostr.Fil
 	loop:
 		for {
 			select {
-			case ev, ok := <-sub.Events:
-				if !ok {
-					break loop
-				}
+			case ev := <-sub.events:
 				handle(url, ev)
-			case <-sub.Context.Done():
+			case <-sub.done:
 				break loop
 			case <-ctx.Done():
-				sub.Unsub()
+				sub.unsub()
 				return
 			}
 		}
-		ts := nostr.Timestamp(time.Now().Add(-10 * time.Minute).Unix())
-		since = &ts
-		p.log.Debug("subscription ended, reconnecting", "relay", url)
+		p.log.Debug("subscription ended, reconnecting", "relay", url, "err", sub.err)
 		sleep(ctx, backoff)
 	}
 }

@@ -18,6 +18,7 @@ import (
 	"github.com/pad01g/proxy-shopping-go/node/internal/contract"
 	"github.com/pad01g/proxy-shopping-go/node/internal/delivery"
 	"github.com/pad01g/proxy-shopping-go/node/internal/evm"
+	"github.com/pad01g/proxy-shopping-go/node/internal/keys"
 	"github.com/pad01g/proxy-shopping-go/node/internal/node"
 	"github.com/pad01g/proxy-shopping-go/node/internal/proto"
 	"github.com/pad01g/proxy-shopping-go/node/internal/shopper"
@@ -64,6 +65,8 @@ func TestUSDCOrder(t *testing.T) {
   risk: {allowlist: [127.0.0.1], known_gateways: [cardgw.test], threshold: 70}
   timelock: {btc_t1_blocks: 20, btc_t2_blocks: 30, evm_t1_seconds: 3600, evm_t2_seconds: 7200}
   tracking_poll_seconds: 1
+  min_t1_remaining_seconds: 1800
+  allow_private_shops: true
 `, botURL), ""))
 	e.escrowAdmin = runNode(t, ctx, nodeYAML("escrow", "escrow-1", freePort(t), freePort(t), e.relays, chainYAML, ca, t.TempDir(), `escrow:
   upfront_fee: {bps: 50, min_sats: "1000", min_usdc: "0.50"}
@@ -78,13 +81,19 @@ func TestUSDCOrder(t *testing.T) {
 	ct, _ := delivery.Seal(k, nil, oid, delivery.Address{Name: "A", PostalCode: "1", Address: "x", Phone: "0"})
 	kShopper, _ := delivery.WrapKey(u.keys.NostrSecretHex(), e.shopper.NostrPubHex(), k)
 	kEscrow, _ := delivery.WrapKey(u.keys.NostrSecretHex(), e.escr.NostrPubHex(), k)
+	proof, err := keys.SignKeyProofEVM(u.keys.EVM, oid, u.keys.NostrPubHex())
+	if err != nil {
+		t.Fatal(err)
+	}
 	req := proto.OrderRequest{
 		ShopURL: e.shopURL, ShopRegion: "JP-13-13104", Items: []proto.Item{{SKU: "A-100", Qty: 1}}, Payment: proto.AssetUSDC,
 		Escrow: e.escr.NostrPubHex(), Operator: e.operator.NostrPubHex(), Coordinator: coordinatorPub,
-		Delivery:       proto.Delivery{Ciphertext: ct, KeyForShopper: kShopper, KeyForEscrow: kEscrow},
+		Delivery:       proto.Delivery{Ciphertext: ct, KeyForShopper: kShopper, KeyForEscrowSHA256: proto.EscrowKeyHash(kEscrow)},
+		KeyProof:       proof,
 		UserEVMAddress: u.keys.EVMAddress().Hex(), Relays: e.relays,
 	}
 	u.send(t, ctx, e.shopper.NostrPubHex(), oid, proto.TypeOrderRequest, req)
+	u.send(t, ctx, e.shopper.NostrPubHex(), oid, proto.TypeOrderEscrowKey, proto.EscrowKey{KeyForEscrow: kEscrow})
 	var q proto.OrderQuote
 	qm := u.wait(t, ctx, oid, proto.TypeOrderQuote, &q)
 	if !q.Accept {

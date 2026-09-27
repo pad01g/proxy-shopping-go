@@ -27,7 +27,11 @@ type Client struct {
 
 	mu        sync.Mutex
 	proxyCode map[common.Address][]byte
+	senders   map[common.Address]*sync.Mutex // serializes nonce assignment per sending account
 }
+
+// WaitTimeout bounds Wait when the context has no deadline of its own.
+var WaitTimeout = 3 * time.Minute
 
 // Dial connects to an RPC endpoint; hc may carry a custom TLS configuration.
 func Dial(ctx context.Context, url string, hc *http.Client) (*Client, error) {
@@ -39,7 +43,7 @@ func Dial(ctx context.Context, url string, hc *http.Client) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dial evm %s: %w", url, err)
 	}
-	c := &Client{Eth: ethclient.NewClient(rc), RPC: rc, proxyCode: map[common.Address][]byte{}}
+	c := &Client{Eth: ethclient.NewClient(rc), RPC: rc, proxyCode: map[common.Address][]byte{}, senders: map[common.Address]*sync.Mutex{}}
 	return c, nil
 }
 
@@ -124,6 +128,9 @@ func (c *Client) SafeNonce(ctx context.Context, safe common.Address) (*big.Int, 
 	return v[0].(*big.Int), nil
 }
 
+// ErrNoContract means there is no code at the address (yet).
+var ErrNoContract = errors.New("no contract")
+
 // SafeState is what the shopper checks before it buys.
 type SafeState struct {
 	Owners        []common.Address
@@ -145,7 +152,7 @@ func (c *Client) InspectSafe(ctx context.Context, safe, module common.Address) (
 		return nil, fmt.Errorf("code of %s: %w", safe, err)
 	}
 	if len(code) == 0 {
-		return nil, fmt.Errorf("no contract at %s", safe)
+		return nil, fmt.Errorf("%w at %s", ErrNoContract, safe)
 	}
 	st := &SafeState{}
 	v, err := c.Call(ctx, safe, SafeABI, "getOwners")
@@ -177,6 +184,22 @@ func (c *Client) LatestTime(ctx context.Context) (uint64, error) {
 	return h.Time, nil
 }
 
+// sender returns the lock of an account. Two goroutines sending from the same account would otherwise read
+// the same pending nonce, and one transaction would replace or reject the other.
+func (c *Client) sender(from common.Address) *sync.Mutex {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.senders == nil {
+		c.senders = map[common.Address]*sync.Mutex{}
+	}
+	mu := c.senders[from]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		c.senders[from] = mu
+	}
+	return mu
+}
+
 // Send signs and sends a contract call from key; it returns the hash without waiting.
 func (c *Client) Send(ctx context.Context, key *btcec.PrivateKey, to common.Address, data []byte, value *big.Int) (common.Hash, error) {
 	chainID, err := c.chainID(ctx)
@@ -184,6 +207,9 @@ func (c *Client) Send(ctx context.Context, key *btcec.PrivateKey, to common.Addr
 		return common.Hash{}, err
 	}
 	from := crypto.PubkeyToAddress(*key.PubKey().ToECDSA())
+	mu := c.sender(from)
+	mu.Lock()
+	defer mu.Unlock()
 	nonce, err := c.Eth.PendingNonceAt(ctx, from)
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("nonce of %s: %w", from, err)
@@ -222,8 +248,23 @@ func (c *Client) Send(ctx context.Context, key *btcec.PrivateKey, to common.Addr
 	return signed.Hash(), nil
 }
 
-// Wait waits for the receipt of a transaction and fails if it reverted.
+// Receipt returns the receipt of a mined transaction; the error wraps ethereum.NotFound while it is pending.
+func (c *Client) Receipt(ctx context.Context, hash common.Hash) (*types.Receipt, error) {
+	r, err := c.Eth.TransactionReceipt(ctx, hash)
+	if err != nil {
+		return nil, fmt.Errorf("receipt of %s: %w", hash, err)
+	}
+	return r, nil
+}
+
+// Wait waits for the receipt of a transaction and fails if it reverted. Without a deadline in ctx it gives up
+// after WaitTimeout; the transaction may still be mined later.
 func (c *Client) Wait(ctx context.Context, hash common.Hash) (*types.Receipt, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, WaitTimeout)
+		defer cancel()
+	}
 	for {
 		r, err := c.Eth.TransactionReceipt(ctx, hash)
 		if err == nil {
@@ -237,7 +278,7 @@ func (c *Client) Wait(ctx context.Context, hash common.Hash) (*types.Receipt, er
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, fmt.Errorf("waiting for %s: %w", hash, ctx.Err())
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
@@ -254,12 +295,26 @@ func (c *Client) SendAndWait(ctx context.Context, key *btcec.PrivateKey, to comm
 
 // ExecTransaction runs a SafeTx with the owners' signatures (any order; they are sorted here).
 func (c *Client) ExecTransaction(ctx context.Context, key *btcec.PrivateKey, safe common.Address, t SafeTx, sigs map[common.Address][]byte) (*types.Receipt, error) {
+	data, err := ExecTransactionCall(t, sigs)
+	if err != nil {
+		return nil, err
+	}
+	return c.SendAndWait(ctx, key, safe, data)
+}
+
+// ExecTransactionCall is the calldata of Safe.execTransaction for t with the owners' signatures.
+func ExecTransactionCall(t SafeTx, sigs map[common.Address][]byte) ([]byte, error) {
 	data, err := SafeABI.Pack("execTransaction", t.To, orZero(t.Value), t.Data, t.Operation,
 		orZero(t.SafeTxGas), orZero(t.BaseGas), orZero(t.GasPrice), t.GasToken, t.RefundReceiver, JoinSignatures(sigs))
 	if err != nil {
 		return nil, fmt.Errorf("pack execTransaction: %w", err)
 	}
-	return c.SendAndWait(ctx, key, safe, data)
+	return data, nil
+}
+
+// ClaimByShopperCall is the calldata of PSEscrowModule.claimByShopper(safe).
+func ClaimByShopperCall(safe common.Address) ([]byte, error) {
+	return ModuleABI.Pack("claimByShopper", safe)
 }
 
 // DeploySafe calls createProxyWithNonce for the order (usually done by the user).
@@ -290,7 +345,7 @@ func (c *Client) TransferToken(ctx context.Context, key *btcec.PrivateKey, token
 
 // ClaimByShopper calls PSEscrowModule.claimByShopper(safe).
 func (c *Client) ClaimByShopper(ctx context.Context, key *btcec.PrivateKey, module, safe common.Address) (*types.Receipt, error) {
-	data, err := ModuleABI.Pack("claimByShopper", safe)
+	data, err := ClaimByShopperCall(safe)
 	if err != nil {
 		return nil, err
 	}
@@ -315,6 +370,11 @@ func (c *Client) TokenTransfers(ctx context.Context, txHash common.Hash, token c
 	if r.Status != types.ReceiptStatusSuccessful {
 		return nil, fmt.Errorf("transaction %s reverted", txHash)
 	}
+	return TransfersOf(r, token), nil
+}
+
+// TransfersOf returns the ERC-20 Transfer events of token in a receipt.
+func TransfersOf(r *types.Receipt, token common.Address) []TransferEvent {
 	topic := ERC20ABI.Events["Transfer"].ID
 	var out []TransferEvent
 	for _, l := range r.Logs {
@@ -327,7 +387,7 @@ func (c *Client) TokenTransfers(ctx context.Context, txHash common.Hash, token c
 			Amount: new(big.Int).SetBytes(l.Data),
 		})
 	}
-	return out, nil
+	return out
 }
 
 // TransferEvent is an ERC-20 Transfer log.
@@ -338,38 +398,49 @@ type TransferEvent struct {
 
 // Deploy sends a contract creation and returns the new contract's address.
 func (c *Client) Deploy(ctx context.Context, key *btcec.PrivateKey, code []byte) (common.Address, error) {
-	chainID, err := c.chainID(ctx)
+	hash, err := c.sendDeploy(ctx, key, code)
 	if err != nil {
 		return common.Address{}, err
 	}
-	from := crypto.PubkeyToAddress(*key.PubKey().ToECDSA())
-	nonce, err := c.Eth.PendingNonceAt(ctx, from)
-	if err != nil {
-		return common.Address{}, err
-	}
-	gas, err := c.Eth.EstimateGas(ctx, ethereum.CallMsg{From: from, Data: code})
-	if err != nil {
-		return common.Address{}, fmt.Errorf("estimate deploy gas: %w", err)
-	}
-	price, err := c.Eth.SuggestGasPrice(ctx)
-	if err != nil {
-		return common.Address{}, err
-	}
-	tx := types.NewTx(&types.LegacyTx{Nonce: nonce, GasPrice: price, Gas: gas + gas/5, Data: code})
-	ek, err := ethKey(key)
-	if err != nil {
-		return common.Address{}, err
-	}
-	signed, err := types.SignTx(tx, types.LatestSignerForChainID(chainID), ek)
-	if err != nil {
-		return common.Address{}, err
-	}
-	if err := c.Eth.SendTransaction(ctx, signed); err != nil {
-		return common.Address{}, fmt.Errorf("send deploy: %w", err)
-	}
-	r, err := c.Wait(ctx, signed.Hash())
+	r, err := c.Wait(ctx, hash)
 	if err != nil {
 		return common.Address{}, err
 	}
 	return r.ContractAddress, nil
+}
+
+func (c *Client) sendDeploy(ctx context.Context, key *btcec.PrivateKey, code []byte) (common.Hash, error) {
+	chainID, err := c.chainID(ctx)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	from := crypto.PubkeyToAddress(*key.PubKey().ToECDSA())
+	mu := c.sender(from)
+	mu.Lock()
+	defer mu.Unlock()
+	nonce, err := c.Eth.PendingNonceAt(ctx, from)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	gas, err := c.Eth.EstimateGas(ctx, ethereum.CallMsg{From: from, Data: code})
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("estimate deploy gas: %w", err)
+	}
+	price, err := c.Eth.SuggestGasPrice(ctx)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	tx := types.NewTx(&types.LegacyTx{Nonce: nonce, GasPrice: price, Gas: gas + gas/5, Data: code})
+	ek, err := ethKey(key)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	signed, err := types.SignTx(tx, types.LatestSignerForChainID(chainID), ek)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	if err := c.Eth.SendTransaction(ctx, signed); err != nil {
+		return common.Hash{}, fmt.Errorf("send deploy: %w", err)
+	}
+	return signed.Hash(), nil
 }

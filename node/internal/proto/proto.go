@@ -2,6 +2,8 @@
 package proto
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 
 	"github.com/nbd-wtf/go-nostr"
@@ -17,6 +19,7 @@ const (
 	TypeOrderAccept            = "order.accept"
 	TypeOrderCancel            = "order.cancel"
 	TypeOrderFunded            = "order.funded"
+	TypeOrderEscrowKey         = "order.escrow_key"
 	TypeEscrowNotice           = "escrow.notice"
 	TypeOrderPurchased         = "order.purchased"
 	TypeOrderShipping          = "order.shipping"
@@ -53,10 +56,23 @@ type Item struct {
 	Qty int    `json:"qty"`
 }
 
+// Delivery is the sealed address of order.request. key_for_escrow itself travels separately in order.escrow_key
+// (spec §4.4); the request only commits to it with its SHA-256.
 type Delivery struct {
-	Ciphertext    string `json:"ciphertext"`
-	KeyForShopper string `json:"key_for_shopper"`
-	KeyForEscrow  string `json:"key_for_escrow"`
+	Ciphertext         string `json:"ciphertext"`
+	KeyForShopper      string `json:"key_for_shopper"`
+	KeyForEscrowSHA256 string `json:"key_for_escrow_sha256"`
+}
+
+// EscrowKey is order.escrow_key (user → shopper, right after the request).
+type EscrowKey struct {
+	KeyForEscrow string `json:"key_for_escrow"`
+}
+
+// EscrowKeyHash is key_for_escrow_sha256: hex(SHA-256(key_for_escrow)).
+func EscrowKeyHash(keyForEscrow string) string {
+	h := sha256.Sum256([]byte(keyForEscrow))
+	return hex.EncodeToString(h[:])
 }
 
 // OrderRequest is §4.4.
@@ -69,6 +85,7 @@ type OrderRequest struct {
 	Operator       string   `json:"operator"`
 	Coordinator    string   `json:"coordinator"`
 	Delivery       Delivery `json:"delivery"`
+	KeyProof       string   `json:"key_proof"`
 	UserBTCPubkey  string   `json:"user_btc_pubkey,omitempty"`
 	UserBTCAddress string   `json:"user_btc_address,omitempty"`
 	UserEVMAddress string   `json:"user_evm_address,omitempty"`
@@ -205,13 +222,13 @@ type RequestedSplit struct {
 	Shopper string `json:"shopper"`
 }
 
-// DisputeEvidence is the evidence of dispute.open and dispute.evidence.
+// DisputeEvidence is the evidence of dispute.open and dispute.evidence. The escrow decrypts only the ciphertext
+// of the signed request, so there is no ciphertext here.
 type DisputeEvidence struct {
 	Messages             []*nostr.Event   `json:"messages,omitempty"`
 	Tracking             []TrackingStatus `json:"tracking,omitempty"`
 	PurchaseEvidence     []Evidence       `json:"purchase_evidence,omitempty"`
 	DeliveryKeyForEscrow string           `json:"delivery_key_for_escrow,omitempty"`
-	DeliveryCiphertext   string           `json:"delivery_ciphertext,omitempty"`
 	Text                 string           `json:"text,omitempty"`
 }
 

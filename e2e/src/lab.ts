@@ -15,7 +15,7 @@ import {
   type RateSource,
   type UserOrder,
   type UserOrderStatus,
-} from '@proxy-shopping/core';
+} from '@proxy-shopping/core/node';
 
 export const NETWORK = 'ps-lab';
 export const RELAYS = ['wss://relay-1.test', 'wss://relay-2.test'];
@@ -42,6 +42,11 @@ export function keys(name: LabName): KeySet {
 }
 export const pk = (name: LabName) => keys(name).nostrPublicKey;
 
+/** 利用者のブラウザと同じ設定（lab/web-config.json を runner に焼き込んだもの） */
+export const LAB_WEB_CONFIG = JSON.parse(readFileSync(new URL('../../lab/web-config.json', import.meta.url), 'utf8')) as {
+  timelock_policy: Record<string, number>;
+};
+
 export function deployments(): Deployments {
   return JSON.parse(readFileSync('/deployments/31337.json', 'utf8')) as Deployments;
 }
@@ -58,7 +63,13 @@ export function session(name: LabName, opts: { rates?: RateSource[]; coordinator
     keys: k,
     transport: new PoolTransport(),
     storage: new MemoryStorage(),
-    config: { network: NETWORK, relays: RELAYS, coordinators: opts.coordinators ?? [pk('coordinator-1'), pk('coordinator-2')], retryIntervalMs: 3000 },
+    config: {
+      network: NETWORK,
+      relays: RELAYS,
+      coordinators: opts.coordinators ?? [pk('coordinator-1'), pk('coordinator-2')],
+      retryIntervalMs: 3000,
+      timelockPolicy: LAB_WEB_CONFIG.timelock_policy,
+    },
     chain: new EsploraClient(ESPLORA),
     evm: new EvmClient(d.chain_id, EVM_RPC, k.evmAccount, d),
     rates: opts.rates ?? labRates(),
@@ -70,6 +81,10 @@ export async function startUser(name: LabName, opts: Parameters<typeof session>[
   await s.start();
   await s.publishInboxRelays();
   const user = new UserClient(s, { deployments: deployments() }).attach();
+  // 捨てたメッセージとエラーは、失敗の原因を追えるように runner のログに出す
+  if (process.env.E2E_TRACE) s.messenger.on('message', (m) => console.log(`[${name}] got ${m.type} ${m.orderId?.slice(0, 8)} from ${m.from.slice(0, 8)}`));
+  s.messenger.on('dropped', ({ inner, reason }) => console.log(`[${name}] dropped ${inner.id.slice(0, 8)}: ${reason}`));
+  user.on('error', ({ orderId, error }) => console.log(`[${name}] error ${orderId?.slice(0, 8) ?? ''}: ${error.message}`));
   return { s, user };
 }
 
@@ -133,6 +148,15 @@ export interface EscrowCase {
   error?: string;
   delivery_address?: typeof ADDRESS;
   attachments?: Record<string, { mime: string; data_b64?: string }>;
+}
+
+/** Esplora で確定した tx の、指定アドレスへの出力の合計 */
+export async function paidTo(txid: string, address: string): Promise<bigint> {
+  const tx = await until(`tx ${txid.slice(0, 8)} confirmed`, 60_000, async () => {
+    const t = (await (await fetch(`https://esplora.test/tx/${txid}`)).json()) as { status: { confirmed: boolean }; vout: Array<{ scriptpubkey_address?: string; value: number }> };
+    return t.status.confirmed ? t : undefined;
+  });
+  return tx.vout.filter((o) => o.scriptpubkey_address === address).reduce((n, o) => n + BigInt(o.value), 0n);
 }
 
 // ---- 待ち合わせ

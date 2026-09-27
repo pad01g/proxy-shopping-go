@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 
 	"gopkg.in/yaml.v3"
@@ -47,6 +48,8 @@ type TLS struct {
 type Nostr struct {
 	Relays []string `yaml:"relays"`
 	K      int      `yaml:"k"`
+	// AllowPrivateRelays permits relays on loopback, link-local and private addresses (§4.10; the lab sets it).
+	AllowPrivateRelays bool `yaml:"allow_private_relays"`
 }
 
 type P2P struct {
@@ -129,7 +132,18 @@ type Shopper struct {
 	AcceptRulings       string   `yaml:"accept_rulings"` // always | favorable
 	QuoteTTLSeconds     int64    `yaml:"quote_ttl_seconds"`
 	PayoutFeeReserve    int64    `yaml:"payout_fee_reserve_sats"`
+	// MinT1RemainingSeconds is how long before T1 a purchase may still start (spec §4.6); with less time left
+	// the shopper offers a cooperative refund instead of buying. Default (delivery_days + 7) days.
+	MinT1RemainingSeconds int64 `yaml:"min_t1_remaining_seconds"`
+	// AllowPrivateShops lets shop_url point at loopback / private addresses (lab only, spec §4.10).
+	AllowPrivateShops bool `yaml:"allow_private_shops"`
 }
+
+// MaxPayoutFeeReserve is the upper bound of payout_fee_reserve that user clients accept (spec §4.5).
+const MaxPayoutFeeReserve = 20000
+
+// MinPayoutFeeReserveCap is the reserve always allowed, however small the order (§4.5).
+const MinPayoutFeeReserveCap = 2000
 
 // UpfrontFee is the escrow's fee at funding time.
 type UpfrontFee struct {
@@ -201,6 +215,9 @@ func (c *Config) defaults() {
 		if s.DeliveryDays <= 0 {
 			s.DeliveryDays = 5
 		}
+		if s.MinT1RemainingSeconds <= 0 {
+			s.MinT1RemainingSeconds = (s.DeliveryDays + 7) * 86400
+		}
 		t := &s.Timelock
 		// spec §4.5 defaults: t1 = now + (delivery_days + 21) days, t2 = t1 + 14 days (600 s per block)
 		if t.EVMT1Seconds <= 0 {
@@ -227,6 +244,9 @@ func (c *Config) validate() error {
 	if c.MnemonicFile == "" {
 		return errors.New("config: mnemonic_file is required")
 	}
+	if c.Admin.Listen != "" && c.Admin.Token == "" && !loopbackListen(c.Admin.Listen) {
+		return fmt.Errorf("config: admin.token is required when admin.listen %q is not a loopback address", c.Admin.Listen)
+	}
 	switch c.P2P.Reachability {
 	case "auto", "public", "private":
 	default:
@@ -244,12 +264,34 @@ func (c *Config) validate() error {
 		default:
 			return fmt.Errorf("config: shopper.accept_rulings must be always or favorable, not %q", c.Shopper.AcceptRulings)
 		}
-		if c.Shopper.Timelock.BTCT1Blocks >= c.Shopper.Timelock.BTCT2Blocks || c.Shopper.Timelock.EVMT1Seconds >= c.Shopper.Timelock.EVMT2Seconds {
+		s := c.Shopper
+		if s.Timelock.BTCT1Blocks >= s.Timelock.BTCT2Blocks || s.Timelock.EVMT1Seconds >= s.Timelock.EVMT2Seconds {
 			return errors.New("config: shopper timelocks need t1 < t2")
+		}
+		// quoted T1 must leave room for the purchase, or every funded order would be refunded
+		if s.Timelock.BTCT1Blocks*600 <= s.MinT1RemainingSeconds || s.Timelock.EVMT1Seconds <= s.MinT1RemainingSeconds {
+			return fmt.Errorf("config: shopper timelock t1 (%d blocks, %d s) must be later than min_t1_remaining_seconds (%d)",
+				s.Timelock.BTCT1Blocks, s.Timelock.EVMT1Seconds, s.MinT1RemainingSeconds)
+		}
+		if s.PayoutFeeReserve > MaxPayoutFeeReserve {
+			return fmt.Errorf("config: shopper.payout_fee_reserve_sats %d exceeds %d (spec §4.5)", s.PayoutFeeReserve, MaxPayoutFeeReserve)
 		}
 	}
 	if c.Role == RoleEscrow && c.Escrow == nil {
 		return errors.New("config: role escrow needs an escrow section")
 	}
 	return nil
+}
+
+// loopbackListen tells whether a listen address only accepts local connections.
+func loopbackListen(listen string) bool {
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

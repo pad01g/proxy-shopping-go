@@ -54,6 +54,9 @@ type Node struct {
 	p2p   *p2p.Service
 	msgr  *messenger.Messenger
 
+	inboxes  *inboxCache
+	debounce time.Duration // of the bridge (BridgeDebounce at New)
+
 	esplora *btc.Esplora
 	evm     *evm.Client
 
@@ -70,7 +73,7 @@ func New(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Node, erro
 	if log == nil {
 		log = slog.Default()
 	}
-	n := &Node{cfg: cfg, log: log.With("node", cfg.Name, "role", cfg.Role)}
+	n := &Node{cfg: cfg, log: log.With("node", cfg.Name, "role", cfg.Role), debounce: BridgeDebounce}
 	var err error
 	if n.keys, err = keys.LoadMnemonicFile(cfg.MnemonicFile); err != nil {
 		return nil, err
@@ -90,7 +93,12 @@ func New(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Node, erro
 	if n.trust, err = trust.NewStore(n.db); err != nil {
 		return nil, err
 	}
-	n.pool = nostrnet.NewPool(n.tls, n.log)
+	// §10: keep only what the coordinators reach, and our own profile and inbox relays
+	if dropped := n.trust.SetScope(cfg.Trust.Coordinators, cfg.Network, n.keys.NostrPubHex()); dropped > 0 {
+		n.log.Info("dropped stored events outside the trust scope", "count", dropped)
+	}
+	n.pool = nostrnet.NewPoolWith(nostrnet.Options{TLS: n.tls, Log: n.log, AllowPrivate: cfg.Nostr.AllowPrivateRelays})
+	n.inboxes = newInboxCache(n.trust, n.pool, func() []string { return n.cfg.Nostr.Relays })
 
 	key, err := n.keys.Libp2pKey()
 	if err != nil {
@@ -121,7 +129,7 @@ func New(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Node, erro
 	if cfg.Role != config.RoleRelay {
 		n.msgr, err = messenger.New(messenger.Config{
 			Secret: n.keys.NostrSecretHex(), Pool: n.pool, DB: n.db, Inbox: cfg.Nostr.Relays, K: cfg.Nostr.K,
-			Resolve: n.trust.InboxRelaysOf, Log: n.log,
+			Resolve: n.inboxes.resolve, Retry: n.hasOrderWith, Log: n.log,
 		})
 		if err != nil {
 			return nil, err
@@ -236,6 +244,9 @@ func (n *Node) Run(ctx context.Context) error {
 	if n.shopper != nil {
 		n.shopper.Start(ctx)
 	}
+	if n.escrow != nil {
+		n.escrow.Start(ctx)
+	}
 	go n.publishOwnLoop(ctx)
 
 	id := n.host.ID().String()
@@ -258,7 +269,8 @@ func (n *Node) Run(ctx context.Context) error {
 	}
 }
 
-// bridge passes newer trust and profile events between libp2p and the Nostr relays.
+// bridge passes newer trust and profile events between libp2p and the Nostr relays. It subscribes only to the
+// authors of the trust scope (§10) and subscribes again when the scope changes.
 func (n *Node) bridge(ctx context.Context) {
 	n.p2p.OnNewEvent(func(ev *nostr.Event, source string) {
 		if source == "nostr" || source == "local" {
@@ -266,20 +278,91 @@ func (n *Node) bridge(ctx context.Context) {
 		}
 		go n.publishNostr(ctx, ev)
 	})
-	filter := nostr.Filter{Kinds: []int{trust.KindDelegation, trust.KindList, trust.KindShopperProfile, trust.KindEscrowProfile, trust.KindInboxRelays}}
-	n.pool.Subscribe(ctx, n.cfg.Nostr.Relays, nostr.Filters{filter}, func(relay string, ev *nostr.Event) {
-		if trust.Network(ev) != "" && trust.Network(ev) != n.cfg.Network && ev.Kind != trust.KindInboxRelays {
+	go n.bridgeLoop(ctx)
+}
+
+// BridgeDebounce is how long the bridge waits for more trust changes before it subscribes again.
+var BridgeDebounce = time.Second
+
+func (n *Node) bridgeLoop(ctx context.Context) {
+	var current nostr.Filters
+	stop := func() {}
+	defer func() { stop() }()
+	for {
+		if fs := n.bridgeFilters(); !reflect.DeepEqual(fs, current) {
+			stop()
+			current = fs
+			sctx, cancel := context.WithCancel(ctx)
+			stop = cancel
+			if len(fs) > 0 {
+				n.log.Debug("bridge subscription", "filters", len(fs))
+				n.pool.Subscribe(sctx, n.cfg.Nostr.Relays, fs, func(_ string, ev *nostr.Event) { n.bridgeEvent(ctx, ev) })
+			}
+		}
+		select {
+		case <-ctx.Done():
 			return
+		case <-n.trust.Changes():
 		}
-		newer, err := n.trust.Put(ev)
-		if err != nil || !newer {
+		select { // a list and its profiles tend to arrive together
+		case <-ctx.Done():
 			return
+		case <-time.After(n.debounce):
 		}
-		n.log.Info("stored event", "kind", ev.Kind, "pubkey", ev.PubKey[:12], "v", trust.Version(ev), "source", "nostr")
-		if err := n.p2p.Publish(ctx, ev); err != nil {
-			n.log.Debug("gossip failed", "err", err)
-		}
-	})
+	}
+}
+
+// bridgeFilters asks for the delegations of the coordinators, the lists of the delegated operators and the
+// profiles and inbox relays of the shoppers and escrows of the effective set (and our own).
+func (n *Node) bridgeFilters() nostr.Filters {
+	a, ok := n.trust.Authors()
+	if !ok {
+		return nil
+	}
+	var fs nostr.Filters
+	// an empty authors list would mean everybody
+	if len(a.Coordinators) > 0 {
+		fs = append(fs, nostr.Filter{Kinds: []int{trust.KindDelegation}, Authors: a.Coordinators})
+	}
+	if len(a.Operators) > 0 {
+		fs = append(fs, nostr.Filter{Kinds: []int{trust.KindList}, Authors: a.Operators})
+	}
+	if len(a.Participants) > 0 {
+		fs = append(fs, nostr.Filter{Kinds: []int{trust.KindShopperProfile, trust.KindEscrowProfile, trust.KindInboxRelays}, Authors: a.Participants})
+	}
+	return fs
+}
+
+func (n *Node) bridgeEvent(ctx context.Context, ev *nostr.Event) {
+	if trust.Network(ev) != "" && trust.Network(ev) != n.cfg.Network && ev.Kind != trust.KindInboxRelays {
+		return
+	}
+	newer, err := n.trust.Put(ev)
+	if err != nil || !newer {
+		return
+	}
+	n.log.Info("stored event", "kind", ev.Kind, "pubkey", ev.PubKey[:12], "v", trust.Version(ev), "source", "nostr")
+	if err := n.p2p.Publish(ctx, ev); err != nil {
+		n.log.Debug("gossip failed", "err", err)
+	}
+}
+
+// hasOrderWith tells the messenger whether unacknowledged messages about an order are resent: only to parties
+// of an order we keep (§4.10; a rejected request is answered once).
+func (n *Node) hasOrderWith(_, orderID string) bool {
+	if orderID == "" {
+		return false
+	}
+	switch {
+	case n.shopper != nil:
+		// a rejection is still a reply to a real requester, so it is resent until acked too
+		_, ok, err := n.shopper.Order(orderID)
+		return err == nil && ok
+	case n.escrow != nil:
+		_, ok, err := n.escrow.Case(orderID)
+		return err == nil && ok
+	}
+	return false
 }
 
 func (n *Node) publishNostr(ctx context.Context, ev *nostr.Event) {

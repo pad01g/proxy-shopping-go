@@ -7,6 +7,9 @@
 // fetched over plain HTTP (SHOP_SCHEME_OVERRIDE=http). See README.
 import { createHash } from "node:crypto";
 import { lookup } from "node:dns/promises";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createBot, type Bot } from "../src/bot.js";
@@ -28,6 +31,7 @@ describe.skipIf(!fakeshop)("shopper-bot against fakeshop", () => {
         SHOP_SCHEME_OVERRIDE: "http",
         BROWSER_HOST_RESOLVER_RULES: `MAP *.test ${address}:${port}`,
         ACTION_TIMEOUT_MS: "10000",
+        BOT_DATA_DIR: mkdtempSync(join(tmpdir(), "bot-it-")),
       }),
     );
     await new Promise<void>((resolve) => bot.server.listen(0, "127.0.0.1", resolve));
@@ -43,8 +47,10 @@ describe.skipIf(!fakeshop)("shopper-bot against fakeshop", () => {
     return { status: res.status, body: (await res.json()) as T };
   }
 
+  let seq = 0;
+  // every purchase gets its own request_id: a repeated one answers the stored result (spec §9)
   const purchase = async (over: Partial<PurchaseRequest>) => {
-    const res = await call<PurchaseResult>("/v1/purchase", purchaseRequest(over));
+    const res = await call<PurchaseResult>("/v1/purchase", purchaseRequest({ request_id: `it-${++seq}`, ...over }));
     expect(res.status).toBe(200);
     return res.body;
   };
@@ -75,6 +81,7 @@ describe.skipIf(!fakeshop)("shopper-bot against fakeshop", () => {
     expect(shot?.kind).toBe("screenshot");
     const png = Buffer.from(shot!.data_b64!, "base64");
     expect(png.subarray(1, 4).toString()).toBe("PNG");
+    expect(png.length).toBeLessThanOrEqual(200 * 1024); // viewport only, fits the attachment budget
     expect(createHash("sha256").update(png).digest("hex")).toBe(shot!.sha256);
     expect(JSON.parse(Buffer.from(receipt!.data_b64!, "base64").toString())).toMatchObject({
       shop_order_id: result.shop_order_id,
@@ -86,6 +93,14 @@ describe.skipIf(!fakeshop)("shopper-bot against fakeshop", () => {
     expect(shipped.tracking_no).toMatch(/^\d{12}$/);
     expect(shipped.evidence[0]?.kind).toBe("json");
     await waitForTracking("https://safe-shop.test/", result.shop_order_id!, "delivered");
+  }, 30_000);
+
+  it("answers a repeated request_id from its store without buying again", async () => {
+    const req = purchaseRequest({ request_id: "it-repeat", items: [{ sku: "A-100", qty: 1 }], max_amount: { amount: "4000", currency: "JPY" } });
+    const first = await call<PurchaseResult>("/v1/purchase", req);
+    const again = await call<PurchaseResult>("/v1/purchase", req);
+    expect(first.body.status).toBe("ok");
+    expect(again.body).toEqual(first.body);
   }, 30_000);
 
   it("buys at us-shop.test in USD", async () => {

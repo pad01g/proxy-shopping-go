@@ -2,7 +2,7 @@
 // data-amount / data-currency, address fields have #ship-* ids and each
 // shop has a JSON order API.
 import type { Page } from "playwright";
-import { evidenceFromBytes, jsonEvidence, screenshotEvidence } from "../evidence.js";
+import { evidenceFromBytes, jsonEvidence, screenshotOf } from "../evidence.js";
 import type { Address, Evidence, Money, PurchaseRequest, PurchaseResult, ShipmentStatus, TrackingQuery, TrackingStatus } from "../types.js";
 import { NotFoundError, type DriverContext } from "./driver.js";
 
@@ -20,8 +20,8 @@ export async function fillAddress(page: Page, a: Address): Promise<void> {
   await page.fill("#ship-phone", a.phone);
 }
 
-export async function screenshot(page: Page): Promise<Evidence> {
-  return screenshotEvidence(await page.screenshot({ fullPage: true, type: "png" }));
+export function screenshot(page: Page): Promise<Evidence> {
+  return screenshotOf(page);
 }
 
 /** The receipt evidence: what was bought, where, for how much. */

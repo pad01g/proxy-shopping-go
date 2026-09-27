@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -45,7 +46,7 @@ func (c *Client) post(ctx context.Context, path string, in, out any) error {
 		return fmt.Errorf("bot %s: %w", path, err)
 	}
 	if res.StatusCode/100 != 2 {
-		return fmt.Errorf("bot %s: HTTP %d: %s", path, res.StatusCode, strings.TrimSpace(string(data)))
+		return &HTTPError{Path: path, Status: res.StatusCode, Body: strings.TrimSpace(string(data))}
 	}
 	if err := json.Unmarshal(data, out); err != nil {
 		return fmt.Errorf("bot %s: %w", path, err)
@@ -53,7 +54,31 @@ func (c *Client) post(ctx context.Context, path string, in, out any) error {
 	return nil
 }
 
-// Purchase is POST /v1/purchase.
+// HTTPError is a non-2xx answer of the bot.
+type HTTPError struct {
+	Path   string
+	Status int
+	Body   string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("bot %s: HTTP %d: %s", e.Path, e.Status, e.Body)
+}
+
+// InProgress tells that the bot is still working on this request_id (409); ask again later (spec §9).
+func InProgress(err error) bool {
+	var he *HTTPError
+	return errors.As(err, &he) && he.Status == http.StatusConflict
+}
+
+// Rejected tells that the bot refused the request itself (4xx other than 409); repeating it does not help.
+func Rejected(err error) bool {
+	var he *HTTPError
+	return errors.As(err, &he) && he.Status/100 == 4 && he.Status != http.StatusConflict
+}
+
+// Purchase is POST /v1/purchase. The bot keeps the result per request_id, so repeating a purchase with the same
+// request_id (after a restart or a lost answer) never buys twice (spec §9).
 func (c *Client) Purchase(ctx context.Context, r proto.PurchaseRequest) (*proto.PurchaseResult, error) {
 	var out proto.PurchaseResult
 	if err := c.post(ctx, "/v1/purchase", r, &out); err != nil {

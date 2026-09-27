@@ -48,6 +48,7 @@ export class CashStoreDriver implements Driver {
       const tooMuch = exceedsMax(total, req.max_amount);
       if (tooMuch) return failed(req, tooMuch, [await screenshot(page)]);
 
+      await ctx.beforePayment();
       cashHandedOver = true;
       await page.click("#cash-received");
       await page.waitForSelector("#receipt-no");

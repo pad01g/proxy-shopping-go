@@ -11,7 +11,9 @@ RUN npm run build && npm prune --omit=dev
 
 FROM mcr.microsoft.com/playwright:v1.55.0-noble
 WORKDIR /app
-ENV NODE_ENV=production PORT=7000
+ENV NODE_ENV=production PORT=7000 BOT_DATA_DIR=/data
+# purchase results per request_id (spec §9); a fresh named volume takes this owner
+RUN mkdir -p /data && chown pwuser:pwuser /data
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json ./

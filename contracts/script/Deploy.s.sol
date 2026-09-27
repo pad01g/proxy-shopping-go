@@ -24,6 +24,7 @@ contract Deploy is Script {
     /// lab の operator-1（m/44'/60'/0'/0/0）
     address internal constant BOND_OPERATOR = 0xFDD9c12c4854FFeeB2C8AC9aEacEA1ce518afA14;
     uint64 internal constant BOND_WITHDRAW_DELAY = 7 days;
+    uint64 internal constant BOND_WITHDRAW_WINDOW = 2 days;
 
     int256 internal constant BTC_USD = 100_000e8;
     int256 internal constant JPY_USD = 666_667; // 1/150 × 1e8 を四捨五入
@@ -58,7 +59,7 @@ contract Deploy is Script {
         d.feedJpyUsd = _deployFeed("JPY / USD", JPY_USD);
         d.feedUsdcUsd = _deployFeed("USDC / USD", USDC_USD);
         d.bond = _deploy(
-            abi.encodePacked(type(PSBond).creationCode, abi.encode(IERC20(d.usdc), BOND_OPERATOR, BOND_WITHDRAW_DELAY))
+            abi.encodePacked(type(PSBond).creationCode, abi.encode(IERC20(d.usdc), BOND_OPERATOR, BOND_WITHDRAW_DELAY, BOND_WITHDRAW_WINDOW))
         );
 
         vm.stopBroadcast();

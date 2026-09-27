@@ -8,7 +8,9 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 
+	"github.com/pad01g/proxy-shopping-go/node/internal/faucet"
 	"github.com/pad01g/proxy-shopping-go/node/internal/fx"
 )
 
@@ -51,5 +53,26 @@ func TestFeederWritesOnlyChanges(t *testing.T) {
 	f.update(ctx)
 	if len(writes) != 4 || writes[3] != "01:9000000000000" {
 		t.Fatalf("after change %v", writes)
+	}
+}
+
+// The feeder must not share labfaucet's (and the deployer's) anvil account: two senders of one account race
+// for the same nonces.
+func TestDefaultKeyIsNotTheFaucets(t *testing.T) {
+	addr := func(hexKey string) common.Address {
+		k, err := loadKey(hexKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return crypto.PubkeyToAddress(*k.PubKey().ToECDSA())
+	}
+	if got := addr(""); got != common.HexToAddress("0x70997970C51812dc3A010C7d01b50e0d17dc79C8") {
+		t.Fatalf("default sender %s, want anvil account 1", got.Hex())
+	}
+	if addr("") == addr(faucet.AnvilKey0) {
+		t.Fatal("ratefeed sends from the faucet's account")
+	}
+	if _, err := loadKey("0x1234"); err == nil {
+		t.Fatal("short key accepted")
 	}
 }

@@ -35,7 +35,7 @@ async function main(): Promise<number> {
   }
   const u1 = await startUser('user-1');
   const u2 = await startUser('user-2');
-  const ctx: Ctx = { users: { 'user-1': u1.user, 'user-2': u2.user }, log: (l) => say(`  - ${l}`, details) };
+  const ctx: Ctx = { users: { 'user-1': u1.user, 'user-2': u2.user }, sessions: { 'user-1': u1.s, 'user-2': u2.s }, log: (l) => say(`  - ${l}`, details) };
   const rows: string[] = [];
   let failed = 0;
   for (const s of selected) {

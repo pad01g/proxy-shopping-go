@@ -96,6 +96,16 @@ func TestVectorsAreSelfConsistent(t *testing.T) {
 		t.Fatalf("key_for_shopper: %v", err)
 	}
 
+	// key proofs verify with the published keys
+	kp := f.KeyProof
+	b, ev := kp["btc"].(map[string]string), kp["evm"].(map[string]string)
+	if err := keys.VerifyKeyProofBTC(b["user_btc_pubkey"], OrderID, user.NostrPubHex(), b["key_proof"]); err != nil {
+		t.Fatalf("btc key_proof: %v", err)
+	}
+	if err := keys.VerifyKeyProofEVM(ev["user_evm_address"], OrderID, user.NostrPubHex(), ev["key_proof"]); err != nil {
+		t.Fatalf("evm key_proof: %v", err)
+	}
+
 	// the CREATE2 address follows the formula of §6.2
 	init, _ := hex.DecodeString(f.Safe["initializer"].(string)[2:])
 	code, _ := hex.DecodeString(LabProxyCreationCode)

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -93,10 +94,32 @@ func NewIndex(src Source, params *chaincfg.Params, log *slog.Logger) *Index {
 	}
 }
 
+// errNotChild reports a block whose parent is not the indexed tip: the node reorganized while we read it.
+var errNotChild = errors.New("block does not extend the indexed tip")
+
+// maxReorgRetries bounds how often one Sync starts over after the chain changed under it.
+const maxReorgRetries = 10
+
 // Sync follows the chain to the node's tip (undoing reorganized blocks) and refreshes the mempool.
 func (ix *Index) Sync(ctx context.Context) error {
 	ix.syncMu.Lock()
 	defer ix.syncMu.Unlock()
+	for attempt := 0; ; attempt++ {
+		err := ix.syncBlocks(ctx)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, errNotChild) || attempt >= maxReorgRetries {
+			return err
+		}
+		ix.log.Info("chain changed while syncing, starting over", "err", err)
+	}
+	return ix.refreshMempoolLocked(ctx)
+}
+
+// syncBlocks rolls back to the fork point with the node's best chain and indexes the blocks after it. Every
+// block must name the indexed tip as its parent; when it does not (a reorg between our calls), errNotChild.
+func (ix *Index) syncBlocks(ctx context.Context) error {
 	count, err := ix.src.GetBlockCount(ctx)
 	if err != nil {
 		return fmt.Errorf("block count: %w", err)
@@ -132,7 +155,7 @@ func (ix *Index) Sync(ctx context.Context) error {
 			return fmt.Errorf("index block %d: %w", h, err)
 		}
 	}
-	return ix.refreshMempoolLocked(ctx)
+	return nil
 }
 
 // RefreshMempool re-reads the mempool only (e.g. right after a broadcast).
@@ -243,6 +266,9 @@ func (ix *Index) addBlock(blk *bitcoinrpc.Block) error {
 	defer ix.mu.Unlock()
 	if int64(len(ix.blocks)) != blk.Height {
 		return fmt.Errorf("block %d does not follow the indexed tip %d", blk.Height, len(ix.blocks)-1)
+	}
+	if n := len(ix.blocks); n > 0 && blk.PreviousBlockHash != ix.blocks[n-1].Hash {
+		return fmt.Errorf("%w: block %d %s has parent %s, the indexed tip is %s", errNotChild, blk.Height, blk.Hash, blk.PreviousBlockHash, ix.blocks[n-1].Hash)
 	}
 	for _, e := range entries {
 		e.prevouts = make([]*output, len(e.tx.TxIn))

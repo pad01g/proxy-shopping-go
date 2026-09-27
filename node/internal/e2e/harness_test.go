@@ -142,6 +142,7 @@ type fakeBot struct {
 	purchases map[string]proto.PurchaseRequest
 	tracked   map[string]int
 	holdBack  map[string]bool // shop orders that stay "processing"
+	dup       bool            // a request_id was bought twice, or was not the order id
 }
 
 func startBot(t *testing.T) (*fakeBot, string) {
@@ -151,6 +152,10 @@ func startBot(t *testing.T) (*fakeBot, string) {
 		var req proto.PurchaseRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		b.mu.Lock()
+		// like shopper-bot, one purchase per request_id (§9); the node must always use the order id
+		if _, again := b.purchases[req.RequestID]; again || req.RequestID != req.OrderID {
+			b.dup = true
+		}
 		b.purchases[req.OrderID] = req
 		b.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(proto.PurchaseResult{
@@ -179,6 +184,12 @@ func startBot(t *testing.T) (*fakeBot, string) {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return b, srv.URL
+}
+
+func (b *fakeBot) duplicated() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.dup
 }
 
 func (b *fakeBot) purchase(orderID string) (proto.PurchaseRequest, bool) {

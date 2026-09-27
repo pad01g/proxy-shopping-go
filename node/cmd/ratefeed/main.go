@@ -27,8 +27,9 @@ import (
 	"github.com/pad01g/proxy-shopping-go/node/internal/httpx"
 )
 
-// anvilKey0 is the private key of anvil's first default account.
-const anvilKey0 = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+// defaultKey is the private key of anvil's second default account (0x70997970…79C8). The first one belongs to
+// the deployer and labfaucet; sharing it made their transactions race for the same nonces.
+const defaultKey = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
 
 // feedPairs are the pairs of the lab feeds.
 var feedPairs = []string{"BTC/USD", "JPY/USD", "USDC/USD"}
@@ -39,6 +40,7 @@ type Config struct {
 	EVM             struct {
 		RPC         string `yaml:"rpc"`
 		Deployments string `yaml:"deployments"`
+		Key         string `yaml:"key"` // hex private key of the sender (RATEFEED_KEY overrides; default anvil account 1)
 	} `yaml:"evm"`
 	TLS config.TLS `yaml:"tls"`
 	FX  config.FX  `yaml:"fx"`
@@ -82,7 +84,8 @@ func run(log *slog.Logger) error {
 	if cfg.EVM.RPC == "" || cfg.EVM.Deployments == "" {
 		return errors.New("evm.rpc and evm.deployments are required")
 	}
-	key, err := loadKey(os.Getenv("RATEFEED_KEY"))
+	override(&cfg.EVM.Key, os.Getenv("RATEFEED_KEY"))
+	key, err := loadKey(cfg.EVM.Key)
 	if err != nil {
 		return err
 	}
@@ -146,11 +149,11 @@ func override(dst *string, v string) {
 
 func loadKey(s string) (*btcec.PrivateKey, error) {
 	if s == "" {
-		s = anvilKey0
+		s = defaultKey
 	}
 	raw, err := hex.DecodeString(strings.TrimPrefix(strings.TrimSpace(s), "0x"))
 	if err != nil || len(raw) != 32 {
-		return nil, errors.New("RATEFEED_KEY must be 32 bytes of hex")
+		return nil, errors.New("evm.key / RATEFEED_KEY must be 32 bytes of hex")
 	}
 	k, _ := btcec.PrivKeyFromBytes(raw)
 	return k, nil

@@ -8,6 +8,7 @@ tls: {extra_ca: /caddy-data/caddy/pki/authorities/local/root.crt}
 nostr:
   relays: ["wss://relay-1.test", "wss://relay-2.test"]
   k: 2
+  allow_private_relays: true
 p2p:
   listen: ["/ip4/0.0.0.0/tcp/4001", "/ip4/0.0.0.0/tcp/4002/ws"]
   bootstrap: ["/ip4/172.40.0.12/tcp/4001/p2p/16Uiu2HAmFngaVFK4D5fix5qN2c6guh3LNyBkmuB42vTFW9aaeDZh"]
@@ -35,3 +36,6 @@ shopper:
   confirmations: 1
   tracking_poll_seconds: 2
   accept_rulings: always
+  # lab: T1 is an hour away and the shops are on the private lab network
+  min_t1_remaining_seconds: 1800
+  allow_private_shops: true

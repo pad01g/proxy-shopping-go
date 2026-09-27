@@ -78,6 +78,7 @@ export class CardShopDriver implements Driver {
       await page.fill("#card-exp", card.exp);
       await page.fill("#card-cvc", card.cvc);
       await page.fill("#card-name", card.name);
+      await ctx.beforePayment();
       paymentSubmitted = true;
       await page.click("#pay");
 

@@ -31,6 +31,7 @@ const (
 	maxEventSize   = 256 << 10
 	maxSyncEvents  = 20000
 	resyncInterval = 5 * time.Minute
+	maxSynced      = 1024 // peers remembered for resyncInterval before the map is swept
 )
 
 // TopicTrust and TopicProfiles name the gossipsub topics of a network.
@@ -150,7 +151,8 @@ func (s *Service) validator(topic string) pubsub.Validator {
 		if t, ok := topicFor(s.network, ev.Kind); !ok || t != topic {
 			return false
 		}
-		return trust.Validate(&ev) == nil
+		// only what our coordinators reach is stored and passed on (§10)
+		return trust.Validate(&ev) == nil && s.store.InScope(&ev)
 	}
 }
 
@@ -309,11 +311,20 @@ func (s *Service) SyncFrom(ctx context.Context, id peer.ID) (int, error) {
 
 func (s *Service) maybeSync(ctx context.Context, id peer.ID) {
 	s.mu.Lock()
-	if time.Since(s.synced[id]) < resyncInterval {
+	now := time.Now()
+	if now.Sub(s.synced[id]) < resyncInterval {
 		s.mu.Unlock()
 		return
 	}
-	s.synced[id] = time.Now()
+	if len(s.synced) >= maxSynced {
+		// entries older than the interval no longer suppress anything
+		for p, at := range s.synced {
+			if now.Sub(at) >= resyncInterval {
+				delete(s.synced, p)
+			}
+		}
+	}
+	s.synced[id] = now
 	s.mu.Unlock()
 	// wait for identify, so that we know whether the peer speaks our protocol
 	select {

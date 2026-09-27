@@ -2,9 +2,12 @@ package p2p
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/nbd-wtf/go-nostr"
 
@@ -106,4 +109,46 @@ func TestGossipSyncStatusThroughRelay(t *testing.T) {
 	if st.Role != "escrow" || st.Network != "ps-test" || st.Reachability != "private" || ev.Kind != trust.KindStatus {
 		t.Fatalf("status %+v", st)
 	}
+}
+
+// A node with coordinators stores (and so gossips and bridges) only what they reach (§10).
+func TestSyncKeepsOnlyScope(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	relay := startNode(t, ctx, Options{Listen: []string{"/ip4/127.0.0.1/tcp/0"}, Reachability: "public"}, "relay")
+	coord, stranger, op := nostr.GeneratePrivateKey(), nostr.GeneratePrivateKey(), nostr.GeneratePrivateKey()
+	coordPub, _ := nostr.GetPublicKey(coord)
+	opPub, _ := nostr.GetPublicKey(op)
+	good, _ := trust.NewDelegation(coord, opPub, "ps-test", 1, false, "")
+	bad, _ := trust.NewDelegation(stranger, opPub, "ps-test", 1, false, "")
+	userRelays, _ := trust.NewInboxRelays(nostr.GeneratePrivateKey(), []string{"wss://x"}, 1)
+	for _, ev := range []*nostr.Event{good, bad, userRelays} {
+		if _, err := relay.st.Put(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a := startNode(t, ctx, Options{Listen: []string{"/ip4/127.0.0.1/tcp/0"}, Bootstrap: []string{relay.h.FullAddrs()[0]}}, "shopper")
+	a.st.SetScope([]string{coordPub}, "ps-test")
+	waitFor(t, ctx, "trust-sync", func() bool { return a.st.Get(trust.KeyOf(good)) != nil })
+	if a.st.Get(trust.KeyOf(bad)) != nil || a.st.Get(trust.KeyOf(userRelays)) != nil {
+		t.Fatal("events outside the scope stored")
+	}
+	var msg pubsub.Message
+	msg.Message = &pb.Message{Data: mustJSON(t, bad)}
+	if a.svc.validator(TopicTrust("ps-test"))(ctx, relay.h.ID(), &msg) {
+		t.Fatal("gossip validator passes an event outside the scope")
+	}
+	msg.Message = &pb.Message{Data: mustJSON(t, good)}
+	if !a.svc.validator(TopicTrust("ps-test"))(ctx, relay.h.ID(), &msg) {
+		t.Fatal("gossip validator refuses an event in the scope")
+	}
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	data, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }

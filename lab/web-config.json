@@ -22,5 +22,14 @@
       "base": "https://rates.test/frankfurter"
     }
   ],
-  "faucet_url": "https://faucet.test"
+  "faucet_url": "https://faucet.test",
+  "timelock_policy": {
+    "btc_min_t1_blocks": 50,
+    "evm_min_t1_seconds": 1800,
+    "btc_min_gap_blocks": 20,
+    "evm_min_gap_seconds": 1800,
+    "btc_max_t2_blocks": 1000,
+    "evm_max_t2_seconds": 86400
+  },
+  "allow_private_endpoints": true
 }

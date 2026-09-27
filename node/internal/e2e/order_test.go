@@ -62,7 +62,7 @@ mnemonic_file: %s
 data_dir: %s
 admin: {listen: "127.0.0.1:%d", token: "lab"}
 tls: {extra_ca: %q}
-nostr: {relays: [%s], k: 2}
+nostr: {relays: [%s], k: 2, allow_private_relays: true}
 p2p: {listen: ["/ip4/127.0.0.1/tcp/%d"], bootstrap: %s, reachability: public}
 trust: {coordinators: [%q]}
 %sfx:
@@ -101,6 +101,8 @@ func setup(t *testing.T, ctx context.Context) *env {
   confirmations: 1
   tracking_poll_seconds: 1
   accept_rulings: always
+  min_t1_remaining_seconds: 1800
+  allow_private_shops: true
 `, botURL), "")
 	e.shopperAdmin = runNode(t, ctx, shopperCfg)
 	escrowCfg := nodeYAML("escrow", "escrow-1", freePort(t), freePort(t), e.relays, btcChain(e.chain.esplora), ca, t.TempDir(), `escrow:
@@ -171,6 +173,8 @@ type order struct {
 	prev    btc.Outpoint
 	events  []*nostr.Event
 	key     [32]byte
+	// keyForEscrow is key_for_escrow of order.escrow_key
+	keyForEscrow string
 }
 
 // placeAndFund runs request → quote → accept → funded (and escrow.notice) and waits until the shopper bought.
@@ -187,15 +191,23 @@ func (e *env) placeAndFund(t *testing.T, ctx context.Context, sku string) *order
 	ct, _ := delivery.Seal(k, nil, o.id, addr)
 	kShopper, _ := delivery.WrapKey(u.keys.NostrSecretHex(), e.shopper.NostrPubHex(), k)
 	kEscrow, _ := delivery.WrapKey(u.keys.NostrSecretHex(), e.escr.NostrPubHex(), k)
+	o.keyForEscrow = kEscrow
 	userKey, _ := u.keys.OrderKey(o.id)
+	proof, err := keys.SignKeyProofBTC(userKey, o.id, u.keys.NostrPubHex())
+	if err != nil {
+		t.Fatal(err)
+	}
 	o.req = proto.OrderRequest{
 		ShopURL: e.shopURL, ShopRegion: "JP-13-13104", Items: []proto.Item{{SKU: sku, Qty: 1}}, Payment: proto.AssetBTC,
 		Escrow: e.escr.NostrPubHex(), Operator: e.operator.NostrPubHex(), Coordinator: coordinatorPub,
-		Delivery:      proto.Delivery{Ciphertext: ct, KeyForShopper: kShopper, KeyForEscrow: kEscrow},
+		Delivery:      proto.Delivery{Ciphertext: ct, KeyForShopper: kShopper, KeyForEscrowSHA256: proto.EscrowKeyHash(kEscrow)},
+		KeyProof:      proof,
 		UserBTCPubkey: hex.EncodeToString(userKey.PubKey().SerializeCompressed()), UserBTCAddress: u.keys.WalletAddress(),
 		Relays: e.relays,
 	}
 	reqEv := u.send(t, ctx, e.shopper.NostrPubHex(), o.id, proto.TypeOrderRequest, o.req)
+	// key_for_escrow travels apart from the request, which only commits to it (§4.4)
+	u.send(t, ctx, e.shopper.NostrPubHex(), o.id, proto.TypeOrderEscrowKey, proto.EscrowKey{KeyForEscrow: kEscrow})
 	qm := u.wait(t, ctx, o.id, proto.TypeOrderQuote, &o.quote)
 	o.quoteEv = qm.Inner
 	if !o.quote.Accept {
@@ -206,7 +218,6 @@ func (e *env) placeAndFund(t *testing.T, ctx context.Context, sku string) *order
 	if o.quote.Price.Items.Amount != price || o.quote.Price.Shipping.Amount != "800" || o.quote.FX.Rate != "15000000" {
 		t.Fatalf("quote price %+v fx %+v", o.quote.Price, o.quote.FX)
 	}
-	var err error
 	if o.esc, err = contract.BTCEscrow(&o.req, &o.quote); err != nil {
 		t.Fatal(err)
 	}
@@ -241,8 +252,11 @@ func (e *env) placeAndFund(t *testing.T, ctx context.Context, sku string) *order
 	}
 	// the bot got the decrypted address
 	p, ok := e.bot.purchase(o.id)
-	if !ok || !strings.Contains(fmt.Sprint(p.Shipping), "山田 太郎") || p.PaymentRef != "card:default" {
+	if !ok || !strings.Contains(fmt.Sprint(p.Shipping), "山田 太郎") || p.PaymentRef != "card:default" || p.RequestID != o.id {
 		t.Fatalf("bot purchase %+v", p)
+	}
+	if e.bot.duplicated() {
+		t.Fatal("the node bought an order twice")
 	}
 	return o
 }
@@ -338,7 +352,7 @@ func TestOrderFlows(t *testing.T) {
 		o := e.placeAndFund(t, ctx, "A-200")
 		// the user says the item was wrong and asks the escrow; the shopper gets a copy
 		open := proto.DisputeOpen{Claim: proto.ClaimWrongItem, Text: "got a different teapot",
-			Evidence: proto.DisputeEvidence{Messages: o.events, DeliveryKeyForEscrow: o.req.Delivery.KeyForEscrow, DeliveryCiphertext: o.req.Delivery.Ciphertext}}
+			Evidence: proto.DisputeEvidence{Messages: o.events, DeliveryKeyForEscrow: o.keyForEscrow}}
 		u.send(t, ctx, e.escr.NostrPubHex(), o.id, proto.TypeDisputeOpen, open)
 		u.send(t, ctx, e.shopper.NostrPubHex(), o.id, proto.TypeDisputeOpen, open)
 
@@ -350,10 +364,17 @@ func TestOrderFlows(t *testing.T) {
 		if c.State != escrow.CaseOpen || !c.FeePaid || c.DeliveryAddress == nil || c.DeliveryAddress.Name != "山田 太郎" {
 			t.Fatalf("case %+v", c)
 		}
+		// the shopper hands over the user's order.escrow_key (a signed message among its evidence)
 		ev := c.Evidence[e.shopper.NostrPubHex()][0]
-		if ev.DeliveryKeyForEscrow == "" || len(ev.Messages) < 4 || len(ev.PurchaseEvidence) == 0 {
+		if ev.DeliveryKeyForEscrow != o.keyForEscrow || len(ev.Messages) < 5 || len(ev.PurchaseEvidence) == 0 {
 			t.Fatalf("shopper evidence %+v", ev)
 		}
+		// a ruling is given once
+		defer func() {
+			if code := admin(t, "POST", e.escrowAdmin+"/cases/"+o.id+"/rule", map[string]string{"user": "1", "shopper": "1"}, nil); code != 409 {
+				t.Errorf("second ruling answered %d", code)
+			}
+		}()
 
 		reserve, _ := strconv.ParseInt(o.quote.PayoutFeeReserve, 10, 64)
 		total := o.prev.Amount - reserve
@@ -410,11 +431,18 @@ func TestOrderFlows(t *testing.T) {
 	t.Run("rejections", func(t *testing.T) {
 		// an escrow outside the list is refused before any risk or price work
 		oid := newOrderID()
-		req := proto.OrderRequest{ShopURL: e.shopURL, ShopRegion: "JP-13-13104", Items: []proto.Item{{SKU: "A-100", Qty: 1}},
-			Payment: proto.AssetBTC, Escrow: e.operator.NostrPubHex(), Delivery: proto.Delivery{Ciphertext: "x", KeyForShopper: "x", KeyForEscrow: "x"},
-			UserBTCAddress: u.keys.WalletAddress()}
-		k, _ := u.keys.OrderKey(oid)
-		req.UserBTCPubkey = hex.EncodeToString(k.PubKey().SerializeCompressed())
+		request := func(oid string) proto.OrderRequest {
+			dk, _ := delivery.NewKey()
+			ct, _ := delivery.Seal(dk, nil, oid, delivery.Address{Name: "A", PostalCode: "1", Address: "x", Phone: "0"})
+			kShopper, _ := delivery.WrapKey(u.keys.NostrSecretHex(), e.shopper.NostrPubHex(), dk)
+			k, _ := u.keys.OrderKey(oid)
+			proof, _ := keys.SignKeyProofBTC(k, oid, u.keys.NostrPubHex())
+			return proto.OrderRequest{ShopURL: e.shopURL, ShopRegion: "JP-13-13104", Items: []proto.Item{{SKU: "A-100", Qty: 1}},
+				Payment: proto.AssetBTC, Escrow: e.operator.NostrPubHex(), Operator: e.operator.NostrPubHex(),
+				Delivery: proto.Delivery{Ciphertext: ct, KeyForShopper: kShopper, KeyForEscrowSHA256: proto.EscrowKeyHash("x")},
+				KeyProof: proof, UserBTCAddress: u.keys.WalletAddress(), UserBTCPubkey: hex.EncodeToString(k.PubKey().SerializeCompressed())}
+		}
+		req := request(oid)
 		u.send(t, ctx, e.shopper.NostrPubHex(), oid, proto.TypeOrderRequest, req)
 		var q proto.OrderQuote
 		u.wait(t, ctx, oid, proto.TypeOrderQuote, &q)
@@ -423,6 +451,7 @@ func TestOrderFlows(t *testing.T) {
 		}
 		// a region the list does not cover
 		oid2 := newOrderID()
+		req = request(oid2)
 		req.Escrow, req.ShopRegion = e.escr.NostrPubHex(), "JP-27-27100"
 		u.send(t, ctx, e.shopper.NostrPubHex(), oid2, proto.TypeOrderRequest, req)
 		u.wait(t, ctx, oid2, proto.TypeOrderQuote, &q)
@@ -431,10 +460,20 @@ func TestOrderFlows(t *testing.T) {
 		}
 		// above the order limit
 		oid3 := newOrderID()
-		req.ShopRegion, req.Items = "JP-13-13104", []proto.Item{{SKU: "A-200", Qty: 20}}
+		req = request(oid3)
+		req.Escrow, req.Items = e.escr.NostrPubHex(), []proto.Item{{SKU: "A-200", Qty: 20}}
 		u.send(t, ctx, e.shopper.NostrPubHex(), oid3, proto.TypeOrderRequest, req)
 		u.wait(t, ctx, oid3, proto.TypeOrderQuote, &q)
 		if q.Accept || q.RejectReason != proto.RejectLimit {
+			t.Fatalf("quote %+v", q)
+		}
+		// a request whose key_proof is not the requester's (§4.4.1)
+		oid4 := newOrderID()
+		req = request(oid4)
+		req.Escrow, req.KeyProof = e.escr.NostrPubHex(), request(oid3).KeyProof
+		u.send(t, ctx, e.shopper.NostrPubHex(), oid4, proto.TypeOrderRequest, req)
+		u.wait(t, ctx, oid4, proto.TypeOrderQuote, &q)
+		if q.Accept || q.RejectReason != proto.RejectInvalid {
 			t.Fatalf("quote %+v", q)
 		}
 	})

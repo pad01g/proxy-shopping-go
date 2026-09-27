@@ -4,6 +4,8 @@ export interface Config {
   port: number;
   host: string;
   cardsFile: string;
+  /** Where purchase results are kept per request_id (spec §9 idempotency). */
+  dataDir: string;
   /** Replace the scheme of shop URLs (tests without TLS only: "http"). */
   shopSchemeOverride?: "http" | "https";
   /** Passed to Chromium as --host-resolver-rules (tests without the lab DNS). */
@@ -26,6 +28,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     port: intEnv(env, "PORT", 7000),
     host: env.HOST ?? "0.0.0.0",
     cardsFile: env.BOT_CARDS_FILE || defaultCardsFile,
+    dataDir: env.BOT_DATA_DIR || "data",
     shopSchemeOverride: scheme,
     hostResolverRules: env.BROWSER_HOST_RESOLVER_RULES || undefined,
     headless: env.HEADLESS !== "false",

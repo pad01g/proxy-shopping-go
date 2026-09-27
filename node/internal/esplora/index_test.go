@@ -27,6 +27,7 @@ type fakeChain struct {
 	mempool map[string]string // txid → hex
 	sent    []string
 	reject  bool
+	onBlock func(hash string) // called after GetBlock returned (to change the chain mid-sync)
 }
 
 func (f *fakeChain) GetBlockCount(context.Context) (int64, error) {
@@ -41,6 +42,9 @@ func (f *fakeChain) GetBlockHash(_ context.Context, h int64) (string, error) {
 func (f *fakeChain) GetBlock(_ context.Context, hash string) (*bitcoinrpc.Block, error) {
 	for _, b := range f.blocks {
 		if b.Hash == hash {
+			if f.onBlock != nil {
+				f.onBlock(hash)
+			}
 			return b, nil
 		}
 	}
@@ -348,5 +352,74 @@ func TestBlockMustFollowTip(t *testing.T) {
 	var re *bitcoinrpc.RPCError
 	if errors.As(err, &re) {
 		t.Fatal("unexpected rpc error")
+	}
+}
+
+func TestBlockMustExtendTip(t *testing.T) {
+	f := newFixture(t)
+	ix := NewIndex(f.chain, keys.BTCParams, nil)
+	if err := ix.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	orphan := &bitcoinrpc.Block{BlockHeader: bitcoinrpc.BlockHeader{Hash: strings.Repeat("ab", 32), Height: 3, PreviousBlockHash: strings.Repeat("cd", 32)}}
+	if err := ix.addBlock(orphan); !errors.Is(err, errNotChild) {
+		t.Fatalf("block with another parent: %v", err)
+	}
+	if h, _ := ix.Tip(); h != 2 {
+		t.Fatalf("tip moved to %d", h)
+	}
+}
+
+// TestReorgDuringSync changes the chain between two getblock calls of one Sync: the index must not stack the
+// new chain's blocks on the old chain's, but roll back to the fork point and follow the new chain.
+func TestReorgDuringSync(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	ix := NewIndex(f.chain, keys.BTCParams, nil)
+	if err := ix.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(ix, nil)
+	spend := spendTx(f.fund, 0, wire.NewTxOut(99_000, f.tr))
+	// old chain: 3 (with the spend), 4
+	f.chain.mine(1, coinbase(3, 50_0000_0000, f.pkhScript), spend)
+	f.chain.mine(1, coinbase(4, 50_0000_0000, f.pkhScript))
+	old3 := f.chain.blocks[3].Hash
+	reorged := false
+	f.chain.onBlock = func(hash string) {
+		if hash != old3 || reorged {
+			return
+		}
+		// right after block 3 was read, the node switches to a longer chain without the spend
+		reorged = true
+		f.chain.blocks = f.chain.blocks[:3]
+		f.chain.mine(2, coinbase(3, 50_0000_0000, f.pkhScript))
+		f.chain.mine(2, coinbase(4, 50_0000_0000, f.pkhScript))
+		f.chain.mine(2, coinbase(5, 50_0000_0000, f.pkhScript))
+		f.chain.mempool[spend.TxHash().String()] = txHex(spend)
+	}
+	if err := ix.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !reorged {
+		t.Fatal("the reorg was not triggered")
+	}
+	for h := int64(0); h < int64(len(f.chain.blocks)); h++ {
+		if got, _ := ix.BlockHash(h); got != f.chain.blocks[h].Hash {
+			t.Fatalf("block %d is %s, the chain has %s", h, got, f.chain.blocks[h].Hash)
+		}
+	}
+	if h, _ := ix.Tip(); h != 5 {
+		t.Fatalf("tip %d", h)
+	}
+	var st Status
+	get(t, srv, "/tx/"+spend.TxHash().String()+"/status", &st)
+	if st.Confirmed {
+		t.Fatal("tx of the orphaned block still confirmed")
+	}
+	var os Outspend
+	get(t, srv, fmt.Sprintf("/tx/%s/outspend/0", f.fund.TxHash()), &os)
+	if !os.Spent || os.Status == nil || os.Status.Confirmed {
+		t.Fatalf("outspend after reorg %+v (want the mempool spend)", os)
 	}
 }

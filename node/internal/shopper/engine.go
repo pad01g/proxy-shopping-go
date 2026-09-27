@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
@@ -68,7 +69,33 @@ type Engine struct {
 	log *slog.Logger
 
 	locks sync.Map // order id → *sync.Mutex, serializes the work on one order
-	busy  sync.Map // order id → struct{}, purchases in progress
+	busy  sync.Map // "<job>:<order id>" → struct{}, background jobs in progress (at most one per job and order)
+	jobs  sync.WaitGroup
+	base  atomic.Pointer[context.Context] // the context of Start, for background jobs
+}
+
+// Wait waits for the background jobs that are running.
+func (e *Engine) Wait() { e.jobs.Wait() }
+
+// background runs fn in its own goroutine unless the same job for the order is still running. Message handlers
+// use it for anything that talks to a chain, the bot or a shop, so that one slow order does not hold up the
+// messages of all others. fn gets the engine's context: the context of a message handler ends with the handler.
+func (e *Engine) background(ctx context.Context, job, id string, fn func(ctx context.Context)) {
+	key := job + ":" + id
+	if _, running := e.busy.LoadOrStore(key, struct{}{}); running {
+		return
+	}
+	if base := e.base.Load(); base != nil {
+		ctx = *base
+	} else {
+		ctx = context.WithoutCancel(ctx)
+	}
+	e.jobs.Add(1)
+	go func() {
+		defer e.jobs.Done()
+		defer e.busy.Delete(key)
+		fn(ctx)
+	}()
 }
 
 // New creates the engine and registers its message handlers.
@@ -77,8 +104,12 @@ func New(d Deps) *Engine {
 		d.Log = slog.Default()
 	}
 	e := &Engine{Deps: d, db: d.DB, cfg: d.Config, log: d.Log.With("component", "shopper")}
+	if d.Shops != nil {
+		d.Shops.AllowPrivate = d.Config.AllowPrivateShops
+	}
 	m := d.Messenger
 	m.Handle(proto.TypeOrderRequest, e.onRequest)
+	m.Handle(proto.TypeOrderEscrowKey, e.onEscrowKey)
 	m.Handle(proto.TypeOrderAccept, e.onAccept)
 	m.Handle(proto.TypeOrderCancel, e.onCancel)
 	m.Handle(proto.TypeOrderFunded, e.onFunded)
@@ -95,9 +126,11 @@ func New(d Deps) *Engine {
 
 // Start runs the background loops until ctx ends.
 func (e *Engine) Start(ctx context.Context) {
+	e.base.Store(&ctx)
 	go e.loop(ctx, 2*time.Second, e.checkFunding)
 	go e.loop(ctx, time.Duration(e.cfg.TrackingPollSeconds)*time.Second, e.pollTracking)
 	go e.loop(ctx, 5*time.Second, e.watchEscrows)
+	go e.loop(ctx, 3*time.Second, e.retryPending)
 }
 
 func (e *Engine) loop(ctx context.Context, every time.Duration, fn func(ctx context.Context)) {

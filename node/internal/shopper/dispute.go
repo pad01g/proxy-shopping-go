@@ -31,12 +31,17 @@ func (e *Engine) onDisputeOpen(ctx context.Context, msg *messenger.Message) {
 	e.log.Info("dispute opened by the user", "order", msg.OrderID, "claim", d.Claim)
 }
 
-// onEvidenceRequest answers the escrow of the order with everything we have (§4.7).
+// onEvidenceRequest answers the escrow of the order with everything we have (§4.7). Sending many messages and
+// attachments takes a while, so it runs in the background.
 func (e *Engine) onEvidenceRequest(ctx context.Context, msg *messenger.Message) {
 	o, ok, err := e.Order(msg.OrderID)
 	if err != nil || !ok || msg.From != o.Request.Escrow {
 		return
 	}
+	e.background(ctx, "evidence", o.ID, func(ctx context.Context) { e.sendEvidence(ctx, o) })
+}
+
+func (e *Engine) sendEvidence(ctx context.Context, o *Order) {
 	parts := splitEvidence(e.Evidence(o))
 	for _, body := range parts {
 		if _, err := e.send(ctx, o, o.Request.Escrow, proto.TypeDisputeEvidence, body); err != nil {
@@ -45,12 +50,9 @@ func (e *Engine) onEvidenceRequest(ctx context.Context, msg *messenger.Message) 
 		}
 	}
 	// the full screenshots and receipts, too large for one message (§4.9)
-	var chunks []proto.Attachment
-	if o.Purchase != nil {
-		var err error
-		if chunks, err = proto.Chunks(o.Purchase.Evidence); err != nil {
-			e.fail(o.ID, "attachments", err)
-		}
+	chunks, err := proto.Chunks(e.PurchaseEvidence(o.ID))
+	if err != nil {
+		e.fail(o.ID, "attachments", err)
 	}
 	for _, c := range chunks {
 		if _, err := e.send(ctx, o, o.Request.Escrow, proto.TypeAttachment, c); err != nil {
@@ -85,8 +87,9 @@ func splitEvidence(ev proto.DisputeEvidence) []proto.DisputeEvidence {
 	return parts
 }
 
-// Evidence collects the signed messages of the order, the tracking, the purchase evidence and the delivery
-// key for the escrow.
+// Evidence collects the signed messages of the order (among them the user's order.escrow_key), the tracking,
+// the purchase evidence and the delivery key for the escrow. The escrow decrypts the ciphertext of the signed
+// request itself.
 func (e *Engine) Evidence(o *Order) proto.DisputeEvidence {
 	var msgs []*nostr.Event
 	seen := map[string]bool{}
@@ -98,14 +101,10 @@ func (e *Engine) Evidence(o *Order) proto.DisputeEvidence {
 			}
 		}
 	}
-	ev := proto.DisputeEvidence{
+	return proto.DisputeEvidence{
 		Messages:             msgs,
 		Tracking:             o.Tracking,
-		DeliveryKeyForEscrow: o.Request.Delivery.KeyForEscrow,
-		DeliveryCiphertext:   o.Request.Delivery.Ciphertext,
+		DeliveryKeyForEscrow: o.EscrowKey,
+		PurchaseEvidence:     proto.InlineOnly(e.PurchaseEvidence(o.ID)),
 	}
-	if o.Purchase != nil {
-		ev.PurchaseEvidence = proto.InlineOnly(o.Purchase.Evidence)
-	}
-	return ev
 }

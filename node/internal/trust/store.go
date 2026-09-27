@@ -2,6 +2,7 @@ package trust
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -14,17 +15,33 @@ import (
 
 const bucket = "trust"
 
+// ErrOutOfScope is returned by Put for events of authors the configured coordinators do not reach (§10).
+var ErrOutOfScope = errors.New("author is not reachable from the configured coordinators")
+
 // Store holds the newest version of every trust and profile event.
 type Store struct {
 	db *store.DB // may be nil (memory only)
 
 	mu     sync.RWMutex
 	events map[Key]*nostr.Event
+	scope  *scope // nil: everything valid is accepted (tests, tools)
+
+	changed chan struct{}
+}
+
+// scope is the acceptance range of §10: the coordinators' delegations, the lists of the delegated operators, and
+// the profiles and inbox relays of the shoppers and escrows of the effective set (plus our own).
+type scope struct {
+	coordinators []string
+	network      string
+	own          map[string]bool
+	operators    map[string]bool
+	participants map[string]bool
 }
 
 // NewStore loads the persisted events.
 func NewStore(db *store.DB) (*Store, error) {
-	s := &Store{db: db, events: map[Key]*nostr.Event{}}
+	s := &Store{db: db, events: map[Key]*nostr.Event{}, changed: make(chan struct{}, 1)}
 	if db == nil {
 		return s, nil
 	}
@@ -41,20 +58,150 @@ func NewStore(db *store.DB) (*Store, error) {
 	return s, nil
 }
 
+// SetScope limits the store to what the coordinators reach (§10) in the network; own are pubkeys whose
+// profiles and inbox relays are kept anyway (the node itself). Events already held outside the scope are
+// dropped. It returns how many.
+func (s *Store) SetScope(coordinators []string, network string, own ...string) int {
+	s.mu.Lock()
+	s.scope = &scope{coordinators: slices.Clone(coordinators), network: network, own: map[string]bool{}}
+	for _, pk := range own {
+		s.scope.own[pk] = true
+	}
+	dropped := s.rescopeLocked()
+	s.mu.Unlock()
+	s.persistDrops(dropped)
+	s.signal()
+	return len(dropped)
+}
+
+// Changes is signalled (coalesced) whenever the scope may have changed.
+func (s *Store) Changes() <-chan struct{} { return s.changed }
+
+func (s *Store) signal() {
+	select {
+	case s.changed <- struct{}{}:
+	default:
+	}
+}
+
+// rescopeLocked recomputes operators and participants and drops the events outside the scope.
+func (s *Store) rescopeLocked() []Key {
+	sc := s.scope
+	if sc == nil {
+		return nil
+	}
+	sc.operators = map[string]bool{}
+	for k, ev := range s.events {
+		if k.Kind == KindDelegation && slices.Contains(sc.coordinators, k.PubKey) && Network(ev) == sc.network && !Revoked(ev) {
+			sc.operators[k.D] = true
+		}
+	}
+	sc.participants = map[string]bool{}
+	for _, r := range s.effectiveLocked(sc.coordinators, sc.network) {
+		sc.participants[r.Shopper] = true
+		sc.participants[r.Escrow] = true
+	}
+	var dropped []Key
+	for k, ev := range s.events {
+		if !sc.allows(ev) {
+			delete(s.events, k)
+			dropped = append(dropped, k)
+		}
+	}
+	return dropped
+}
+
+func (s *Store) persistDrops(keys []Key) {
+	if s.db == nil {
+		return
+	}
+	for _, k := range keys {
+		_ = s.db.Delete(bucket, k.String())
+	}
+}
+
+func (sc *scope) allows(ev *nostr.Event) bool {
+	switch ev.Kind {
+	case KindDelegation:
+		return slices.Contains(sc.coordinators, ev.PubKey) && Network(ev) == sc.network
+	case KindList:
+		return sc.operators[ev.PubKey] && Tag(ev, "d") == sc.network
+	case KindShopperProfile, KindEscrowProfile:
+		return (sc.participants[ev.PubKey] || sc.own[ev.PubKey]) && Network(ev) == sc.network
+	case KindInboxRelays:
+		return sc.participants[ev.PubKey] || sc.own[ev.PubKey]
+	}
+	return false
+}
+
+// InScope tells whether the store would keep an event of this author (always true without a scope).
+func (s *Store) InScope(ev *nostr.Event) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.scope == nil || s.scope.allows(ev)
+}
+
+// Authors are the pubkeys of the scope, for subscriptions.
+type Authors struct {
+	Coordinators []string // their delegations
+	Operators    []string // their lists
+	Participants []string // their profiles and inbox relays (including our own)
+}
+
+// Authors returns the current scope; ok is false without one.
+func (s *Store) Authors() (a Authors, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sc := s.scope
+	if sc == nil {
+		return a, false
+	}
+	a.Coordinators = slices.Sorted(slices.Values(sc.coordinators))
+	for pk := range sc.operators {
+		a.Operators = append(a.Operators, pk)
+	}
+	for pk := range sc.participants {
+		a.Participants = append(a.Participants, pk)
+	}
+	for pk := range sc.own {
+		if !sc.participants[pk] {
+			a.Participants = append(a.Participants, pk)
+		}
+	}
+	sort.Strings(a.Operators)
+	sort.Strings(a.Participants)
+	return a, true
+}
+
 // Put validates and stores an event. It reports whether the event is new and newer than what we had.
+// With a scope, events of other authors are refused with ErrOutOfScope, and a new delegation or list re-evaluates
+// the scope (dropping what fell out of it).
 func (s *Store) Put(ev *nostr.Event) (bool, error) {
 	if err := Validate(ev); err != nil {
 		return false, err
 	}
 	k := KeyOf(ev)
 	s.mu.Lock()
+	if s.scope != nil && !s.scope.allows(ev) {
+		s.mu.Unlock()
+		return false, ErrOutOfScope
+	}
 	old, ok := s.events[k]
 	if ok && (old.ID == ev.ID || !Newer(ev, old)) {
 		s.mu.Unlock()
 		return false, nil
 	}
 	s.events[k] = ev
+	var dropped []Key
+	rescoped := s.scope != nil && IsTrustKind(ev.Kind)
+	if rescoped {
+		dropped = s.rescopeLocked()
+	}
 	s.mu.Unlock()
+	s.persistDrops(dropped)
+	if rescoped {
+		s.signal()
+	}
 	if s.db != nil {
 		if err := s.db.Put(bucket, k.String(), ev); err != nil {
 			return true, fmt.Errorf("persist %s: %w", k, err)
@@ -70,7 +217,21 @@ func (s *Store) Get(k Key) *nostr.Event {
 	return s.events[k]
 }
 
-// All returns every event, ordered by kind, pubkey and d.
+// syncRank orders the kinds for trust-sync (§10): delegations, lists, then profiles and inbox relays, so that a
+// receiver cutting the stream short still has the roots of trust.
+func syncRank(kind int) int {
+	switch kind {
+	case KindDelegation:
+		return 0
+	case KindList:
+		return 1
+	case KindShopperProfile, KindEscrowProfile:
+		return 2
+	}
+	return 3
+}
+
+// All returns every event: delegations, lists, profiles, inbox relays, each by pubkey and d.
 func (s *Store) All() []*nostr.Event {
 	s.mu.RLock()
 	out := make([]*nostr.Event, 0, len(s.events))
@@ -80,6 +241,9 @@ func (s *Store) All() []*nostr.Event {
 	s.mu.RUnlock()
 	sort.Slice(out, func(i, j int) bool {
 		a, b := KeyOf(out[i]), KeyOf(out[j])
+		if ra, rb := syncRank(a.Kind), syncRank(b.Kind); ra != rb {
+			return ra < rb
+		}
 		if a.Kind != b.Kind {
 			return a.Kind < b.Kind
 		}
@@ -151,6 +315,10 @@ type Row struct {
 func (s *Store) Effective(coordinators []string, network string) []Row {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.effectiveLocked(coordinators, network)
+}
+
+func (s *Store) effectiveLocked(coordinators []string, network string) []Row {
 	type triple struct{ region, shopper, escrow string }
 	seen := map[triple]bool{}
 	var rows []Row

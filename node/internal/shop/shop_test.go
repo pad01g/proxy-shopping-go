@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -30,7 +31,9 @@ func TestInspectAndScore(t *testing.T) {
 	pool := x509.NewCertPool()
 	pool.AddCert(tlsSrv.Certificate())
 	trusting := NewInspector(&tls.Config{RootCAs: pool})
+	trusting.AllowPrivate = true // the test servers listen on 127.0.0.1
 	strict := NewInspector(&tls.Config{RootCAs: x509.NewCertPool()})
+	strict.AllowPrivate = true
 	ctx := context.Background()
 	p := Policy{Allowlist: []string{"127.0.0.1"}, KnownGateways: []string{"cardgw.test"}, Threshold: 70}
 
@@ -41,13 +44,12 @@ func TestInspectAndScore(t *testing.T) {
 	if s, _ := p.Score(info); s != 100 {
 		t.Fatalf("score %d %+v", s, info)
 	}
-	// an unverifiable certificate still gives the page, without the TLS points
-	info, err = strict.Inspect(ctx, tlsSrv.URL)
-	if err != nil || info.CertOK {
-		t.Fatalf("%+v %v", info, err)
+	// a certificate that does not verify is never read insecurely
+	if info, err := strict.Inspect(ctx, tlsSrv.URL); err == nil {
+		t.Fatalf("unverified shop read: %+v", info)
 	}
-	if s, _ := p.Score(info); s != 80 {
-		t.Fatalf("score %d", s)
+	if _, err := strict.Catalog(ctx, tlsSrv.URL); err == nil {
+		t.Fatal("unverified catalog read")
 	}
 	info, err = trusting.Inspect(ctx, plain.URL)
 	if err != nil {
@@ -61,7 +63,7 @@ func TestInspectAndScore(t *testing.T) {
 		t.Fatalf("cash %+v %v", info, err)
 	}
 
-	c, err := trusting.Catalog(ctx, tlsSrv.URL+"/some/page", true)
+	c, err := trusting.Catalog(ctx, tlsSrv.URL+"/some/page")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,5 +72,36 @@ func TestInspectAndScore(t *testing.T) {
 	}
 	if _, err := ParseURL("ftp://x"); err == nil || !strings.Contains(err.Error(), "bad shop url") {
 		t.Fatal("ftp accepted")
+	}
+}
+
+func TestPrivateShopsRefused(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++; w.Write([]byte(page)) }))
+	defer srv.Close()
+	in := NewInspector(&tls.Config{})
+	for _, u := range []string{srv.URL, "http://localhost:" + srv.URL[strings.LastIndex(srv.URL, ":")+1:]} {
+		if _, err := in.Inspect(context.Background(), u); !errors.Is(err, ErrPrivateAddress) {
+			t.Fatalf("%s: %v", u, err)
+		}
+	}
+	if _, err := in.Catalog(context.Background(), srv.URL); !errors.Is(err, ErrPrivateAddress) {
+		t.Fatalf("catalog: %v", err)
+	}
+	if hits != 0 {
+		t.Fatalf("private server reached %d times", hits)
+	}
+	for addr, ok := range map[string]bool{
+		"8.8.8.8:443": true, "[2001:4860:4860::8888]:443": true,
+		"127.0.0.1:80": false, "10.1.2.3:80": false, "172.20.0.2:443": false, "192.168.1.1:80": false,
+		"169.254.169.254:80": false, "100.64.0.1:80": false, "0.0.0.0:80": false, "[::1]:80": false,
+		"[fe80::1]:80": false, "[fd00::1]:80": false, "[::ffff:127.0.0.1]:80": false,
+	} {
+		if err := checkPublic(addr); (err == nil) != ok {
+			t.Errorf("%s: %v", addr, err)
+		}
+	}
+	if _, err := ParseURL("https://user:pw@shop.test/"); err == nil {
+		t.Error("url with credentials accepted")
 	}
 }

@@ -1,12 +1,13 @@
 // e2e のシナリオ（docs/lab.md）。a〜f はユーザーと決めたもの、g・h はタイムロックの確認。
-import { StaticSource, type UserClient } from '@proxy-shopping/core';
-import { ADDRESS, admin, assert, faucet, keys, pk, startUser, until, waitOrder, waitShopper, type LabName } from '../lab.js';
+import { StaticSource, signInner, type Session, type UserClient } from '@proxy-shopping/core';
+import { ADDRESS, admin, assert, faucet, keys, paidTo, pk, startUser, until, waitOrder, waitShopper, type LabName } from '../lab.js';
 import { acceptAndFund, placeFunded, requestQuote } from '../orders.js';
 import { delegate, operator1Entries, publishList, waitTrust } from '../setup.js';
 import { browserHappyPath } from './browser.js';
 
 export interface Ctx {
   users: Record<'user-1' | 'user-2', UserClient>;
+  sessions: Record<'user-1' | 'user-2', Session>;
   log: (line: string) => void;
 }
 
@@ -60,16 +61,28 @@ export const scenarios: Scenario[] = [
   },
   {
     id: 'b',
-    title: '配達失敗 → 紛争 → 誠実な escrow-1 が返金を裁定 → 利用者が連署（BTC）',
+    title: '配達失敗 → 紛争 → 誠実な escrow-1 が返金を裁定 → 利用者が連署（BTC）。偽の利用者による紛争の乗っ取りは効かない',
     async run({ users, log }) {
       const user = users['user-1'];
       const o = await placeFunded(user, { shopUrl: SAFE_SHOP, region: SHINJUKU, sku: 'FAIL-100', payment: 'btc-signet', shopper: 'shopper-1', escrow: 'escrow-1' }, 'delivery_failed');
+      // 攻撃: 捨て鍵の「偽の利用者」が、本物の利用者の公開鍵を写し、返金先だけ自分にした request で先に紛争を開く
+      const mallory = await startUser('faucet');
+      const forged = await signInner(mallory.s.signer, {
+        recipient: pk('escrow-1'), orderId: o.id, type: 'order.request',
+        body: { ...o.request, user_btc_address: mallory.s.keys.btcWallet.address },
+      });
+      await mallory.s.messenger.send(pk('escrow-1'), o.id, 'dispute.open', {
+        claim: 'not_delivered', text: '返金して', evidence: { messages: [forged], tracking: [], purchase_evidence: [] },
+      });
+      await new Promise((r) => setTimeout(r, 4000));
+      mallory.s.stop();
       await user.openDispute(o.id, { claim: 'not_delivered', text: '配送に失敗したと通知が来ました' });
       const c = await until('escrow-1 case collects evidence', 60_000, async () => {
         const c = await admin('escrow-1').case(o.id);
         return c.state === 'open' && c.delivery_address ? c : undefined;
       });
       assert(c.delivery_address?.address === ADDRESS.address, 'escrow decrypted the delivery address from key_for_escrow');
+      assert((c as { user?: string }).user === pk('user-1'), `case user is ${(c as { user?: string }).user}, not the forger`);
       // 購入画面のスクリーンショットは 1 通に収まらないので、添付として分けて届く（spec §4.9）
       const shot = await until('escrow-1 assembled the screenshot', 60_000, async () =>
         Object.values((await admin('escrow-1').case(o.id)).attachments ?? {}).find((a) => a.mime === 'image/png' && a.data_b64));
@@ -81,6 +94,8 @@ export const scenarios: Scenario[] = [
       const problems = await user.reviewRuling(o.id);
       assert(problems.length === 0, `ruling review: ${problems.join('; ')}`);
       const settled = await user.countersignRuling(o.id);
+      const refunded = await paidTo(settled.settledTxid!, o.request.user_btc_address!);
+      assert(refunded === lock - fee, `refund output ${refunded}, want ${lock - fee}`);
       await waitShopper('shopper-1', o.id, ['settled', 'closed']);
       log(`dispute ${o.id.slice(0, 8)}: refunded ${lock - fee} sats to user (escrow fee ${fee}), tx ${settled.settledTxid}`);
     },
@@ -153,9 +168,11 @@ export const scenarios: Scenario[] = [
       const nat = await admin('escrow-nat').status();
       assert(nat.reachability === 'private', `escrow-nat reachability ${nat.reachability}`);
       assert(nat.addrs.some((a) => a.includes('/p2p-circuit')), 'escrow-nat has a relay address');
-      const st = (await admin('shopper-1').p2pStatus(nat.peer_id)) as { pubkey?: string; content?: string };
-      assert(JSON.stringify(st).includes(pk('escrow-nat')), `status over libp2p: ${JSON.stringify(st).slice(0, 200)}`);
-      log(`libp2p /ps/status from shopper-1 to escrow-nat via circuit relay: ok`);
+      assert(!nat.addrs.some((a) => a.startsWith('/ip4/172.40.') && !a.includes('/p2p-circuit')), 'escrow-nat has no direct public address');
+      const st = (await admin('shopper-1').p2pStatus(nat.peer_id)) as { status?: { pubkey?: string }; limited_connection?: boolean };
+      assert(st.status?.pubkey === pk('escrow-nat'), `status over libp2p: ${JSON.stringify(st).slice(0, 200)}`);
+      // 公開側から NAT の内側へは経路が無いので、つながった以上 relay 経由か、DCUtR の穴あけに成功したかのどちらか
+      log(`libp2p /ps/status from shopper-1 to escrow-nat: ok (${st.limited_connection ? 'over the circuit relay' : 'direct after DCUtR hole punching'})`);
       // 利用者のブラウザも NAT の内側（この runner 自体が router の内側にいる）
       const r = await browserHappyPath();
       log(`browser (behind NAT) order ${r.orderId.slice(0, 8)} completed, payout ${r.txid}`);
@@ -180,15 +197,23 @@ export const scenarios: Scenario[] = [
   },
   {
     id: 'g',
-    title: 'タイムロック T1: 利用者が受け取り確認をしないまま T1 を過ぎると、shopper が単独で受け取る（BTC）',
-    async run({ users, log }) {
+    title: 'タイムロック T1: 利用者が受け取り確認をしないまま T1 を過ぎると、shopper が単独で受け取る（BTC）。偽の「連署しました」では止まらない',
+    async run({ users, sessions, log }) {
       const user = users['user-2'];
       const o = await placeFunded(user, { shopUrl: SAFE_SHOP, region: SHINJUKU, sku: 'A-100', payment: 'btc-signet', shopper: 'shopper-1', escrow: 'escrow-1' });
+      // 攻撃: 受け取った利用者が「連署・放送した」と嘘をつき、shopper に T1 の受け取りをやめさせようとする
+      await sessions['user-2'].messenger.send(pk('shopper-1'), o.id, 'dispute.countersigned', { txid: '00'.repeat(32) });
+      await new Promise((r) => setTimeout(r, 5000));
+      const still = await admin('shopper-1').order(o.id);
+      assert(still.state === 'delivered', `a bogus countersigned moved the shopper to ${still.state}`);
       const t1 = o.quote!.timelock!.t1;
       const { btc } = await faucet.height();
       await faucet.mine(t1 - btc + 1);
       const so = await waitShopper('shopper-1', o.id, ['claimed'], 120_000);
-      log(`T1=${t1}: shopper-1 claimed alone, tx ${so.payout_tx}`);
+      const got = await paidTo(so.payout_tx!, o.quote!.shopper_btc_address!);
+      const want = BigInt(o.quote!.lock_amount!) - BigInt(o.quote!.payout_fee_reserve ?? '0');
+      assert(got === want, `T1 claim paid ${got} to the shopper, want ${want}`);
+      log(`T1=${t1}: shopper-1 claimed ${got} sats alone, tx ${so.payout_tx}`);
     },
   },
   {

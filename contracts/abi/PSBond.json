@@ -16,6 +16,11 @@
         "name": "withdrawDelay_",
         "type": "uint64",
         "internalType": "uint64"
+      },
+      {
+        "name": "withdrawWindow_",
+        "type": "uint64",
+        "internalType": "uint64"
       }
     ],
     "stateMutability": "nonpayable"
@@ -130,6 +135,19 @@
   },
   {
     "type": "function",
+    "name": "withdrawWindow",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "withdrawableAt",
     "inputs": [
       {
@@ -205,6 +223,19 @@
   },
   {
     "type": "event",
+    "name": "WithdrawCancelled",
+    "inputs": [
+      {
+        "name": "escrow",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "WithdrawRequested",
     "inputs": [
       {
@@ -254,6 +285,11 @@
   {
     "type": "error",
     "name": "TooEarly",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "TooLate",
     "inputs": []
   },
   {

@@ -8,6 +8,7 @@ tls: {extra_ca: /caddy-data/caddy/pki/authorities/local/root.crt}
 nostr:
   relays: ["wss://relay-1.test", "wss://relay-2.test"]
   k: 2
+  allow_private_relays: true
 p2p:
   listen: ["/ip4/0.0.0.0/tcp/4001", "/ip4/0.0.0.0/tcp/4002/ws"]
   bootstrap: []

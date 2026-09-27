@@ -20,16 +20,18 @@ import (
 
 func TestAdminAPI(t *testing.T) {
 	relay := testutil.StartRelay(t)
+	coord := nostr.GeneratePrivateKey()
+	coordPub, _ := nostr.GetPublicKey(coord)
 	yaml := fmt.Sprintf(`role: operator
 name: operator-1
 network: ps-lab
 mnemonic_file: %s
 data_dir: %s
 admin: {listen: "", token: "secret"}
-nostr: {relays: [%q]}
+nostr: {relays: [%q], allow_private_relays: true}
 p2p: {listen: ["/ip4/127.0.0.1/tcp/0"]}
-trust: {coordinators: []}
-`, filepath.Join("..", "..", "..", "lab", "keys", "operator-1.mnemonic"), t.TempDir(), relay)
+trust: {coordinators: [%q]}
+`, filepath.Join("..", "..", "..", "lab", "keys", "operator-1.mnemonic"), t.TempDir(), relay, coordPub)
 	cfg, err := config.Parse([]byte(yaml))
 	if err != nil {
 		t.Fatal(err)
@@ -66,7 +68,6 @@ trust: {coordinators: []}
 		t.Fatalf("status %d %s", code, body)
 	}
 
-	coord := nostr.GeneratePrivateKey()
 	ev, _ := trust.NewDelegation(coord, n.keys.NostrPubHex(), "ps-lab", 1, false, "")
 	data, _ := json.Marshal(ev)
 	if code, body := do("POST", "/events", "secret", string(data)); code != 200 || !strings.Contains(body, `"newer": true`) {
@@ -77,6 +78,15 @@ trust: {coordinators: []}
 	data, _ = json.Marshal([]*nostr.Event{&bad})
 	if code, _ := do("POST", "/events", "secret", string(data)); code != http.StatusBadRequest {
 		t.Fatalf("invalid event answered %d", code)
+	}
+	// null entries and events of authors outside the trust scope are refused
+	if code, body := do("POST", "/events", "secret", "[null]"); code != http.StatusBadRequest || !strings.Contains(body, "null event") {
+		t.Fatalf("[null] answered %d %s", code, body)
+	}
+	stranger, _ := trust.NewDelegation(nostr.GeneratePrivateKey(), n.keys.NostrPubHex(), "ps-lab", 1, false, "")
+	data, _ = json.Marshal(stranger)
+	if code, body := do("POST", "/events", "secret", string(data)); code != http.StatusBadRequest || !strings.Contains(body, "not reachable") {
+		t.Fatalf("delegation of another coordinator answered %d %s", code, body)
 	}
 	if code, body := do("GET", "/trust", "secret", ""); code != 200 || !strings.Contains(body, ev.ID) {
 		t.Fatalf("trust %d", code)
@@ -96,7 +106,7 @@ trust: {coordinators: []}
 
 func TestPublishVersioned(t *testing.T) {
 	relay := testutil.StartRelay(t)
-	cfg, err := config.Parse([]byte(fmt.Sprintf("role: operator\nmnemonic_file: %s\ndata_dir: %s\nnostr: {relays: [%q]}\np2p: {listen: [\"/ip4/127.0.0.1/tcp/0\"]}\n",
+	cfg, err := config.Parse([]byte(fmt.Sprintf("role: operator\nmnemonic_file: %s\ndata_dir: %s\nnostr: {relays: [%q], allow_private_relays: true}\np2p: {listen: [\"/ip4/127.0.0.1/tcp/0\"]}\n",
 		filepath.Join("..", "..", "..", "lab", "keys", "operator-2.mnemonic"), t.TempDir(), relay)))
 	if err != nil {
 		t.Fatal(err)

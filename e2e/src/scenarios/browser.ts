@@ -9,6 +9,12 @@ async function waitAttr(page: Page, testId: string, attr: string, value: string,
   await page.getByTestId(testId).and(page.locator(`[${attr}="${value}"]`)).waitFor({ timeout });
 }
 
+/** 資金を動かす操作は、金額と宛先を示す確認ダイアログを通る */
+async function confirm(page: Page, action: string): Promise<void> {
+  await page.getByTestId('confirm-dialog').and(page.locator(`[data-action="${action}"]`)).waitFor({ timeout: T });
+  await page.getByTestId('confirm-ok').click();
+}
+
 export async function browserHappyPath(): Promise<{ orderId: string; txid: string }> {
   const mnemonic = readFileSync('/keys/user-browser.mnemonic', 'utf8').trim();
   const browser = await chromium.launch();
@@ -20,6 +26,8 @@ export async function browserHappyPath(): Promise<{ orderId: string; txid: strin
     await page.goto('https://app.test/');
     await page.getByTestId('onboarding-import-toggle').click();
     await page.getByTestId('onboarding-mnemonic-input').fill(mnemonic);
+    await page.getByTestId('onboarding-passphrase').fill('lab-passphrase');
+    await page.getByTestId('onboarding-passphrase-confirm').fill('lab-passphrase');
     await page.getByTestId('onboarding-import-submit').click();
     await page.getByTestId('whoami').and(page.locator('[data-pubkey]')).waitFor();
 
@@ -47,8 +55,10 @@ export async function browserHappyPath(): Promise<{ orderId: string; txid: strin
     await waitAttr(page, 'order-faucet', 'data-busy', 'false');
     await waitAttr(page, 'fund-balance', 'data-enough', 'true');
     await page.getByTestId('order-fund').click();
+    await confirm(page, 'order-fund');
     await waitAttr(page, 'order-status', 'data-status', 'delivered', 180_000);
     await page.getByTestId('order-release').click();
+    await confirm(page, 'order-release');
     await waitAttr(page, 'order-status', 'data-status', 'completed');
     const orderId = (await page.getByTestId('order-id').textContent())!.trim();
     const txid = (await page.getByTestId('order-completed-txid').textContent())!.trim();

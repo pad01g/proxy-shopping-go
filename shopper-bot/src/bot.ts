@@ -2,11 +2,12 @@ import type { Server } from "node:http";
 import { BrowserPool } from "./browser.js";
 import { CardVault } from "./cards.js";
 import type { Config } from "./config.js";
-import type { DriverContext } from "./drivers/driver.js";
+import type { BaseContext } from "./drivers/driver.js";
 import { defaultRegistry } from "./drivers/index.js";
 import type { DriverRegistry } from "./drivers/registry.js";
 import { createHttpServer } from "./http.js";
 import { BotService } from "./service.js";
+import { PurchaseStore } from "./store.js";
 
 export interface Bot {
   server: Server;
@@ -20,7 +21,7 @@ export function createBot(config: Config, registry: DriverRegistry = defaultRegi
     hostResolverRules: config.hostResolverRules,
     actionTimeoutMs: config.actionTimeoutMs,
   });
-  const ctx: DriverContext = {
+  const ctx: BaseContext = {
     withPage: (fn) => pool.withPage(config.purchaseTimeoutMs, fn),
     cards: CardVault.fromFile(config.cardsFile),
     origin: (shopUrl) => {
@@ -29,7 +30,7 @@ export function createBot(config: Config, registry: DriverRegistry = defaultRegi
     },
     log: (message) => console.log(`[bot] ${message}`),
   };
-  const server = createHttpServer(new BotService(registry, ctx));
+  const server = createHttpServer(new BotService(registry, ctx, new PurchaseStore(config.dataDir)));
   return {
     server,
     async close() {

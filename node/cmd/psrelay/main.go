@@ -62,10 +62,17 @@ func parseKinds(s string) ([]int, error) {
 func main() {
 	listen := flag.String("listen", env("PSRELAY_LISTEN", "0.0.0.0:7777"), "listen address")
 	data := flag.String("data", env("PSRELAY_DATA", "data"), "event store directory")
-	kinds := flag.String("kinds", env("PSRELAY_KINDS", "0,5,1059,10050,30500-30503"), "accepted kinds (list and ranges)")
+	kinds := flag.String("kinds", env("PSRELAY_KINDS", "5,1059,10050,30500-30503"), "accepted kinds (list and ranges)")
 	retention := flag.Int("retention-days", envInt("PSRELAY_RETENTION_DAYS", 30), "days to keep gift wraps (kind 1059)")
 	maxSize := flag.Int("max-event-size", envInt("PSRELAY_MAX_EVENT_SIZE", 256<<10), "maximum serialized event size in bytes")
 	name := flag.String("name", env("PSRELAY_NAME", "psrelay"), "NIP-11 name")
+	events := flag.Int("events-per-minute", envInt("PSRELAY_EVENTS_PER_MINUTE", relay.DefaultEventsPerMinute), "events per client address and minute (-1: no limit)")
+	connEvents := flag.Int("conn-events-per-minute", envInt("PSRELAY_CONN_EVENTS_PER_MINUTE", relay.DefaultConnEventsPerMinute), "events per connection and minute (-1: no limit)")
+	reqs := flag.Int("reqs-per-minute", envInt("PSRELAY_REQS_PER_MINUTE", relay.DefaultReqsPerMinute), "REQ filters per client address and minute (-1: no limit)")
+	conns := flag.Int("conns-per-minute", envInt("PSRELAY_CONNS_PER_MINUTE", relay.DefaultConnsPerMinute), "new connections per client address and minute (-1: no limit)")
+	maxSubs := flag.Int("max-subscriptions", envInt("PSRELAY_MAX_SUBSCRIPTIONS", relay.DefaultMaxSubscriptions), "open subscriptions per connection (-1: no limit)")
+	maxLimit := flag.Int("max-limit", envInt("PSRELAY_MAX_LIMIT", relay.DefaultMaxLimit), "cap of the limit of a filter")
+	proxies := flag.String("trusted-proxies", env("PSRELAY_TRUSTED_PROXIES", ""), "comma separated IPs / CIDRs of reverse proxies whose X-Forwarded-For names the client")
 	flag.Parse()
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil)).With("service", "psrelay")
 
@@ -74,7 +81,11 @@ func main() {
 		log.Error("kinds", "err", err)
 		os.Exit(2)
 	}
-	srv, err := relay.New(relay.Options{DataDir: *data, Kinds: ks, RetentionDays: *retention, MaxEventSize: *maxSize, Name: *name, Log: log})
+	srv, err := relay.New(relay.Options{
+		DataDir: *data, Kinds: ks, RetentionDays: *retention, MaxEventSize: *maxSize, Name: *name, Log: log,
+		EventsPerMinute: *events, ConnEventsPerMinute: *connEvents, ReqsPerMinute: *reqs, ConnsPerMinute: *conns,
+		MaxSubscriptions: *maxSubs, MaxLimit: *maxLimit, TrustedProxies: strings.Split(*proxies, ","),
+	})
 	if err != nil {
 		log.Error("start", "err", err)
 		os.Exit(1)

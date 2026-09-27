@@ -54,6 +54,7 @@ func (n *Node) adminHandler() http.Handler {
 	case n.shopper != nil:
 		mux.HandleFunc("GET /orders", n.handleOrders)
 		mux.HandleFunc("GET /orders/{id}", n.handleOrder)
+		mux.HandleFunc("POST /orders/{id}/resolve", n.handleResolve)
 	case n.escrow != nil:
 		mux.HandleFunc("GET /cases", n.handleCases)
 		mux.HandleFunc("GET /cases/{id}", n.handleCase)
@@ -133,6 +134,11 @@ func (n *Node) handleEvents(w http.ResponseWriter, r *http.Request) {
 	var out []result
 	status := http.StatusOK
 	for _, ev := range evs {
+		if ev == nil {
+			out = append(out, result{Error: "null event"})
+			status = http.StatusBadRequest
+			continue
+		}
 		newer, err := n.PublishEvent(r.Context(), ev)
 		res := result{ID: ev.ID, Newer: newer}
 		if err != nil {
@@ -213,6 +219,24 @@ func (n *Node) handleOrder(w http.ResponseWriter, r *http.Request) {
 	}{o, append(n.msgr.Inbox(o.ID), n.msgr.Outbox(o.ID)...)})
 }
 
+// handleResolve settles an order the bot left to a human (shopper.ResolveRequest).
+func (n *Node) handleResolve(w http.ResponseWriter, r *http.Request) {
+	var req shopper.ResolveRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	o, err := n.shopper.Resolve(r.Context(), r.PathValue("id"), req)
+	switch {
+	case errors.Is(err, shopper.ErrNotResolvable):
+		writeError(w, http.StatusConflict, err)
+	case err != nil:
+		writeError(w, http.StatusBadRequest, err)
+	default:
+		writeJSON(w, http.StatusOK, o)
+	}
+}
+
 func (n *Node) handleCases(w http.ResponseWriter, _ *http.Request) {
 	cases, err := n.escrow.Cases()
 	if err != nil {
@@ -242,7 +266,7 @@ func (n *Node) handleRule(w http.ResponseWriter, r *http.Request) {
 	}
 	ruling, err := n.escrow.Rule(r.Context(), r.PathValue("id"), req)
 	switch {
-	case errors.Is(err, escrow.ErrNoObligation):
+	case errors.Is(err, escrow.ErrNoObligation), errors.Is(err, escrow.ErrAlreadyRuled):
 		writeError(w, http.StatusConflict, err)
 	case err != nil:
 		writeError(w, http.StatusBadRequest, err)

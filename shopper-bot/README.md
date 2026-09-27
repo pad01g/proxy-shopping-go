@@ -16,9 +16,17 @@ psnode (shopper) ──HTTP──▶ shopper-bot :7000 ──Chromium──▶ �
 
 型は `schema/*.json`（JSON Schema 2020-12）。要求も応答も ajv で検証する。不正な要求は 400、ドライバが不正な結果を返したら 500。
 
+### 冪等（`request_id`）
+
+- 結果は `request_id` ごとに `BOT_DATA_DIR/purchases/<sha256(request_id)>.json` に保存する（一時ファイル + rename）。同じ `request_id` の要求には、店を操作せず保存した結果を返す（再起動の後も）。
+- 購入の途中に同じ `request_id` が来たら `409 {"status":"in_progress","request_id"}`。ノードは少し待って同じ要求を送り直す。
+- 同じ `request_id` で中身の違う要求は `422`（要求の誤り。再試行しない）。
+- 店を操作する前に `started`、支払いの操作（カードの送信・現金の受け取り）の直前に `payment_submitted` を記録する。`payment_submitted` のまま止まった要求は二度と実行せず `needs_human` を返す。`started` のまま止まった要求（まだ払っていない）はやり直す。
+- 支払いの後に失敗した要求は `needs_human` として保存され、同じ `request_id` でも再実行しない。
+
 `PurchaseResult.status`:
 
-- `ok`: 買えた。`shop_order_id` と `total`（店の表示額）、証拠（確認画面の全体スクリーンショット PNG と JSON の receipt）付き。
+- `ok`: 買えた。`shop_order_id` と `total`（店の表示額）、証拠（確認画面のスクリーンショットと JSON の receipt）付き。スクリーンショットは表示範囲（1280×900）だけの PNG。200 KiB を超えるときは JPEG（品質 70、次に 40）、それでも超えれば `sha256` と `mime` だけにする。
 - `failed`: **支払っていない** ことが分かっている失敗。店の合計が `max_amount` を超えた、カードが拒否された、商品が無い、など。
 - `needs_human`: 人が確かめる必要がある。担当のドライバが無い店、または支払いの操作の後に何かが起きて支払われたか分からないとき。
 
@@ -53,6 +61,7 @@ AI 版も同じ入出力（`PurchaseRequest` → `PurchaseResult`, `TrackingQuer
 |---|---|---|
 | `PORT` / `HOST` | `7000` / `0.0.0.0` | 待ち受け |
 | `BOT_CARDS_FILE` | `lab/cards.json` | `{"cards": {"default": {"number","exp","cvc","name"}}}` |
+| `BOT_DATA_DIR` | `data`（イメージでは `/data`） | 購入結果の保存先（冪等のため。lab は volume `bot1_data` / `bot2_data`） |
 | `NODE_EXTRA_CA_CERTS` | ― | lab の Caddy のルート CA（Chromium は `ignoreHTTPSErrors` で動く） |
 | `PURCHASE_TIMEOUT_MS` | `120000` | 1 回の購入の上限 |
 | `ACTION_TIMEOUT_MS` | `15000` | 1 操作の上限 |

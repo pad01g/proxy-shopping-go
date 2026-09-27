@@ -55,16 +55,17 @@ services:
         ipv4_address: 172.40.0.2
         aliases: [app.test, relay-1.test, relay-2.test, esplora.test, evm.test, faucet.test, rates.test, safe-shop.test, us-shop.test, cash-store.test, cardgw.test, risky-shop.test]
 
+  # NAT の内側の利用者（runner とブラウザ）はすべて router の 1 つの IP から来るので、IP ごとの上限を広げる
   relay-1:
     <<: *node
     build: ./node
     pull_policy: build
-    command: ["psrelay", "-listen", "0.0.0.0:7777", "-data", "/data"]
+    command: ["psrelay", "-listen", "0.0.0.0:7777", "-data", "/data", "-trusted-proxies", "172.40.0.2", "-conns-per-minute", "2000", "-events-per-minute", "6000", "-reqs-per-minute", "6000"]
     volumes: [relay1_data:/data]
     networks: {pub: {ipv4_address: 172.40.0.10}}
   relay-2:
     <<: *node
-    command: ["psrelay", "-listen", "0.0.0.0:7777", "-data", "/data"]
+    command: ["psrelay", "-listen", "0.0.0.0:7777", "-data", "/data", "-trusted-proxies", "172.40.0.2", "-conns-per-minute", "2000", "-events-per-minute", "6000", "-reqs-per-minute", "6000"]
     volumes: [relay2_data:/data]
     networks: {pub: {ipv4_address: 172.40.0.11}}
 
@@ -170,7 +171,7 @@ services:
     image: proxy-shopping/shopper-bot:dev
     environment: &bot-env
       NODE_EXTRA_CA_CERTS: /caddy-data/caddy/pki/authorities/local/root.crt
-    volumes: [caddy_data:/caddy-data:ro]
+    volumes: [caddy_data:/caddy-data:ro, bot1_data:/data]
     depends_on: *edge-ready
     logging: *logging
     networks: {pub: {ipv4_address: 172.40.0.31}}
@@ -190,7 +191,7 @@ services:
     image: proxy-shopping/shopper-bot:dev
     pull_policy: never
     environment: *bot-env
-    volumes: [caddy_data:/caddy-data:ro]
+    volumes: [caddy_data:/caddy-data:ro, bot2_data:/data]
     depends_on:
       <<: *edge-ready
       bot-1: {condition: service_started}
@@ -312,6 +313,7 @@ services:
       - caddy_data:/caddy-data:ro
       - deployments:/deployments:ro
       - ./e2e/results:/src/proxy-shopping-go/e2e/results
+      - ./lab/web-config.json:/src/proxy-shopping-go/lab/web-config.json:ro
       # シナリオ h で shopper-2 を止める（「shopper が消えた」状態を作る）ためだけに使う
       - /var/run/docker.sock:/var/run/docker.sock
     networks: {home: {ipv4_address: 172.41.0.20}}
@@ -328,6 +330,8 @@ volumes:
   escrownat_data:
   operator1_data:
   operator2_data:
+  bot1_data:
+  bot2_data:
 
 networks:
   pub:

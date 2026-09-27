@@ -25,3 +25,10 @@ func TestWireShapes(t *testing.T) {
 		t.Fatalf("%+v %v", ts, err)
 	}
 }
+
+func TestRequestCommitsToTheEscrowKey(t *testing.T) {
+	data, _ := json.Marshal(OrderRequest{Delivery: Delivery{Ciphertext: "c", KeyForShopper: "k", KeyForEscrowSHA256: EscrowKeyHash("x")}, KeyProof: "p"})
+	if strings.Contains(string(data), `"key_for_escrow"`) || !strings.Contains(string(data), `"key_for_escrow_sha256":"2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"`) || !strings.Contains(string(data), `"key_proof":"p"`) {
+		t.Fatalf("request: %s", data)
+	}
+}

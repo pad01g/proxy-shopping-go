@@ -256,8 +256,9 @@ NIP-59 の 3 層に従う。ただし中身（rumor）は **署名付き** に�
   "delivery": {
     "ciphertext": "<base64(nonce24 || XChaCha20-Poly1305(K, nonce, JSON(Address), aad=order_id の 16 byte))>",
     "key_for_shopper": "<NIP-44 v2(user→shopper, hex(K))>",
-    "key_for_escrow": "<NIP-44 v2(user→escrow, hex(K))>"
+    "key_for_escrow_sha256": "<hex(SHA-256(key_for_escrow の文字列))>"
   },
+  "key_proof": "<§4.4.1>",
   "user_btc_pubkey": "<33 byte 圧縮公開鍵 hex>（btc のとき）",
   "user_btc_address": "tb1q…（返金先）",
   "user_evm_address": "0x…（usdc のとき）",
@@ -267,8 +268,23 @@ NIP-59 の 3 層に従う。ただし中身（rumor）は **署名付き** に�
 
 `Address = {"name","postal_code","address","phone"}`。
 
-- K は 32 byte の乱数。shopper は `key_for_escrow` を紛争に備えて保存する。**紛争になったら shopper（または user）が escrow に渡す**。
+- K は 32 byte の乱数。
+- `key_for_escrow = NIP-44 v2(user→escrow, hex(K))` は **order.request に入れない**。
+  - 入れると `escrow.notice` に写った request から、紛争の無い注文でも escrow が住所を読めてしまう。
+  - user は request の直後に、`order.escrow_key {"key_for_escrow"}` を shopper へ送る。shopper はそれを紛争に備えて保存する。
+  - **紛争になったら、shopper（または user）が escrow に渡す**（`order.escrow_key` の署名付き inner を証拠に入れる）。
+  - escrow は `key_for_escrow_sha256` と照らし合わせ、**署名付きの request の `ciphertext` だけ**を復号する（相手が差し出した別の ciphertext は使わない）。
 - `order_id` は inner の `o` タグ。
+
+#### 4.4.1 key_proof（身元とチェーンの鍵の結び付け）
+
+Nostr の身元（inner の署名者）と、多重署名に入れるチェーンの鍵が同じ人のものであることを示す。
+これが無いと、別の身元が user の公開鍵を写した request を作り、escrow に「自分が user だ」と名乗れる。
+
+- 対象のメッセージ `m = "ps-key-proof-v1|" + order_id + "|" + user の Nostr 公開鍵（hex）"`
+- `btc-signet`: `key_proof = hex(BIP340 Schnorr 署名(SHA-256(m)))`。鍵は `user_btc_pubkey` の秘密鍵（§1 の注文鍵）。検証は x-only 公開鍵で行う。
+- `usdc-evm`: `key_proof = hex(EIP-191 personal_sign(m))`（65 byte）。署名者は `user_evm_address` と一致すること。
+- shopper と escrow は、`key_proof` が検証できない request を拒否する。
 
 ### 4.5 order.quote
 
@@ -298,7 +314,32 @@ NIP-59 の 3 層に従う。ただし中身（rumor）は **署名付き** に�
 - 金額の単位: BTC は sats（整数）、USDC は 6 桁の基本単位（整数）。`lock_amount` は多重署名に入れる額（payout の手数料の予備を含む）。
 - 換算: `lock_amount = ceil((items + shipping + shopper_fee) / rate × 10^decimals) + payout_fee_reserve`（USDC の payout_fee_reserve は 0）。
 - `timelock`: BTC はブロック高、USDC は UNIX 秒。既定 `t1 = 今 + (delivery_days + 21) 日`, `t2 = t1 + 14 日`（BTC は 600 秒 = 1 ブロックで換算）。
-- **user 側の検証:** user は自分の設定したレートの取得元で同じ pair を計算し、乖離 `|quote − own| / own` が 3% を超えたら注意、10% を超えたら強い警告を表示する。escrow の組み合わせが実効の一覧（§2.4）に無ければ受け付けない。user は `escrow_address` を自分で計算し直して一致を確かめる。
+- **user 側の検証:**
+  - レート: user は自分で設定した取得元で同じ pair を計算し、乖離 `|quote − own| / own` を出す。
+    - 3% を超えたら注意を出す。
+    - 10% を超えたら強い警告を出し、**利用者が明示的に確認するまで承諾できない**。
+  - 組み合わせ: escrow の組み合わせが実効の一覧（§2.4）に無ければ受け付けない。
+  - アドレス: `escrow_address` を自分で計算し直して一致を確かめる。
+  - 次のどれかに当たる見積は **エラー** とし、承諾できない。
+    - `lock_amount` が、見積の価格とレートから計算し直した値と一致しない。
+    - `payout_fee_reserve` が上限を超える。BTC は `min(20000 sats, max(2000 sats, lock_amount の 5%))`（少額の注文でも 2000 sats までは認める）、USDC は 0。
+    - `escrow_upfront_fee` が、escrow のプロフィールの `max(bps × lock, min)` の 2 倍を超える。
+    - タイムロックが user の方針を満たさない（§4.5.1）。
+
+#### 4.5.1 タイムロックの方針（user 側）
+
+shopper は T1 以降に単独で受け取れるので、T1 が近すぎる見積は、買わずに持ち逃げする準備になる。
+user のクライアントは、**今のブロック高 / チェーンの時刻** と比べて次を確かめる。
+
+| 値 | 既定（公開網） | 意味 |
+|---|---|---|
+| `min_t1` | (`delivery_days` + 14) 日 | T1 は今からこれ以上先 |
+| `min_gap` | 7 日 | T2 − T1 の下限 |
+| `max_t2` | 120 日 | T2 は今からこれ以下 |
+
+- BTC は 600 秒 = 1 ブロックで換算する。
+- BTC の T1 / T2 は 500000000 未満（ブロック高）であること。
+- 利用者はこの方針を設定で変えられる。lab の `config.json` は短い値を配る（`timelock_policy`）。
 
 ### 4.6 order.funded
 
@@ -307,7 +348,15 @@ NIP-59 の 3 層に従う。ただし中身（rumor）は **署名付き** に�
 {"asset": "usdc-evm", "safe": "0x…", "deploy_tx": "0x…", "fund_tx": "0x…", "fee_tx": "0x…", "amount": "…"}
 ```
 
-shopper は 1 承認（既定）を確認してから購入する。
+shopper は 1 承認（既定）を確認してから購入する。加えて、次を確かめる。
+
+- `order.accept` を受け取っていること、入金の承認時刻が `expires_at` + 猶予（既定 1 時間）より前であること。
+- 購入を始める時点で、T1 までに `delivery_days` + 猶予が残っていること（残っていなければ協力的な払い戻しを申し出る）。
+- **同じ出力（txid:vout）・同じ Safe・同じ前払い手数料の取引を、別の注文で使っていないこと。**
+- 前払い手数料:
+  - BTC は **同じ入金 tx** の中に escrow の `btc_fee_address` への出力があること（`fee_txid` は `txid` と同じ）。
+  - USDC は `fee_tx` が `user_evm_address` から escrow の `evm_address` への USDC の transfer で、承認済みであること。
+  - escrow も同じ確認をし、使い回された手数料の注文には裁定の義務を負わない。
 
 ### 4.7 dispute.open
 
@@ -320,13 +369,22 @@ shopper は 1 承認（既定）を確認してから購入する。
     "messages": [<署名付き inner> …],
     "tracking": [TrackingStatus …],
     "purchase_evidence": [Evidence …],
-    "delivery_key_for_escrow": "<order.request の key_for_escrow>",
-    "delivery_ciphertext": "<order.request の delivery.ciphertext>"
+    "delivery_key_for_escrow": "<order.escrow_key の key_for_escrow>"
   }
 }
 ```
 
 escrow は **すべての証拠**（店の注文番号・配送状況・双方の申告と署名付きメッセージ）を揃えてから裁定する。足りなければ `dispute.evidence_request` で求める。
+
+**escrow が注文を組み立てる規則:**
+
+- 注文の request・quote・accept・funded は、**`escrow.notice` で受け取ったもの**を使う。
+- 証拠に入った同じ種類のメッセージが、それと食い違う（id が違う）ときは、証拠のほうを無視して記録に残す。
+- notice が無い注文は、証拠から組み立てる。同じ注文 id に異なる request が 2 つ以上あれば、その紛争は受けない。
+- user は request の署名者で、`key_proof`（§4.4.1）が検証できること。
+- funded の出力（BTC の scriptPubKey）と Safe のアドレスが、request と quote から計算し直した P2WSH / Safe と一致すること。
+  - Safe は、所有者・しきい値・モジュールの設定もチェーン上で確かめる。
+- 前払い手数料が §4.6 を満たすこと（使い回しは不可）。
 
 ### 4.8 dispute.ruling
 
@@ -341,7 +399,11 @@ escrow は **すべての証拠**（店の注文番号・配送状況・双方�
 ```
 
 - `split` の合計 = 多重署名の残高 − payout_fee_reserve。
+- `escrow_fee` ≤ `dispute_fee_bps` × （残高 − payout_fee_reserve）。
+- **escrow は 1 件の紛争に 1 回だけ裁定する**（署名済みの tx は取り消せないので、2 回目は両立しない配分を生む）。
 - どちらか一方の当事者が連署して放送する（2-of-3）。
+- 当事者は、開いている紛争の無い注文への裁定と、`escrow_fee` が上限を超える裁定を連署しない。
+- `dispute.countersigned` と `order.completed` を受けても、**チェーン上で多重署名の出力が使われたこと**（BTC は outspend、USDC は Safe の残高 0 と tx の receipt）を確かめるまで、状態を終わりにしない。
 
 ### 4.9 大きさの上限と添付
 
@@ -357,6 +419,27 @@ NIP-44 が暗号化できるのは 64 KiB までで、wrap の中の seal の中
 | type | 送り手 → 受け手 | body |
 |---|---|---|
 | `attachment` | 当事者 → escrow | 上記 |
+
+### 4.10 受け取ったメッセージの扱い
+
+- body はスキーマで検証する（型・桁・文字列の長さ）。合わないものは捨てる。
+- 相手が主張しただけの状態（完了・決着・取り消し）で、T2 の返金や紛争の操作を隠さない。
+- 連署して自動で実行してよいのは、**決まった形の取引だけ**。
+  - BTC:
+    - 入力は funded の出力 1 つだけで、witnessScript が一致すること。
+    - 出力は決まった宛先だけであること。
+    - 手数料は `payout_fee_reserve` 以下であること。
+  - USDC:
+    - `operation 0` かつ `to = usdc` の `transfer`、または `operation 1` かつ `to = MultiSendCallOnly` で USDC の transfer だけを並べたもの。
+    - `value = safeTxGas = baseGas = gasPrice = 0`、`gasToken = refundReceiver = 0`。
+    - nonce が Safe の今の nonce であること。
+    - 合計が Safe の残高であること。
+- user のクライアントは、協力的な払い戻し（`order.refund`）を含め、**資金を動かす署名には利用者の操作を求める**。
+- 受信箱のリレー（kind 10050）は先頭の 8 個までを使う。
+- ack と返信は、相手の受信箱のうち k 個までに送る。
+- 既定では、ループバック・リンクローカル・プライベートのアドレスのリレーには接続しない（lab は設定で許す）。
+- shopper は `shop_url` についても同じ扱いをする（プライベートのアドレスには接続しない。lab は設定で許す）。
+- 当事者でない相手（注文の無い相手）への返信は、再送しない。
 
 ## 5. BTC（signet, P2WSH）
 
@@ -461,6 +544,9 @@ Playwright 版と将来の AI 版は同じ入出力を持つ。JSON Schema は `
 
 - `GET /v1/capabilities` → `{"version":"1","drivers":["safe-shop.test", …]}`
 - `POST /v1/purchase` `PurchaseRequest` → `PurchaseResult`
+  - **冪等:** bot は `request_id` ごとに結果を保存し、同じ `request_id` の要求には、店をもう一度操作せず保存した結果を返す。
+  - 購入の途中なら `409 in_progress` を返す。ノードは再起動後や通信エラーのあと、同じ `request_id` で問い合わせ直す。
+  - 4xx（要求の誤り）は再試行しない。
 - `POST /v1/tracking` `TrackingQuery` → `TrackingStatus`
 
 ```ts
@@ -478,9 +564,14 @@ TrackingStatus  = {status: "processing" | "shipped" | "delivered" | "failed", ca
   - `/ps/<network>/trust/1`: kind 30500 / 30501 のイベント（JSON）
   - `/ps/<network>/profiles/1`: kind 30502 / 30503 / 10050
   受け取ったノードは検証して保存し、より新しい版なら自分の Nostr リレーにも転送する。
+- **受け入れる範囲:** 保存・中継するのは、設定した coordinator から辿れる著者のイベントだけにする。
+  - coordinator の委任書
+  - 委任された operator の一覧
+  - 実効の一覧に載った shopper / escrow のプロフィールと 10050
+  - それ以外の 10050（注文の相手の user など）は、必要なときに取りに行き、保存数に上限を設け、中継しない。
 - stream プロトコル:
   - `/ps/status/1.0.0`: 要求なし → `{"pubkey","role","network","reachability","trust":{"<operator pk>": v, …},"at"}` を身元鍵で署名した kind 5401 のイベント
-  - `/ps/trust-sync/1.0.0`: 自分が持つ trust / profiles のイベントを全部送る
+  - `/ps/trust-sync/1.0.0`: 自分が持つ trust / profiles のイベントを全部送る。委任書 → 一覧 → プロフィールの順に送る（受け手が件数の上限で打ち切っても、信頼の根から先に届くように）
 
 ## 11. 流れ
 
@@ -510,6 +601,8 @@ user                     shopper                   escrow               operator
 ```
 
 ## 12. 既知の制約
+
+- lab の `evm.test`（anvil の RPC をそのまま公開）と `faucet.test` は、誰でも時刻を進めたり残高を作ったりできる。lab 専用で、公開網で同じ構成にしてはならない。
 
 - 3 者が一覧の外で直接取引することは検知できない。一覧が売っているのは「見つけてもらえること」。
 - 紛争中に escrow が応答しないまま T1 を過ぎると、shopper が単独で受け取れる（shopper を先にしている）。escrow の義務（SLA）違反として operator に通報する。

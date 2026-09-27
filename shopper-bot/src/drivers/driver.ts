@@ -13,7 +13,17 @@ export interface DriverContext {
   /** Scheme + host to use for a shop URL (applies SHOP_SCHEME_OVERRIDE). */
   origin(shopUrl: string): string;
   log(message: string): void;
+  /**
+   * Must be awaited right before the step that can move money (submitting
+   * the card form, confirming a cash sale). It records that the purchase
+   * may have been paid, so that after a crash the bot answers needs_human
+   * instead of buying again. If it throws, do not pay.
+   */
+  beforePayment(): Promise<void>;
 }
+
+/** The part of DriverContext shared by all requests (beforePayment is per purchase). */
+export type BaseContext = Omit<DriverContext, "beforePayment">;
 
 /**
  * A way to shop at one or more hosts. The Playwright drivers follow scripted

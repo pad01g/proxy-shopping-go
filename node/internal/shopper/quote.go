@@ -16,8 +16,11 @@ import (
 
 	"github.com/pad01g/proxy-shopping-go/node/internal/amount"
 	"github.com/pad01g/proxy-shopping-go/node/internal/btc"
+	"github.com/pad01g/proxy-shopping-go/node/internal/config"
 	"github.com/pad01g/proxy-shopping-go/node/internal/contract"
+	"github.com/pad01g/proxy-shopping-go/node/internal/delivery"
 	"github.com/pad01g/proxy-shopping-go/node/internal/fx"
+	"github.com/pad01g/proxy-shopping-go/node/internal/giftwrap"
 	"github.com/pad01g/proxy-shopping-go/node/internal/keys"
 	"github.com/pad01g/proxy-shopping-go/node/internal/messenger"
 	"github.com/pad01g/proxy-shopping-go/node/internal/proto"
@@ -58,7 +61,8 @@ func (e *Engine) onRequest(ctx context.Context, msg *messenger.Message) {
 		ID: msg.OrderID, User: msg.From, Created: time.Now().Unix(), Request: req, Relays: req.Relays,
 		Events: map[string]*nostr.Event{"request": msg.Inner},
 	}
-	o.set("requested", "")
+	o.set(StateRequested, "")
+	o.addPending(ActQuote, &Action{})
 	// an order id is used once; a repeated request of the same user gets the stored answer again
 	existing, ok, _ := e.Order(o.ID)
 	if ok {
@@ -71,43 +75,86 @@ func (e *Engine) onRequest(ctx context.Context, msg *messenger.Message) {
 		e.log.Error("store order", "err", err)
 		return
 	}
-	// quoting fetches the shop and the rates; do not block the message queue
-	go e.quote(ctx, o.ID)
+	// relays do not keep order: the escrow key may have come first
+	e.replay(ctx, o.ID, o.User, proto.TypeOrderEscrowKey, e.onEscrowKey)
+	// quoting fetches the shop and the rates; the pending quote is worked off (and retried) in the background
+	e.kick(ctx, o.ID)
 }
 
-func (e *Engine) quote(ctx context.Context, id string) {
-	defer e.lock(id)()
-	o, _, err := e.Order(id)
-	if err != nil {
+// replay hands the latest stored message of a type from the user to its handler again. It is used when a message
+// arrived before the one it builds on (relays do not keep order), and was therefore skipped.
+func (e *Engine) replay(ctx context.Context, id, from, typ string, h messenger.Handler) {
+	var last *nostr.Event
+	for _, ev := range e.Messenger.Inbox(id) {
+		if ev.PubKey == from && giftwrap.Type(ev) == typ && (last == nil || ev.CreatedAt >= last.CreatedAt) {
+			last = ev
+		}
+	}
+	if last != nil {
+		h(ctx, &messenger.Message{Inner: last, From: from, Type: typ, OrderID: id})
+	}
+}
+
+// onEscrowKey keeps key_for_escrow for a dispute, after checking it against the request's commitment.
+func (e *Engine) onEscrowKey(ctx context.Context, msg *messenger.Message) {
+	var k proto.EscrowKey
+	if msg.Decode(&k) != nil || k.KeyForEscrow == "" {
 		return
 	}
-	qctx, cancel := context.WithTimeout(ctx, time.Minute)
-	defer cancel()
-	q, info, score, err := e.buildQuote(qctx, o)
+	_, _ = e.update(msg.OrderID, func(o *Order) error {
+		if o.User != msg.From || o.EscrowKey != "" {
+			return errSkip
+		}
+		if proto.EscrowKeyHash(k.KeyForEscrow) != o.Request.Delivery.KeyForEscrowSHA256 {
+			o.note("order.escrow_key does not match key_for_escrow_sha256 of the request, ignored")
+			return nil
+		}
+		o.EscrowKey = k.KeyForEscrow
+		o.Events["escrow_key"] = msg.Inner
+		o.note("escrow key received")
+		return nil
+	})
+}
+
+// doQuote answers a request (the pending quote action). A quote that could not be sent stays pending.
+func (e *Engine) doQuote(ctx context.Context, o *Order) error {
+	if o.State != StateRequested {
+		return nil
+	}
+	q, info, score, err := e.buildQuote(ctx, o)
 	if err != nil {
 		var rj *rejection
 		if !errors.As(err, &rj) {
-			rj = &rejection{reason: proto.RejectUnavailable, detail: err.Error()}
+			e.log.Warn("quote failed", "order", o.ID, "err", err)
+			rj = &rejection{reason: proto.RejectUnavailable, detail: "the quote could not be made"}
 		}
 		q = &proto.OrderQuote{Accept: false, RejectReason: rj.reason, Detail: rj.detail}
 	}
 	ev, err := e.send(ctx, o, o.User, proto.TypeOrderQuote, q)
 	if err != nil {
-		e.fail(id, "quote not sent", err)
-		return
+		return err
 	}
-	_, _ = e.update(id, func(o *Order) error {
-		o.Quote, o.Shop, o.Score = q, info, score
-		o.Events["quote"] = ev
+	_, err = e.update(o.ID, func(cur *Order) error {
+		cur.Quote, cur.Shop, cur.Score, cur.ChainExpiresAt = q, info, score, o.ChainExpiresAt
+		cur.Events["quote"] = ev
 		if q.Accept {
-			o.set(StateQuoted, fmt.Sprintf("lock %s %s", q.LockAmount, q.Asset))
+			cur.set(StateQuoted, fmt.Sprintf("lock %s %s", q.LockAmount, q.Asset))
 		} else {
-			o.set(StateRejected, q.RejectReason+": "+q.Detail)
+			cur.set(StateRejected, q.RejectReason+": "+q.Detail)
 		}
 		return nil
 	})
-	e.log.Info("quoted", "order", id, "accept", q.Accept, "reason", q.RejectReason, "detail", q.Detail)
+	e.log.Info("quoted", "order", o.ID, "accept", q.Accept, "reason", q.RejectReason, "detail", q.Detail)
+	return err
 }
+
+// Limits of the bot schema (shopper-bot/schema) checked before quoting.
+const (
+	maxItems   = 20
+	maxQty     = 99
+	maxSKU     = 64
+	maxAddress = 500
+)
 
 // buildQuote runs the checks of §4.5 / §8 and prices the order.
 func (e *Engine) buildQuote(ctx context.Context, o *Order) (*proto.OrderQuote, *shop.Info, int, error) {
@@ -139,16 +186,24 @@ func (e *Engine) buildQuote(ctx context.Context, o *Order) (*proto.OrderQuote, *
 	default:
 		return nil, nil, 0, reject(proto.RejectPayment, "unknown payment %q", req.Payment)
 	}
+	if err := contract.VerifyKeyProof(o.ID, o.User, req); err != nil {
+		return nil, nil, 0, reject(proto.RejectInvalid, "%v", err)
+	}
 	u, err := shop.ParseURL(req.ShopURL)
 	if err != nil {
 		return nil, nil, 0, reject(proto.RejectInvalid, "%v", err)
 	}
 	host := strings.ToLower(u.Hostname())
-	if len(req.Items) == 0 {
-		return nil, nil, 0, reject(proto.RejectInvalid, "no items")
+	if len(req.Items) == 0 || len(req.Items) > maxItems {
+		return nil, nil, 0, reject(proto.RejectInvalid, "1 to %d items are needed", maxItems)
 	}
-	if req.Delivery.Ciphertext == "" || req.Delivery.KeyForShopper == "" || req.Delivery.KeyForEscrow == "" {
-		return nil, nil, 0, reject(proto.RejectInvalid, "delivery address and keys are required")
+	for _, it := range req.Items {
+		if it.SKU == "" || len(it.SKU) > maxSKU || it.Qty < 1 || it.Qty > maxQty {
+			return nil, nil, 0, reject(proto.RejectInvalid, "item %.64q: sku of 1-%d bytes and qty 1-%d are needed", it.SKU, maxSKU, maxQty)
+		}
+	}
+	if req.Delivery.Ciphertext == "" || req.Delivery.KeyForShopper == "" || !isHex32(req.Delivery.KeyForEscrowSHA256) {
+		return nil, nil, 0, reject(proto.RejectInvalid, "delivery ciphertext, key_for_shopper and key_for_escrow_sha256 are required")
 	}
 
 	// the shopper × escrow combination must be in the effective set and cover the shop region
@@ -174,15 +229,25 @@ func (e *Engine) buildQuote(ctx context.Context, o *Order) (*proto.OrderQuote, *
 	if len(match) == 0 {
 		return nil, nil, 0, reject(proto.RejectRegion, "shop %s is not listed for this combination", host)
 	}
+	// the operator the request names (its list decides the donation, §2.3) must be the one listing us
+	if !slices.ContainsFunc(match, func(r trust.Row) bool { return r.Operator == req.Operator }) {
+		return nil, nil, 0, reject(proto.RejectTrust, "operator %s does not list this combination", short(req.Operator))
+	}
 	escrow, _ := e.Trust.EscrowProfile(req.Escrow, e.Network)
 	if escrow == nil {
 		return nil, nil, 0, reject(proto.RejectUnavailable, "no profile of escrow %s", short(req.Escrow))
+	}
+	// the address must open and be something the bot can use (shopper-bot/schema/Address.json)
+	if err := e.checkAddress(o); err != nil {
+		return nil, nil, 0, reject(proto.RejectInvalid, "delivery address: %v", err)
 	}
 
 	// shop risk (§8)
 	info, err := e.Shops.Inspect(ctx, req.ShopURL)
 	if err != nil {
-		return nil, nil, 0, reject(proto.RejectUnavailable, "shop not reachable: %v", err)
+		// the error may describe the shopper's own network; the requester only learns that it failed
+		e.log.Info("shop not reachable", "order", o.ID, "url", req.ShopURL, "err", err)
+		return nil, nil, 0, reject(proto.RejectUnavailable, "shop not reachable")
 	}
 	score := 0
 	if info.CashOnly {
@@ -202,9 +267,10 @@ func (e *Engine) buildQuote(ctx context.Context, o *Order) (*proto.OrderQuote, *
 	}
 
 	// price
-	cat, err := e.Shops.Catalog(ctx, req.ShopURL, info.CertOK)
+	cat, err := e.Shops.Catalog(ctx, req.ShopURL)
 	if err != nil {
-		return nil, info, score, reject(proto.RejectUnavailable, "%v", err)
+		e.log.Info("catalog not readable", "order", o.ID, "url", req.ShopURL, "err", err)
+		return nil, info, score, reject(proto.RejectUnavailable, "shop catalog not readable")
 	}
 	cur := cat.Currency
 	if !slices.Contains(e.cfg.Currencies, cur) {
@@ -263,6 +329,10 @@ func (e *Engine) buildQuote(ctx context.Context, o *Order) (*proto.OrderQuote, *
 	lock, err := amount.LockAmount(total, rate, decimals, reserve)
 	if err != nil {
 		return nil, info, score, err
+	}
+	// user clients refuse a reserve above min(20000 sats, max(2000 sats, 5% of the lock)) (§4.5)
+	if reserve > config.MaxPayoutFeeReserve || (reserve > config.MinPayoutFeeReserveCap && big.NewInt(reserve*20).Cmp(lock) > 0) {
+		return nil, info, score, reject(proto.RejectLimit, "order too small: the payout fee reserve of %d sats would exceed 5%% of the lock", reserve)
 	}
 	q := &proto.OrderQuote{
 		Accept:    true,
@@ -365,6 +435,7 @@ func (e *Engine) fillUSDC(ctx context.Context, o *Order, q *proto.OrderQuote, es
 		return reject(proto.RejectUnavailable, "escrow has no EVM address")
 	}
 	q.Timelock = &proto.Timelock{T1: int64(now) + e.cfg.Timelock.EVMT1Seconds, T2: int64(now) + e.cfg.Timelock.EVMT2Seconds}
+	o.ChainExpiresAt = int64(now) + e.cfg.QuoteTTLSeconds
 	fee := amount.BPS(lock, escrow.UpfrontFee.BPS)
 	if escrow.UpfrontFee.MinUSDC != "" {
 		min, err := amount.Parse(escrow.UpfrontFee.MinUSDC)
@@ -411,6 +482,10 @@ func (e *Engine) onAccept(ctx context.Context, msg *messenger.Message) {
 	if err != nil && !errors.Is(err, errSkip) {
 		e.log.Warn("accept", "order", msg.OrderID, "err", err)
 	}
+	if err == nil {
+		// an order.funded that overtook the accept was skipped; look at it again
+		e.replay(ctx, msg.OrderID, msg.From, proto.TypeOrderFunded, e.onFunded)
+	}
 }
 
 func (e *Engine) onCancel(ctx context.Context, msg *messenger.Message) {
@@ -423,6 +498,33 @@ func (e *Engine) onCancel(ctx context.Context, msg *messenger.Message) {
 		o.set(StateCancelled, c.Reason)
 		return nil
 	})
+}
+
+// checkAddress opens the delivery address with key_for_shopper and checks it against the bot schema.
+func (e *Engine) checkAddress(o *Order) error {
+	addr, err := e.openAddress(o)
+	if err != nil {
+		return err
+	}
+	for name, v := range map[string]string{"name": addr.Name, "postal_code": addr.PostalCode, "address": addr.Address, "phone": addr.Phone} {
+		if strings.TrimSpace(v) == "" || len(v) > maxAddress {
+			return fmt.Errorf("%s must have 1-%d bytes", name, maxAddress)
+		}
+	}
+	return nil
+}
+
+func (e *Engine) openAddress(o *Order) (delivery.Address, error) {
+	k, err := delivery.UnwrapKey(e.Keys.NostrSecretHex(), o.User, o.Request.Delivery.KeyForShopper)
+	if err != nil {
+		return delivery.Address{}, err
+	}
+	return delivery.Open(k, o.Request.Delivery.Ciphertext, o.ID)
+}
+
+func isHex32(s string) bool {
+	b, err := hex.DecodeString(s)
+	return err == nil && len(b) == 32 && strings.ToLower(s) == s
 }
 
 func short(pk string) string {

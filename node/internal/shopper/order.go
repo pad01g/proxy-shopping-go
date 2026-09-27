@@ -13,6 +13,7 @@ import (
 
 // Order states of the shopper side (spec §11).
 const (
+	StateRequested      = "requested"
 	StateRejected       = "rejected"
 	StateQuoted         = "quoted"
 	StateAccepted       = "accepted"
@@ -69,9 +70,49 @@ type Order struct {
 	Dispute *Dispute      `json:"dispute,omitempty"`
 	Ruling  *proto.Ruling `json:"ruling,omitempty"`
 
+	// EscrowKey is key_for_escrow of the user's order.escrow_key, kept for a dispute (§4.4).
+	EscrowKey string `json:"escrow_key,omitempty"`
+	// FundingSince is when the order.funded being checked arrived.
+	FundingSince int64 `json:"funding_since,omitempty"`
+	// ChainExpiresAt is expires_at in chain time (USDC: the EVM clock may run ahead of ours).
+	ChainExpiresAt int64 `json:"chain_expires_at,omitempty"`
+	// Pending are the actions still to be carried out (quote, refund, release, ruling, claim); the tick loop
+	// retries them until they are done or can never succeed.
+	Pending map[string]*Action `json:"pending,omitempty"`
+	// ClaimedPayout is a payout transaction the user told us about (dispute.countersigned). It is only believed
+	// once the chain shows the escrow spent by it.
+	ClaimedPayout string `json:"claimed_payout,omitempty"`
+
 	PayoutTx string  `json:"payout_tx,omitempty"`
 	PayoutBy string  `json:"payout_by,omitempty"` // release | ruling | timelock | other
 	History  []Entry `json:"history"`
+}
+
+// Kinds of pending actions.
+const (
+	ActQuote   = "quote"
+	ActRefund  = "refund"
+	ActRelease = "release"
+	ActRuling  = "ruling"
+	ActClaim   = "claim"
+)
+
+// Action is a pending action of an order.
+type Action struct {
+	Event    *nostr.Event `json:"event,omitempty"` // the message that asked for it (order.release, dispute.ruling)
+	Tx       string       `json:"tx,omitempty"`    // the transaction sent for it, while not known to be final
+	Sent     int64        `json:"sent,omitempty"`
+	Since    int64        `json:"since"`
+	Attempts int          `json:"attempts,omitempty"`
+	Error    string       `json:"error,omitempty"`
+}
+
+func (o *Order) addPending(kind string, a *Action) {
+	if o.Pending == nil {
+		o.Pending = map[string]*Action{}
+	}
+	a.Since = time.Now().Unix()
+	o.Pending[kind] = a
 }
 
 // Dispute records a dispute.open we were told about.
@@ -89,7 +130,13 @@ type Entry struct {
 	Detail string `json:"detail,omitempty"`
 }
 
-const bucketOrders = "orders"
+const (
+	bucketOrders = "orders"
+	// bucketUses maps the chain objects that fund an order (outpoint, Safe, fee tx) to the order (§4.6).
+	bucketUses = "funding_uses"
+	// bucketEvidence keeps the full purchase evidence (screenshots) out of the order document.
+	bucketEvidence = "purchase_evidence"
+)
 
 func (o *Order) set(state, detail string) {
 	now := time.Now().Unix()
@@ -97,8 +144,14 @@ func (o *Order) set(state, detail string) {
 	o.History = append(o.History, Entry{At: now, State: state, Detail: detail})
 }
 
+// note adds a history line. A line repeating the last one (a retry failing the same way every tick) only
+// refreshes its time, so the history does not grow with every retry.
 func (o *Order) note(detail string) {
 	o.Updated = time.Now().Unix()
+	if n := len(o.History); n > 0 && o.History[n-1].State == o.State && o.History[n-1].Detail == detail {
+		o.History[n-1].At = o.Updated
+		return
+	}
 	o.History = append(o.History, Entry{At: o.Updated, State: o.State, Detail: detail})
 }
 

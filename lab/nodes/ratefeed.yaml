@@ -1,6 +1,7 @@
 # ratefeed: copies the ratemock rates into the MockAggregatorV3 feeds (docs/spec.md §7)
 interval_seconds: 5
-evm: {rpc: "http://anvil:8545", deployments: /deployments/31337.json}
+# sender: anvil account 1 (account 0 is the deployer's and labfaucet's; one account for two senders races for nonces)
+evm: {rpc: "http://anvil:8545", deployments: /deployments/31337.json, key: "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"}
 tls: {extra_ca: /caddy-data/caddy/pki/authorities/local/root.crt}
 fx:
   sources:

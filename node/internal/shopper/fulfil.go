@@ -6,14 +6,22 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/pad01g/proxy-shopping-go/node/internal/botclient"
 	"github.com/pad01g/proxy-shopping-go/node/internal/contract"
-	"github.com/pad01g/proxy-shopping-go/node/internal/delivery"
 	"github.com/pad01g/proxy-shopping-go/node/internal/messenger"
 	"github.com/pad01g/proxy-shopping-go/node/internal/proto"
+	"github.com/pad01g/proxy-shopping-go/node/internal/store"
 )
 
-// fundingTimeout is how long we wait for a funding to confirm before giving up on the order.
-const fundingTimeout = 24 * time.Hour
+const (
+	// fundingTimeout is how long we wait for a funding to confirm before giving up on the order.
+	fundingTimeout = 24 * time.Hour
+	// fundingGrace is how long after expires_at a funding may still confirm (spec §4.6).
+	fundingGrace = int64(3600)
+)
+
+// purchaseRetry is the pause after a purchase call that has to be repeated.
+var purchaseRetry = 5 * time.Second
 
 func (e *Engine) onFunded(ctx context.Context, msg *messenger.Message) {
 	var f proto.OrderFunded
@@ -21,39 +29,38 @@ func (e *Engine) onFunded(ctx context.Context, msg *messenger.Message) {
 		return
 	}
 	_, err := e.update(msg.OrderID, func(o *Order) error {
-		if o.User != msg.From || (o.State != StateAccepted && o.State != StateQuoted) {
+		// only an accepted quote is funded; an order.funded that overtakes the accept is replayed by onAccept
+		if o.User != msg.From || o.State != StateAccepted || o.Events["accept"] == nil {
 			return errSkip
-		}
-		if o.Events["accept"] == nil {
-			// order.accept may still be on its way; the funded message implies it
-			o.note("funded before accept arrived")
 		}
 		if f.Asset != o.Quote.Asset {
 			return errSkip
 		}
 		o.Funded = &f
 		o.Events["funded"] = msg.Inner
+		o.FundingSince = time.Now().Unix()
 		o.set(StateFunding, "waiting for confirmations")
 		return nil
 	})
 	if err == nil {
-		e.checkFunding(ctx)
+		e.background(ctx, "verify", msg.OrderID, func(ctx context.Context) { e.verifyFunding(ctx, msg.OrderID) })
 	}
 }
 
-// checkFunding verifies the orders waiting for their funding and starts the purchase of verified ones.
+// checkFunding verifies the orders waiting for their funding and starts (or resumes) their purchases.
 func (e *Engine) checkFunding(ctx context.Context) {
 	orders, err := e.Orders()
 	if err != nil {
 		return
 	}
 	for _, o := range orders {
+		id := o.ID
 		switch o.State {
 		case StateFunding:
-			e.verifyFunding(ctx, o.ID)
+			e.background(ctx, "verify", id, func(ctx context.Context) { e.verifyFunding(ctx, id) })
 		case StateFunded, StatePurchasing:
-			// resume after a restart
-			e.startPurchase(ctx, o.ID)
+			// resume after a restart or a failed call; the bot answers a repeated request_id from its records
+			e.background(ctx, "purchase", id, func(ctx context.Context) { e.startPurchase(ctx, id) })
 		}
 	}
 }
@@ -67,95 +74,179 @@ func (e *Engine) verifyFunding(ctx context.Context, id string) {
 	}
 	vctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	var outpointErr error
+	f, err := e.checkChain(vctx, o)
+	if err == nil {
+		err = e.claimUses(id, f.Uses)
+	}
+	switch {
+	case err == nil:
+		late := f.ConfirmedAt > e.fundingDeadline(o)
+		o, err = e.update(id, func(o *Order) error {
+			if o.State != StateFunding {
+				return errSkip
+			}
+			if o.Quote.Asset == proto.AssetBTC {
+				op := f.Outpoint
+				o.Outpoint = &op
+				o.set(StateFunded, fmt.Sprintf("%s:%d %d sats", op.TxID, op.Vout, op.Amount))
+			} else {
+				o.Safe = f.Safe.Hex()
+				o.set(StateFunded, "safe "+o.Safe)
+			}
+			return nil
+		})
+		if err != nil {
+			return
+		}
+		if late {
+			// the price and the rate of the quote no longer hold; give the money back instead of buying
+			e.abandon(ctx, id, "funded after the quote expired")
+			return
+		}
+		e.log.Info("funding verified", "order", id)
+		e.background(ctx, "purchase", id, func(ctx context.Context) { e.startPurchase(ctx, id) })
+	case contract.IsDefinite(err):
+		// a wrong funding stays wrong; tell the user and wait for a corrected order.funded
+		e.log.Warn("funding rejected", "order", id, "err", err)
+		_, _ = e.update(id, func(o *Order) error {
+			o.Error = err.Error()
+			o.set(StateAccepted, "funding rejected: "+err.Error())
+			return nil
+		})
+		_, _ = e.send(ctx, o, o.User, proto.TypeChat, proto.Chat{Text: "funding rejected: " + err.Error()})
+	default:
+		// not confirmed yet, or the chain could not be asked: keep waiting
+		_, _ = e.update(id, func(o *Order) error {
+			if time.Since(time.Unix(o.FundingSince, 0)) > fundingTimeout {
+				o.set(StateCancelled, "funding never confirmed")
+				return nil
+			}
+			if !errors.Is(err, contract.ErrNotYet) {
+				o.note("funding check failed, will retry: " + err.Error())
+			}
+			return nil
+		})
+	}
+}
+
+// checkChain runs the funding checks of §4.6 for the asset of the order.
+func (e *Engine) checkChain(ctx context.Context, o *Order) (contract.Funding, error) {
 	switch o.Quote.Asset {
 	case proto.AssetBTC:
 		esc, err := contract.BTCEscrow(&o.Request, o.Quote)
 		if err != nil {
-			outpointErr = err
-			break
+			return contract.Funding{}, contract.Definite(err)
 		}
-		op, err := contract.VerifyBTCFunding(vctx, e.BTC, esc, o.Quote, o.Funded, e.cfg.Confirmations)
-		if err == nil {
-			_, err = e.update(id, func(o *Order) error {
-				o.Outpoint = &op
-				o.set(StateFunded, fmt.Sprintf("%s:%d %d sats", op.TxID, op.Vout, op.Amount))
-				return nil
-			})
-		}
-		outpointErr = err
+		return contract.VerifyBTCFunding(ctx, e.BTC, esc, o.Quote, o.Funded, e.cfg.Confirmations)
 	case proto.AssetUSDC:
 		d, err := e.Deployments()
 		if err != nil {
-			outpointErr = err
-			break
+			return contract.Funding{}, err
 		}
 		os, err := contract.SafeOf(d, &o.Request, o.Quote)
 		if err != nil {
-			outpointErr = err
-			break
+			return contract.Funding{}, contract.Definite(err)
 		}
-		safe, err := contract.VerifySafeFunding(vctx, e.EVM, d, os, o.ID, o.Quote, o.Funded, e.cfg.Confirmations)
-		if err == nil {
-			_, err = e.update(id, func(o *Order) error {
-				o.Safe = safe.Hex()
-				o.set(StateFunded, "safe "+safe.Hex())
-				return nil
-			})
-		}
-		outpointErr = err
+		return contract.VerifySafeFunding(ctx, e.EVM, d, os, o.ID, &o.Request, o.Quote, o.Funded, e.cfg.Confirmations)
 	}
-	switch {
-	case outpointErr == nil:
-		e.log.Info("funding verified", "order", id)
-		go e.startPurchase(context.WithoutCancel(ctx), id)
-	case errors.Is(outpointErr, contract.ErrNotYet) || isTransient(outpointErr):
-		if time.Since(time.Unix(o.Updated, 0)) > fundingTimeout {
-			_, _ = e.update(id, func(o *Order) error { o.set(StateCancelled, "funding never confirmed"); return nil })
-		}
-	default:
-		// a wrong funding stays wrong; tell the user and wait for a corrected order.funded
-		e.log.Warn("funding rejected", "order", id, "err", outpointErr)
-		_, _ = e.update(id, func(o *Order) error {
-			o.Error = outpointErr.Error()
-			o.set(StateAccepted, "funding rejected: "+outpointErr.Error())
+	return contract.Funding{}, contract.Mismatchf("unknown asset %q", o.Quote.Asset)
+}
+
+// fundingDeadline is the latest block time of a funding we still buy for: expires_at plus the grace, on the
+// clock of the chain (the EVM clock of the lab may run ahead).
+func (e *Engine) fundingDeadline(o *Order) int64 {
+	exp := o.Quote.ExpiresAt
+	if o.Quote.Asset == proto.AssetUSDC && o.ChainExpiresAt != 0 {
+		exp = o.ChainExpiresAt
+	}
+	return exp + fundingGrace
+}
+
+// claimUses records that the chain objects of a funding belong to this order. One outpoint, Safe or fee
+// transaction can fund only one order.
+func (e *Engine) claimUses(id string, uses []string) error {
+	for _, u := range uses {
+		err := store.Modify(e.db, bucketUses, u, func(owner *string, exists bool) error {
+			if exists && *owner != id {
+				return contract.Mismatchf("%s already funds order %s", u, *owner)
+			}
+			if exists {
+				return store.ErrStop
+			}
+			*owner = id
 			return nil
 		})
-		_, _ = e.send(ctx, o, o.User, proto.TypeChat, proto.Chat{Text: "funding rejected: " + outpointErr.Error()})
+		if err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
-// isTransient tells network trouble from a wrong funding.
-func isTransient(err error) bool {
-	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+// timeToT1 is how many seconds are left until T1 (BTC: 600 s per block).
+func (e *Engine) timeToT1(ctx context.Context, o *Order) (int64, error) {
+	switch o.Quote.Asset {
+	case proto.AssetBTC:
+		tip, err := e.BTC.TipHeight(ctx)
+		if err != nil {
+			return 0, err
+		}
+		return (o.Quote.Timelock.T1 - tip) * 600, nil
+	case proto.AssetUSDC:
+		now, err := e.EVM.LatestTime(ctx)
+		if err != nil {
+			return 0, err
+		}
+		return o.Quote.Timelock.T1 - int64(now), nil
+	}
+	return 0, fmt.Errorf("unknown asset %q", o.Quote.Asset)
 }
 
-// startPurchase buys the items through shopper-bot once per order.
+// startPurchase buys the items through shopper-bot. The request_id is always the order id: the bot keeps one
+// result per request_id, so asking again after a restart or a lost answer returns that result instead of
+// buying twice (spec §9).
 func (e *Engine) startPurchase(ctx context.Context, id string) {
-	if _, running := e.busy.LoadOrStore(id, struct{}{}); running {
+	o, ok, err := e.Order(id)
+	if err != nil || !ok {
 		return
 	}
-	defer e.busy.Delete(id)
-	o, err := e.update(id, func(o *Order) error {
-		if o.State != StateFunded && o.State != StatePurchasing {
-			return errSkip
+	switch o.State {
+	case StateFunded:
+		// before the first call only: enough time must be left to buy and deliver before T1
+		tctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		left, err := e.timeToT1(tctx, o)
+		cancel()
+		if err != nil {
+			e.fail(id, "time to T1", err)
+			return
 		}
-		if o.State == StateFunded {
+		if left < e.cfg.MinT1RemainingSeconds {
+			e.abandon(ctx, id, fmt.Sprintf("only %d s left until T1, %d s needed", left, e.cfg.MinT1RemainingSeconds))
+			return
+		}
+		if o, err = e.update(id, func(o *Order) error {
+			if o.State != StateFunded {
+				return errSkip
+			}
 			o.set(StatePurchasing, "")
+			return nil
+		}); err != nil {
+			return
 		}
-		return nil
-	})
-	if err != nil {
+	case StatePurchasing:
+	default:
 		return
 	}
-	k, err := delivery.UnwrapKey(e.Keys.NostrSecretHex(), o.User, o.Request.Delivery.KeyForShopper)
+	e.purchaseOnce(ctx, o)
+}
+
+// purchaseOnce calls the bot for a purchasing order and records the answer. The order may have moved on while
+// the call ran (a dispute, a payout); then the result is recorded without changing the state.
+func (e *Engine) purchaseOnce(ctx context.Context, o *Order) {
+	id := o.ID
+	addr, err := e.openAddress(o)
 	if err != nil {
-		e.purchaseFailed(ctx, o, fmt.Errorf("delivery key: %w", err))
-		return
-	}
-	addr, err := delivery.Open(k, o.Request.Delivery.Ciphertext, o.ID)
-	if err != nil {
-		e.purchaseFailed(ctx, o, err)
+		e.purchaseFailed(ctx, o.ID, fmt.Errorf("delivery address: %w", err))
 		return
 	}
 	payment := "card:default"
@@ -170,14 +261,27 @@ func (e *Engine) startPurchase(ctx context.Context, id string) {
 		RequestID: o.ID, OrderID: o.ID, ShopURL: o.Request.ShopURL, Items: o.Request.Items,
 		Shipping: addr, PaymentRef: payment, MaxAmount: max,
 	})
-	if err != nil {
-		// the bot may be restarting; keep the order in purchasing and retry on the next funding tick
+	switch {
+	case botclient.InProgress(err):
+		// the bot is still buying this request_id; ask again later
+		_, _ = e.update(id, func(o *Order) error { o.note("the bot is still buying"); return nil })
+		time.Sleep(purchaseRetry)
+		return
+	case botclient.Rejected(err):
+		e.purchaseFailed(ctx, id, err)
+		return
+	case err != nil:
+		// the bot may be restarting; keep the order in purchasing and ask again with the same request_id
 		e.fail(id, "purchase call failed", err)
-		time.Sleep(5 * time.Second)
+		time.Sleep(purchaseRetry)
 		return
 	}
 	switch res.Status {
 	case "ok":
+		if err := e.db.Put(bucketEvidence, id, res.Evidence); err != nil {
+			e.fail(id, "store purchase evidence", err)
+			return
+		}
 		body := proto.OrderPurchased{ShopOrderID: res.ShopOrderID, Evidence: proto.InlineOnly(res.Evidence)}
 		if res.Total != nil {
 			body.Total = *res.Total
@@ -187,27 +291,80 @@ func (e *Engine) startPurchase(ctx context.Context, id string) {
 			e.fail(id, "purchased not sent", err)
 		}
 		_, _ = e.update(id, func(o *Order) error {
-			o.Purchase = res
+			o.Purchase = withoutData(res)
 			if ev != nil {
 				o.Events["purchased"] = ev
 			}
-			o.set(StatePurchased, res.ShopOrderID)
+			// a dispute or payout that happened meanwhile keeps its state; the purchase is recorded anyway
+			if o.State == StatePurchasing {
+				o.set(StatePurchased, res.ShopOrderID)
+			} else {
+				o.note("purchased " + res.ShopOrderID)
+			}
 			return nil
 		})
 		e.log.Info("purchased", "order", id, "shop_order", res.ShopOrderID)
 	case "needs_human":
-		_, _ = e.update(id, func(o *Order) error { o.Purchase = res; o.set(StateNeedsHuman, res.Error); return nil })
+		_, _ = e.update(id, func(o *Order) error {
+			o.Purchase = withoutData(res)
+			if o.State == StatePurchasing {
+				o.set(StateNeedsHuman, res.Error)
+			} else {
+				o.note("bot needs a human: " + res.Error)
+			}
+			return nil
+		})
 	default:
-		e.purchaseFailed(ctx, o, fmt.Errorf("bot: %s", res.Error))
+		e.purchaseFailed(ctx, id, fmt.Errorf("bot: %s", res.Error))
 	}
 }
 
-func (e *Engine) purchaseFailed(ctx context.Context, o *Order, cause error) {
-	e.log.Warn("purchase failed", "order", o.ID, "err", cause)
-	_, _ = e.update(o.ID, func(o *Order) error { o.set(StatePurchaseFailed, cause.Error()); return nil })
-	// offer the money back: a cooperative refund signed by us (order.refund)
-	if err := e.offerRefund(ctx, o.ID); err != nil {
-		e.log.Warn("refund offer failed", "order", o.ID, "err", err)
+// withoutData copies a purchase result without the evidence data; the full items stay in bucketEvidence.
+func withoutData(res *proto.PurchaseResult) *proto.PurchaseResult {
+	out := *res
+	out.Evidence = make([]proto.Evidence, len(res.Evidence))
+	for i, ev := range res.Evidence {
+		ev.DataB64 = ""
+		out.Evidence[i] = ev
+	}
+	return &out
+}
+
+// PurchaseEvidence returns the full evidence of the purchase (with the data of screenshots and receipts).
+func (e *Engine) PurchaseEvidence(id string) []proto.Evidence {
+	var evs []proto.Evidence
+	if ok, _ := e.db.Get(bucketEvidence, id, &evs); ok {
+		return evs
+	}
+	if o, ok, _ := e.Order(id); ok && o.Purchase != nil {
+		return o.Purchase.Evidence // orders stored before the evidence bucket existed
+	}
+	return nil
+}
+
+func (e *Engine) purchaseFailed(ctx context.Context, id string, cause error) {
+	e.log.Warn("purchase failed", "order", id, "err", cause)
+	e.abandon(ctx, id, cause.Error())
+}
+
+// abandon ends an order we will not (or can no longer) buy: purchase_failed, with a cooperative refund offered.
+// Orders that moved on (dispute, payout) keep their state.
+func (e *Engine) abandon(ctx context.Context, id, reason string) {
+	_, err := e.update(id, func(o *Order) error {
+		switch o.State {
+		case StateFunded, StatePurchasing, StateNeedsHuman:
+			o.set(StatePurchaseFailed, reason)
+		default:
+			o.note("not buying: " + reason)
+			return nil
+		}
+		if o.funded() {
+			o.addPending(ActRefund, &Action{})
+		}
+		return nil
+	})
+	if err == nil {
+		e.kick(ctx, id)
 	}
 }
 
@@ -254,7 +411,6 @@ func (e *Engine) pollTracking(ctx context.Context) {
 }
 
 func (e *Engine) reportShipping(ctx context.Context, id string, st *proto.TrackingStatus) {
-	defer e.lock(id)()
 	o, err := e.update(id, func(o *Order) error {
 		if o.ShipStatus == st.Status {
 			return errSkip

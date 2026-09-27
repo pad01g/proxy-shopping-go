@@ -11,6 +11,7 @@ import type { Driver, DriverContext } from "./driver.js";
  *     schema/PurchaseResult.json (the server checks);
  *   - get card data only from ctx.cards.resolve(req.payment_ref);
  *   - refuse to pay when the shop's total exceeds req.max_amount;
+ *   - await ctx.beforePayment() right before any step that can move money;
  *   - return "needs_human" whenever it cannot tell whether it has paid;
  *   - attach a screenshot and a receipt as evidence.
  */
