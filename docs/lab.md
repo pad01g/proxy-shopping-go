@@ -36,7 +36,7 @@ Go は設定 `tls.extra_ca`、Node は `NODE_EXTRA_CA_CERTS`、Playwright は `i
 | サービス | IP | 内容 |
 |---|---|---|
 | `edge` | 172.40.0.2 | Caddy |
-| `relay-1`, `relay-2` | .10, .11 | psrelay（khatru）。下の「psrelay の制限」 |
+| `relay-1`, `relay-2` | .10, .11 | psrelay（khatru）。下の「psrelay の制限」。`edge` と `demo` の `X-Forwarded-For` を信じる |
 | `p2p-relay` | .12 | psnode `-role relay`（circuit relay v2, gossipsub の中継） |
 | `bitcoind` | .20 | Bitcoin Core 29, `-signet -signetchallenge=51`（OP_TRUE の独自 signet） |
 | `esplora` | .21 | esplora-lite（ブロックごとに親のハッシュを確かめ、合わなければ分岐点まで巻き戻す） |
@@ -52,6 +52,7 @@ Go は設定 `tls.extra_ca`、Node は `NODE_EXTRA_CA_CERTS`、Playwright は `i
 | `operator-1` | .50 | operator ノード（通報の受信箱） |
 | `operator-2` | .51 | operator ノード（シナリオ d で委任を失効させられる） |
 | `web` | .60 | nginx（proxy-shopping-web の dist） |
+| `demo` | .61（別名 `demo`） | デモ画面（proxy-shopping-web/apps/demo）と、その中継。ホストの `127.0.0.1:8888` に公開（下の「デモ画面」） |
 | `natbox` | 172.41.0.10 | NAT の内側の名前空間 |
 | `escrow-nat` | natbox を共有 | NAT の内側の escrow（libp2p は relay 経由でのみ届く） |
 | `runner` | 172.41.0.20（`home`） | e2e の実行（profile `run`）。NAT の内側から動かし、Playwright（NAT の内側のブラウザ利用者）も中で動く。docker の socket は持たない（シナリオ h は管理 API の `POST /admin/pause` を使う） |
@@ -101,6 +102,74 @@ Go は設定 `tls.extra_ca`、Node は `NODE_EXTRA_CA_CERTS`、Playwright は `i
 - 置き換え可能な kind（10050, 30500–30503）は最新の 1 件だけを保つ。新旧は `v` タグで決める（spec §2.1。同じ `v` なら `id` の小さいもの）。`v` の無い 10050 は `created_at` で決める。
 - COUNT（NIP-45）と NIP-50 の検索には応じない。
 
+## デモ画面（http://localhost:8888/）
+
+lab を動かしたまま、1 つの画面で全員の役割を演じて流れを追うためのページ。`docker compose up -d --build` で `demo` も立ち上がる。
+ブラウザで <http://localhost:8888/> を開く（localhost なので Web Crypto / Web Locks が使える安全な文脈になる）。
+
+- 役割ごとに鍵を持つ: 利用者・escrow・operator は初回に BIP39 の鍵を作ってブラウザの localStorage に置き（平文。lab 専用）、coordinator は lab の固定の
+  デモ用の鍵（`lab/keys/coordinator-demo.mnemonic`, 公開鍵 `07da142f…9084`）を使う。lab のノードはすべてこの公開鍵を `trust.coordinators` に持つ。
+  各役割は別々の Session（別の IndexedDB `ps-demo-<役割>`、別のリレー接続）で同時に動く。shopper は常時オンラインの Go ノード `shopper-1`。
+- 画面: 左がガイド（選んだシナリオの手順。役割のバッジ、説明、✓ / いま / まだ、「この操作へ」でタブを開いて押すボタンを光らせる）。右が役割のタブ
+  （`利用者` `shopper（ノード）` `escrow` `operator` `coordinator` `lab 操作`）。フォームはシナリオに合わせて入力済みなので、ガイドのボタンと確認ダイアログを押すだけで進む。
+- 準備（全シナリオ共通。済んでいれば ✓）: coordinator が operator に委任 → operator が一覧（shopper-1 × デモの escrow、JP-13 と US）を公開 →
+  escrow がプロフィールを公開 → shopper-1 ノードが一覧とプロフィールを受け取る → 利用者が蛇口から BTC・USDC・ETH を受け取る。
+- シナリオ:
+
+| id | 内容 |
+|---|---|
+| `normal-btc` | 正常系（BTC）: safe-shop A-100 → 見積 → 承諾 → 2-of-3 の P2WSH に入金（+ escrow の前払い手数料）→ shopper が bot で購入・配達 → 利用者が支払いに署名 → shopper が連署して放送 → チェーンで完了 |
+| `normal-usdc` | 正常系（USDC）: us-shop U-100 を注文ごとの Safe で。shopper-1 にガス代が無ければ lab 操作で ETH を送る手順が入る |
+| `dispute-refund` | FAIL-100 → 配送失敗 → 利用者が紛争 → escrow が証拠を確かめ、届け先を復号し、全額を利用者へ裁定 → 利用者が連署 → 精算 |
+| `sold-out` | SOLDOUT-100 → shopper が購入に失敗して払い戻しを申し出る → 利用者が確かめて連署 → 返金 |
+| `risky` | risky-shop R-100 → shopper が `risk` で断る |
+| `fraud` | FAIL-100 → 紛争 → escrow が全額を shopper へ（不正な裁定のデモ）→ shopper が自動で連署 → 利用者が通報 → operator が escrow を一覧から外す → 候補から消える |
+| `timelock-t2` | 見積の承諾後に lab 操作で shopper-1 を一時停止 → 入金 → T2 まで採掘 → 利用者が一人で取り戻す → shopper-1 を再開 |
+
+- 別々のウィンドウ: `?role=user`、`?role=escrow,operator,coordinator` のように役割を選ぶと、そのウィンドウではその役割だけが動く（同じブラウザなら鍵と
+  ガイドの進み具合は localStorage で共有される）。ガイドはどのウィンドウにも出て、ほかのウィンドウの役割の手順は「別のウィンドウで … が操作」と表示する。
+  同じ役割は 1 つのウィンドウでしか動かない（Web Locks）。`shopper（ノード）` と `lab 操作` のタブはどのウィンドウにもある。
+- 「デモを初期化」: このブラウザのデモの鍵と記録（localStorage と IndexedDB）をすべて消す。チェーンやノードの記録は消えない。
+  coordinator の鍵は固定なので、前の operator への委任書は残る（coordinator タブで失効させられる）。
+- 「最初から」: 同じシナリオを新しい注文でやり直す（準備の手順は済んでいれば ✓ のまま）。
+- testid は `proxy-shopping-web/apps/demo/TESTIDS.md`。
+
+### デモのサーバー（`lab/demo/nginx.conf`, `lab/demo/demo-config.json`）
+
+ブラウザはホストにいて `*.test` の名前を引けないので、ページが使うものをすべて `demo` の 1 つの origin にまとめる。
+
+| パス | 転送先 |
+|---|---|
+| `/` | デモ画面（静的ファイル） |
+| `/demo-config.json` | `lab/demo/demo-config.json`（マウント） |
+| `/deployments/` | volume `deployments` |
+| `/relay-1`, `/relay-2` | `relay-1:7777`, `relay-2:7777`（websocket） |
+| `/esplora/` | `esplora:3000` |
+| `/evm` | `anvil:8545` |
+| `/faucet/` | `faucet:8080` |
+| `/rates/` | `fakeshop:8080`（`Host: rates.test`、`/rates/admin/rates` には `X-Admin-Token: lab` を付ける） |
+| `/node/shopper-1/…`, `/node/shopper-2/…` | 各 shopper の管理 API。`Authorization: Bearer lab` を付け、`Host` をサービス名にし、`Origin` を外し、`Content-Type: application/json` にする（管理 API の CSRF 対策の検査を通すため） |
+
+プロトコルに現れるリレーの URL は論理名（`wss://relay-1.test`）のまま（受信箱の kind 10050、依頼の `relays`、一覧の `relays`）なので、docker の中の
+Go ノードも同じリレーに届く。ブラウザの実際の接続だけを `ws://<ページのホスト>/relay-1` に向ける（core の `MappedTransport`。対応の無いリレーには接続しない）。
+Esplora・EVM RPC・faucet もページと同じ origin のパスを使う。
+
+**注意（lab 専用）:** このサーバーは shopper ノードの管理 API を token 付きで中継し、faucet（採掘・時刻送り・残高の作成）とレートの管理 API も開いている。
+このポートに届く人は誰でも shopper を止めたりチェーンを進めたりできる。compose は `127.0.0.1:8888` にだけ公開する。ほかのアドレスに公開しないこと。
+
+### デモの e2e
+
+```sh
+docker compose run --rm runner demo                    # 7 シナリオ + 別々のウィンドウ（separate）
+docker compose run --rm runner demo dispute-refund     # 選ぶ（id は上の表と separate）
+```
+
+runner（NAT の内側）の Chromium が `http://demo` を開き、最初に「デモを初期化」してから、シナリオごとにページを開き直してガイドの指示どおりに押す
+（「この操作へ」→ ボタン →（確認ダイアログなら）OK、待ちの手順は進むまで待つ）。最後に画面の表示（txid・状態・配分・候補の有無）を確かめる。
+`separate` は `?role=user` と `?role=escrow,operator,coordinator` の 2 つのページで `dispute-refund` を進め、各手順をその役割のページで押す。
+`http://demo` は安全な文脈ではないので、Chromium は `--unsafely-treat-insecure-origin-as-secure=http://demo` で起動する。
+結果は `e2e/results/demo-latest.md`（と `demo-<時刻>.md`、各シナリオの画面 `demo-<id>.png`）。
+
 ## lab の鍵（テスト専用。公開網で使わないこと）
 
 `sha256("ps-lab:" + 名前)` の先頭 16 byte を entropy にした BIP39 の 12 語。`lab/keys/<名前>.mnemonic` に置く。
@@ -119,6 +188,7 @@ Go は設定 `tls.extra_ca`、Node は `NODE_EXTRA_CA_CERTS`、Playwright は `i
 | user-1 | news hybrid corn purchase public hedgehog clay survey able alter supreme shove |
 | user-2 | sting unknown cabbage detect artist gate judge virus mutual forum return garlic |
 | user-browser | injury raise enable film tissue approve code topple unlock busy candy embark |
+| coordinator-demo | message occur banana believe spring shadow deer manage ginger mistake mad process（デモ画面の coordinator） |
 | relay-p2p | dream entry clutch old reform gain tortoise slab kitchen mother rebuild lunch |
 | faucet | defense girl explain south shine scissors view soup code talk fence town |
 

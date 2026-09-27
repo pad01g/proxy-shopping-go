@@ -15,7 +15,7 @@ p2p:
   relays: ["/ip4/172.40.0.12/tcp/4001/p2p/16Uiu2HAmFngaVFK4D5fix5qN2c6guh3LNyBkmuB42vTFW9aaeDZh"]
   reachability: auto
 trust:
-  coordinators: ["6eac25bc912ab49582890fa47837d574e6d7932620d5410fcffec31a8f87d520", "23c66e3b8b09d6f242e501ddbff2e6a2c786b4d36a8bdffddb1299b4c5de13dd"]
+  coordinators: ["6eac25bc912ab49582890fa47837d574e6d7932620d5410fcffec31a8f87d520", "23c66e3b8b09d6f242e501ddbff2e6a2c786b4d36a8bdffddb1299b4c5de13dd", "07da142f98ad9ede9b07a73f6481feaf5a710e92b8581798241f02ac333f9084"]
 chain:
   btc: {network: signet, esplora: "https://esplora.test"}
   evm: {chain_id: 31337, rpc: "https://evm.test", deployments: /deployments/31337.json}

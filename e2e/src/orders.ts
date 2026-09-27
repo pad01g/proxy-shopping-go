@@ -14,8 +14,15 @@ export interface OrderSpec {
 
 /** 候補から指定の shopper × escrow を選んで注文し、見積（または拒否）を待つ */
 export async function requestQuote(user: UserClient, o: OrderSpec): Promise<UserOrder> {
-  const offers = await user.discoverOffers({ shopUrl: o.shopUrl, region: o.region, payment: o.payment, refresh: true });
-  const offer = offers.find((x) => x.entry.shopper === pk(o.shopper) && x.entry.escrow === pk(o.escrow));
+  // Trust lists arrive eventually (relays can be slow under load), so look again for a while, as a user would.
+  let offers: Awaited<ReturnType<UserClient['discoverOffers']>> = [];
+  const wanted = (x: (typeof offers)[number]) => x.entry.shopper === pk(o.shopper) && x.entry.escrow === pk(o.escrow);
+  for (let end = Date.now() + 30_000; ; ) {
+    offers = await user.discoverOffers({ shopUrl: o.shopUrl, region: o.region, payment: o.payment, refresh: true });
+    if (offers.some(wanted) || Date.now() > end) break;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  const offer = offers.find(wanted);
   assert(offer, `offer ${o.shopper} × ${o.escrow} for ${o.region} (have ${offers.length})`);
   const order = await user.createOrder({
     offer,

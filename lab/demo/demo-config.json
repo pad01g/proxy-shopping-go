@@ -1,0 +1,30 @@
+{
+  "network": "ps-lab",
+  "relays": ["wss://relay-1.test", "wss://relay-2.test"],
+  "relay_paths": { "wss://relay-1.test": "/relay-1", "wss://relay-2.test": "/relay-2" },
+  "esplora": "/esplora",
+  "evm_rpc": "/evm",
+  "faucet": "/faucet",
+  "deployments": "/deployments/31337.json",
+  "rates": [
+    { "type": "coingecko", "base": "/rates/coingecko" },
+    { "type": "frankfurter", "base": "/rates/frankfurter" }
+  ],
+  "rates_admin": "/rates",
+  "coordinator_mnemonic": "message occur banana believe spring shadow deer manage ginger mistake mad process",
+  "shoppers": [
+    { "name": "shopper-1", "pubkey": "58faf8c359a8c0c9e27e4c610a93406536f07b4585d6351a9ea3ee8fc3891ae4", "node": "/node/shopper-1", "evm_address": "0xf9835d3ce8F450cA201F8Dcb30263475Fb25A445" },
+    { "name": "shopper-2", "pubkey": "2d76e032f910b4936e5bd4d029a5356ab55d25f097d22ce6ee2f9606934cf50c", "node": "/node/shopper-2", "evm_address": "0x208c8f5196b22453A4b4ECA148BDDc9aA938ec91" }
+  ],
+  "list_endpoints": { "esplora": "https://esplora.test", "evm_rpc": "https://evm.test" },
+  "timelock_policy": {
+    "btc_min_t1_blocks": 50,
+    "evm_min_t1_seconds": 1800,
+    "btc_min_gap_blocks": 20,
+    "evm_min_gap_seconds": 1800,
+    "btc_max_t2_blocks": 1000,
+    "evm_max_t2_seconds": 86400
+  },
+  "max_clock_skew_seconds": 315360000,
+  "allow_private_endpoints": true
+}

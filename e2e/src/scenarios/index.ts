@@ -1,6 +1,6 @@
 // e2e のシナリオ（docs/lab.md）。a〜f はユーザーと決めたもの、g・h はタイムロックの確認。
 import { StaticSource, signInner, type Session, type UserClient } from '@proxy-shopping/core';
-import { ADDRESS, admin, assert, faucet, keys, paidTo, pk, startUser, until, waitOrder, waitShopper, type LabName } from '../lab.js';
+import { ADDRESS, admin, assert, faucet, keys, paidTo, pk, session, startUser, until, waitOrder, waitShopper, type LabName } from '../lab.js';
 import { acceptAndFund, placeFunded, requestQuote } from '../orders.js';
 import { delegate, operator1Entries, publishList, waitTrust } from '../setup.js';
 import { browserHappyPath } from './browser.js';
@@ -16,8 +16,9 @@ export type Scenario = { id: string; title: string; run: (ctx: Ctx) => Promise<v
 const SAFE_SHOP = 'https://safe-shop.test/';
 const SHINJUKU = 'JP-13-13104';
 
+/** USDC balance of a lab key, read over the EVM RPC only (no Nostr session, which would subscribe as that key). */
 async function usdcOf(name: LabName): Promise<bigint> {
-  return (await startUser(name)).s.evm!.usdcBalance();
+  return session(name).evm!.usdcBalance();
 }
 
 export const scenarios: Scenario[] = [
@@ -134,12 +135,11 @@ export const scenarios: Scenario[] = [
       assert(!offers.some((x) => x.entry.escrow === pk('escrow-2')), 'escrow-2 is no longer offered');
 
       // 規約（プロトコルの外）: bond を没収して利用者に補償する
-      const op = (await startUser('operator-1')).s;
+      const op = session('operator-1'); // the bond contract is on chain; no Nostr needed
       const before = await usdcOf('user-1');
       await op.evm!.bondSlash(keys('escrow-2').evmAddress, keys('user-1').evmAddress, lock);
       const comp = (await usdcOf('user-1')) - before;
       assert(comp === lock, `compensation ${comp}`);
-      op.stop();
       log(`fraud ${o.id.slice(0, 8)}: reported, list v${v.version} without escrow-2, bond slashed ${comp} to user`);
     },
   },
@@ -250,10 +250,9 @@ export const scenarios: Scenario[] = [
       await until('escrow-1 case open', 60_000, async () => (await admin('escrow-1').case(o.id)).state === 'open');
       // 攻撃: Safe のアドレスは誰でも計算できるので、1 単位送り付けて合計を狂わせようとする
       const safe = (o.funded as { safe: `0x${string}` }).safe;
-      const griefer = (await startUser('faucet')).s;
+      const griefer = session('faucet');
       await faucet.evm(griefer.keys.evmAddress, '1');
       await griefer.evm!.transferUsdc(safe, 1n);
-      griefer.stop();
       const lock = BigInt(o.quote!.lock_amount!);
       const total = lock + 1n; // 裁定は署名した時点の残高を分ける（§4.8）
       const fee = (total * 200n) / 10_000n;
@@ -311,6 +310,8 @@ export const scenarios: Scenario[] = [
         assert(failedEarly, 'refund before T2 must fail');
         const { btc } = await faucet.height();
         await faucet.mine(t2 - btc + 1);
+        // the user's client reads the height from esplora, which indexes new blocks a moment later
+        await until(`esplora at T2=${t2}`, 60_000, async () => Number(await (await fetch('https://esplora.test/blocks/tip/height')).text()) >= t2);
         const r = await user.refundAfterTimelock(q.id);
         const got = await paidTo(r.refundTxid!, q.request.user_btc_address!);
         log(`T2=${t2}: user-2 refunded ${got} sats alone, tx ${r.refundTxid}`);

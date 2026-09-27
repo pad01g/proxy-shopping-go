@@ -2,6 +2,7 @@
 #   docker compose up -d --build
 #   docker compose run --rm runner            # e2e（全シナリオ）
 #   docker compose run --rm runner a b        # シナリオを選ぶ
+#   docker compose run --rm runner demo       # デモ画面（http://localhost:8888/）の e2e
 # proxy-shopping-web は ../proxy-shopping-web に置く（WEB_DIR で変更可）。
 
 name: pslab
@@ -70,7 +71,7 @@ services:
     <<: *node
     build: ./node
     pull_policy: build
-    command: ["psrelay", "-listen", "0.0.0.0:7777", "-data", "/data", "-trusted-proxies", "172.40.0.2", "-conns-per-minute", "2000", "-events-per-minute", "6000", "-reqs-per-minute", "6000"]
+    command: ["psrelay", "-listen", "0.0.0.0:7777", "-data", "/data", "-trusted-proxies", "172.40.0.2,172.40.0.61", "-conns-per-minute", "2000", "-events-per-minute", "6000", "-reqs-per-minute", "6000"]
     volumes: [relay1_data:/data]
     healthcheck: &relay-health
       test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:7777/healthz"]
@@ -80,7 +81,7 @@ services:
     networks: {pub: {ipv4_address: 172.40.0.10}}
   relay-2:
     <<: *node
-    command: ["psrelay", "-listen", "0.0.0.0:7777", "-data", "/data", "-trusted-proxies", "172.40.0.2", "-conns-per-minute", "2000", "-events-per-minute", "6000", "-reqs-per-minute", "6000"]
+    command: ["psrelay", "-listen", "0.0.0.0:7777", "-data", "/data", "-trusted-proxies", "172.40.0.2,172.40.0.61", "-conns-per-minute", "2000", "-events-per-minute", "6000", "-reqs-per-minute", "6000"]
     volumes: [relay2_data:/data]
     healthcheck: *relay-health
     networks: {pub: {ipv4_address: 172.40.0.11}}
@@ -106,6 +107,31 @@ services:
       retries: 30
     logging: *logging
     networks: {pub: {ipv4_address: 172.40.0.60}}
+
+  # デモ画面（docs/lab.md「デモ画面」）。ホストの 127.0.0.1:8888 だけに公開する。
+  # リレー・チェーン・faucet・shopper ノードの管理 API（token 付き）を 1 つの origin にまとめる lab 専用のサーバー
+  demo:
+    build:
+      context: ${WEB_DIR:-../proxy-shopping-web}
+      dockerfile: apps/demo/Dockerfile
+    image: proxy-shopping/demo:dev
+    volumes:
+      - ./lab/demo/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./lab/demo/demo-config.json:/etc/demo/demo-config.json:ro
+      - deployments:/deployments:ro
+    ports: ["127.0.0.1:8888:80"]
+    depends_on:
+      deployer: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/demo-config.json"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    logging: *logging
+    networks:
+      pub:
+        ipv4_address: 172.40.0.61
+        aliases: [demo]
 
   # ---- チェーン
   bitcoind:
@@ -340,6 +366,7 @@ services:
       - "cash-store.test:172.40.0.2"
       - "cardgw.test:172.40.0.2"
       - "risky-shop.test:172.40.0.2"
+      - "demo:172.40.0.61"
     environment:
       NODE_EXTRA_CA_CERTS: /caddy-data/caddy/pki/authorities/local/root.crt
     volumes:
@@ -352,6 +379,7 @@ services:
     depends_on:
       <<: *node-deps
       web: {condition: service_healthy}
+      demo: {condition: service_healthy}
       faucet: {condition: service_healthy}
       shopper-1: {condition: service_healthy}
       shopper-2: {condition: service_healthy}

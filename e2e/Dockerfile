@@ -7,6 +7,7 @@ WORKDIR /src/proxy-shopping-web
 COPY --from=web package.json package-lock.json tsconfig.base.json ./
 COPY --from=web packages/core/package.json packages/core/
 COPY --from=web apps/web/package.json apps/web/
+COPY --from=web apps/demo/package.json apps/demo/
 RUN npm ci -w @proxy-shopping/core --include-workspace-root
 COPY --from=web packages/core packages/core
 RUN npm run build -w @proxy-shopping/core

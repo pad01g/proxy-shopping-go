@@ -7,6 +7,10 @@
   "nostr_pubkey": "23c66e3b8b09d6f242e501ddbff2e6a2c786b4d36a8bdffddb1299b4c5de13dd",
   "libp2p_peer_id": "16Uiu2HAm2xAdKYf3QgytpfL11y6Rojd93zmKsDPAwJxPGFmaEZdV"
  },
+ "coordinator-demo": {
+  "nostr_pubkey": "07da142f98ad9ede9b07a73f6481feaf5a710e92b8581798241f02ac333f9084",
+  "libp2p_peer_id": "16Uiu2HAm1tv1iY6k5rgugSQUsAdXDKExystg6x23Bi1KtwbQwEDj"
+ },
  "escrow-1": {
   "nostr_pubkey": "5733593b6fb3c911be92e6d5cfc10e22520b4df2f73e057732814393440f205e",
   "libp2p_peer_id": "16Uiu2HAmDtFBgrLmUz9YeyMGdNkTaf1UefDxM94x13aQirPM2rQr"

@@ -26,6 +26,20 @@ docker compose run --rm runner a e      # シナリオを選ぶ
 
 結果は `e2e/results/e2e-latest.md`。シナリオは `docs/lab.md` と `e2e/src/scenarios/index.ts`。
 
+## デモ画面
+
+`docker compose up -d --build` の後、ブラウザで <http://localhost:8888/> を開く。利用者・escrow・operator・coordinator の鍵を
+それぞれブラウザに持ち、shopper は lab の Go ノード（shopper-1）が務める。左のガイドに従ってボタンを押すと、本物のリレー・signet・anvil の上で
+代理購入と escrow のロック解除まで進む。シナリオは正常系（BTC / USDC）・紛争で返金・在庫切れ・危険な店・不正な escrow・T2 の返金の 7 つ。
+役割ごとに別のウィンドウで開くときは `http://localhost:8888/?role=user` と `?role=escrow,operator,coordinator` のように指定する。
+
+```sh
+docker compose run --rm runner demo                 # デモ画面の e2e（7 シナリオ + 別ウィンドウ）
+docker compose run --rm runner demo fraud separate  # 選ぶ
+```
+
+結果は `e2e/results/demo-latest.md`。詳しくは `docs/lab.md` の「デモ画面」。lab 専用（管理 API の token を付けて中継するので、127.0.0.1 以外に公開しないこと）。
+
 ## テスト
 
 ```sh
