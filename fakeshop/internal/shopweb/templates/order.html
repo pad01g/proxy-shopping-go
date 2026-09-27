@@ -1,0 +1,8 @@
+{{define "content"}}
+<h1>{{.T.orderStatus}}</h1>
+<p>{{.T.orderID}}: <strong id="order-id">{{.Order.ID}}</strong> (<span id="order-status">{{.Order.Status}}</span>)</p>
+{{template "items-table" .}}
+<p>{{.T.total}}: {{template "money" (money "order-total" .Order.Total)}}</p>
+<p>{{.T.tracking}}: <strong id="tracking-status">{{.Tracking.Status}}</strong>
+{{if .Tracking.TrackingNo}} · {{.Tracking.Carrier}} <span id="tracking-no">{{.Tracking.TrackingNo}}</span>{{end}}</p>
+{{end}}

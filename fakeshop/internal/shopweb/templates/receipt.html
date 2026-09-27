@@ -1,0 +1,10 @@
+{{define "content"}}
+<h1>{{.T.receipt}}</h1>
+<p>{{.T.receiptNo}}: <strong id="receipt-no">{{.Order.ReceiptNo}}</strong></p>
+<p>{{.T.orderID}}: <strong id="order-id">{{.Order.ID}}</strong></p>
+{{template "items-table" .}}
+<p>{{.T.total}}: {{template "money" (money "order-total" .Order.Total)}}</p>
+<p id="paid-cash">{{.T.paidCash}}</p>
+<p>{{.T.posShipping}}: <span id="order-shipping">{{.Order.Address.Name}}, {{.Order.Address.PostalCode}} {{.Order.Address.Address}}</span></p>
+<p><a href="/pos">{{.T.posTitle}}</a></p>
+{{end}}

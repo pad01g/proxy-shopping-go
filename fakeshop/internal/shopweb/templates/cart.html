@@ -1,0 +1,12 @@
+{{define "content"}}
+<h1>{{.T.cart}}</h1>
+{{if .Items}}
+{{template "items-table" .}}
+<p>{{.T.total}}: {{template "money" (money "cart-total" .Total)}}</p>
+<p><a href="/checkout" id="go-checkout">{{.T.checkout}}</a></p>
+<form method="post" action="/cart/clear"><button id="clear-cart" type="submit">{{.T.clearCart}}</button></form>
+{{else}}
+<p id="cart-empty">{{.T.emptyCart}}</p>
+{{end}}
+<p><a href="/">{{.T.backToShop}}</a></p>
+{{end}}

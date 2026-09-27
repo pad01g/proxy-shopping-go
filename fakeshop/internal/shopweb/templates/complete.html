@@ -1,0 +1,9 @@
+{{define "content"}}
+<h1 id="thanks">{{.T.thanks}}</h1>
+<p>{{.T.orderID}}: <strong id="order-id">{{.Order.ID}}</strong></p>
+{{template "items-table" .}}
+<p>{{.T.total}}: {{template "money" (money "order-total" .Order.Total)}}</p>
+<p>{{.T.shippingTo}}: <span id="order-shipping">{{.Order.Address.Name}}, {{.Order.Address.PostalCode}} {{.Order.Address.Address}}</span></p>
+<p>{{.T.paymentMethod}}: <span id="order-payment">{{.Order.Payment}}</span></p>
+<p><a href="/orders/{{.Order.ID}}" id="order-link">{{.T.orderStatus}}</a> · <a href="/">{{.T.backToShop}}</a></p>
+{{end}}

@@ -1,0 +1,338 @@
+# proxy-shopping の閉じた網（docs/lab.md）。
+#   docker compose up -d --build
+#   docker compose run --rm runner            # e2e（全シナリオ）
+#   docker compose run --rm runner a b        # シナリオを選ぶ
+# proxy-shopping-web は ../proxy-shopping-web に置く（WEB_DIR で変更可）。
+
+name: pslab
+
+x-node: &node
+  image: proxy-shopping/node:dev
+  pull_policy: never
+  restart: "no"
+  logging: &logging
+    options: {max-size: "20m", max-file: "2"}
+
+x-node-volumes: &node-volumes
+  - ./lab/keys:/keys:ro
+  - ./lab/nodes:/nodes:ro
+  - caddy_data:/caddy-data:ro
+  - deployments:/deployments:ro
+
+# *.test は edge に向く。NAT の内側（home）では名前が引けないので extra_hosts で与える
+x-test-hosts: &test-hosts
+  - "app.test:172.40.0.2"
+  - "relay-1.test:172.40.0.2"
+  - "relay-2.test:172.40.0.2"
+  - "esplora.test:172.40.0.2"
+  - "evm.test:172.40.0.2"
+  - "faucet.test:172.40.0.2"
+  - "rates.test:172.40.0.2"
+  - "safe-shop.test:172.40.0.2"
+  - "us-shop.test:172.40.0.2"
+  - "cash-store.test:172.40.0.2"
+  - "cardgw.test:172.40.0.2"
+  - "risky-shop.test:172.40.0.2"
+
+x-edge-ready: &edge-ready
+  edge: {condition: service_healthy}
+
+services:
+  # ---- 公開口
+  edge:
+    image: caddy:2.10-alpine
+    volumes:
+      - ./lab/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - deployments:/deployments:ro
+    healthcheck:
+      test: ["CMD", "test", "-f", "/data/caddy/pki/authorities/local/root.crt"]
+      interval: 2s
+      retries: 30
+    logging: *logging
+    networks:
+      pub:
+        ipv4_address: 172.40.0.2
+        aliases: [app.test, relay-1.test, relay-2.test, esplora.test, evm.test, faucet.test, rates.test, safe-shop.test, us-shop.test, cash-store.test, cardgw.test, risky-shop.test]
+
+  relay-1:
+    <<: *node
+    build: ./node
+    pull_policy: build
+    command: ["psrelay", "-listen", "0.0.0.0:7777", "-data", "/data"]
+    volumes: [relay1_data:/data]
+    networks: {pub: {ipv4_address: 172.40.0.10}}
+  relay-2:
+    <<: *node
+    command: ["psrelay", "-listen", "0.0.0.0:7777", "-data", "/data"]
+    volumes: [relay2_data:/data]
+    networks: {pub: {ipv4_address: 172.40.0.11}}
+
+  p2p-relay:
+    <<: *node
+    command: ["psnode", "-config", "/nodes/p2p-relay.yaml"]
+    volumes: *node-volumes
+    depends_on: *edge-ready
+    networks: {pub: {ipv4_address: 172.40.0.12}}
+
+  web:
+    build:
+      context: ${WEB_DIR:-../proxy-shopping-web}
+      dockerfile: apps/web/Dockerfile
+    image: proxy-shopping/web:dev
+    volumes:
+      - ./lab/web-config.json:/usr/share/nginx/html/config.json:ro
+    logging: *logging
+    networks: {pub: {ipv4_address: 172.40.0.60}}
+
+  # ---- チェーン
+  bitcoind:
+    image: bitcoin/bitcoin:29.0
+    command:
+      - -signet
+      - -signetchallenge=51
+      - -server
+      - -txindex
+      - -rpcuser=lab
+      - -rpcpassword=lab
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=172.40.0.0/24
+      - -fallbackfee=0.0002
+      - -printtoconsole
+    logging: *logging
+    networks: {pub: {ipv4_address: 172.40.0.20}}
+
+  esplora:
+    <<: *node
+    command: ["esplora-lite", "-listen", "0.0.0.0:3000", "-rpc", "http://lab:lab@bitcoind:38332"]
+    depends_on: [bitcoind]
+    networks: {pub: {ipv4_address: 172.40.0.21}}
+
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:stable
+    entrypoint: ["anvil", "--host", "0.0.0.0", "--chain-id", "31337"]
+    logging: *logging
+    networks: {pub: {ipv4_address: 172.40.0.22}}
+
+  deployer:
+    build: ./contracts
+    image: proxy-shopping/contracts:dev
+    environment:
+      RPC_URL: http://anvil:8545
+      OUT: /deployments/31337.json
+    volumes: [deployments:/deployments]
+    depends_on: [anvil]
+    restart: on-failure
+    networks: [pub]
+
+  faucet:
+    <<: *node
+    command: ["labfaucet", "-listen", "0.0.0.0:8080", "-btc-rpc", "http://lab:lab@bitcoind:38332", "-evm-rpc", "http://anvil:8545", "-deployments", "/deployments/31337.json"]
+    volumes: *node-volumes
+    depends_on:
+      bitcoind: {condition: service_started}
+      deployer: {condition: service_completed_successfully}
+    networks: {pub: {ipv4_address: 172.40.0.23}}
+
+  # ---- 店・レート
+  fakeshop:
+    build: ./fakeshop
+    image: proxy-shopping/fakeshop:dev
+    logging: *logging
+    networks: {pub: {ipv4_address: 172.40.0.26}}
+
+  ratefeed:
+    <<: *node
+    command: ["ratefeed", "-config", "/nodes/ratefeed.yaml"]
+    volumes: *node-volumes
+    depends_on:
+      <<: *edge-ready
+      deployer: {condition: service_completed_successfully}
+    networks: {pub: {ipv4_address: 172.40.0.25}}
+
+  # ---- shopper
+  shopper-1:
+    <<: *node
+    command: ["psnode", "-config", "/nodes/shopper-1.yaml"]
+    volumes:
+      - ./lab/keys:/keys:ro
+      - ./lab/nodes:/nodes:ro
+      - caddy_data:/caddy-data:ro
+      - deployments:/deployments:ro
+      - shopper1_data:/data
+    depends_on: &node-deps
+      <<: *edge-ready
+      deployer: {condition: service_completed_successfully}
+      p2p-relay: {condition: service_started}
+    networks: {pub: {ipv4_address: 172.40.0.30}}
+  bot-1:
+    build: ./shopper-bot
+    image: proxy-shopping/shopper-bot:dev
+    environment: &bot-env
+      NODE_EXTRA_CA_CERTS: /caddy-data/caddy/pki/authorities/local/root.crt
+    volumes: [caddy_data:/caddy-data:ro]
+    depends_on: *edge-ready
+    logging: *logging
+    networks: {pub: {ipv4_address: 172.40.0.31}}
+
+  shopper-2:
+    <<: *node
+    command: ["psnode", "-config", "/nodes/shopper-2.yaml"]
+    volumes:
+      - ./lab/keys:/keys:ro
+      - ./lab/nodes:/nodes:ro
+      - caddy_data:/caddy-data:ro
+      - deployments:/deployments:ro
+      - shopper2_data:/data
+    depends_on: *node-deps
+    networks: {pub: {ipv4_address: 172.40.0.32}}
+  bot-2:
+    image: proxy-shopping/shopper-bot:dev
+    pull_policy: never
+    environment: *bot-env
+    volumes: [caddy_data:/caddy-data:ro]
+    depends_on:
+      <<: *edge-ready
+      bot-1: {condition: service_started}
+    logging: *logging
+    networks: {pub: {ipv4_address: 172.40.0.33}}
+
+  # ---- escrow / operator
+  escrow-1:
+    <<: *node
+    command: ["psnode", "-config", "/nodes/escrow-1.yaml"]
+    volumes:
+      - ./lab/keys:/keys:ro
+      - ./lab/nodes:/nodes:ro
+      - caddy_data:/caddy-data:ro
+      - deployments:/deployments:ro
+      - escrow1_data:/data
+    depends_on: *node-deps
+    networks: {pub: {ipv4_address: 172.40.0.40}}
+  escrow-2:
+    <<: *node
+    command: ["psnode", "-config", "/nodes/escrow-2.yaml"]
+    volumes:
+      - ./lab/keys:/keys:ro
+      - ./lab/nodes:/nodes:ro
+      - caddy_data:/caddy-data:ro
+      - deployments:/deployments:ro
+      - escrow2_data:/data
+    depends_on: *node-deps
+    networks: {pub: {ipv4_address: 172.40.0.41}}
+  operator-1:
+    <<: *node
+    command: ["psnode", "-config", "/nodes/operator-1.yaml"]
+    volumes:
+      - ./lab/keys:/keys:ro
+      - ./lab/nodes:/nodes:ro
+      - caddy_data:/caddy-data:ro
+      - deployments:/deployments:ro
+      - operator1_data:/data
+    depends_on: *node-deps
+    networks: {pub: {ipv4_address: 172.40.0.50}}
+  operator-2:
+    <<: *node
+    command: ["psnode", "-config", "/nodes/operator-2.yaml"]
+    volumes:
+      - ./lab/keys:/keys:ro
+      - ./lab/nodes:/nodes:ro
+      - caddy_data:/caddy-data:ro
+      - deployments:/deployments:ro
+      - operator2_data:/data
+    depends_on: *node-deps
+    networks: {pub: {ipv4_address: 172.40.0.51}}
+
+  # ---- NAT
+  router:
+    image: alpine:3.22
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    command: ["sh", "-c", "apk add -q iptables && iptables -t nat -A POSTROUTING -s 172.41.0.0/24 ! -d 172.41.0.0/24 -j MASQUERADE && echo router ready && exec sleep infinity"]
+    networks:
+      pub: {ipv4_address: 172.40.0.254}
+      home: {ipv4_address: 172.41.0.254}
+
+  natbox:
+    image: alpine:3.22
+    cap_add: [NET_ADMIN]
+    command: ["sh", "-c", "ip route replace default via 172.41.0.254 && echo natbox ready && exec sleep infinity"]
+    extra_hosts: *test-hosts
+    depends_on: [router]
+    networks: {home: {ipv4_address: 172.41.0.10}}
+  escrow-nat:
+    <<: *node
+    network_mode: "service:natbox"
+    command: ["psnode", "-config", "/nodes/escrow-nat.yaml"]
+    volumes:
+      - ./lab/keys:/keys:ro
+      - ./lab/nodes:/nodes:ro
+      - caddy_data:/caddy-data:ro
+      - deployments:/deployments:ro
+      - escrownat_data:/data
+    depends_on:
+      <<: *node-deps
+      natbox: {condition: service_started}
+
+  # ---- e2e（NAT の内側から動かす。利用者のブラウザも NAT の内側）
+  runner:
+    build:
+      context: ./e2e
+      additional_contexts:
+        web: ${WEB_DIR:-../proxy-shopping-web}
+    image: proxy-shopping/e2e:dev
+    profiles: ["run"]
+    cap_add: [NET_ADMIN]
+    extra_hosts:
+      - "shopper-1:172.40.0.30"
+      - "shopper-2:172.40.0.32"
+      - "escrow-1:172.40.0.40"
+      - "escrow-2:172.40.0.41"
+      - "operator-1:172.40.0.50"
+      - "operator-2:172.40.0.51"
+      - "p2p-relay:172.40.0.12"
+      - "escrow-nat:172.41.0.10"
+      - "app.test:172.40.0.2"
+      - "relay-1.test:172.40.0.2"
+      - "relay-2.test:172.40.0.2"
+      - "esplora.test:172.40.0.2"
+      - "evm.test:172.40.0.2"
+      - "faucet.test:172.40.0.2"
+      - "rates.test:172.40.0.2"
+      - "safe-shop.test:172.40.0.2"
+      - "us-shop.test:172.40.0.2"
+      - "cash-store.test:172.40.0.2"
+      - "cardgw.test:172.40.0.2"
+      - "risky-shop.test:172.40.0.2"
+    environment:
+      NODE_EXTRA_CA_CERTS: /caddy-data/caddy/pki/authorities/local/root.crt
+    volumes:
+      - ./lab/keys:/keys:ro
+      - caddy_data:/caddy-data:ro
+      - deployments:/deployments:ro
+      - ./e2e/results:/src/proxy-shopping-go/e2e/results
+      # シナリオ h で shopper-2 を止める（「shopper が消えた」状態を作る）ためだけに使う
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: {home: {ipv4_address: 172.41.0.20}}
+
+volumes:
+  caddy_data:
+  deployments:
+  relay1_data:
+  relay2_data:
+  shopper1_data:
+  shopper2_data:
+  escrow1_data:
+  escrow2_data:
+  escrownat_data:
+  operator1_data:
+  operator2_data:
+
+networks:
+  pub:
+    ipam:
+      config: [{subnet: 172.40.0.0/24}]
+  home:
+    ipam:
+      config: [{subnet: 172.41.0.0/24}]

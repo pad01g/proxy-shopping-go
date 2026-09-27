@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/pad01g/proxy-shopping-go/shopper-bot/schema/TrackingStatus.json",
+  "title": "TrackingStatus",
+  "type": "object",
+  "required": ["status", "updated_at", "evidence"],
+  "additionalProperties": false,
+  "properties": {
+    "status": {"enum": ["processing", "shipped", "delivered", "failed"]},
+    "carrier": {"type": "string"},
+    "tracking_no": {"type": "string"},
+    "updated_at": {"type": "integer", "minimum": 0, "description": "UNIX seconds"},
+    "evidence": {"type": "array", "items": {"$ref": "Evidence.json"}}
+  }
+}

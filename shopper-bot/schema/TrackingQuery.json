@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/pad01g/proxy-shopping-go/shopper-bot/schema/TrackingQuery.json",
+  "title": "TrackingQuery",
+  "type": "object",
+  "required": ["shop_url", "shop_order_id"],
+  "additionalProperties": false,
+  "properties": {
+    "shop_url": {"type": "string", "pattern": "^https?://[^/\\s]+(/.*)?$"},
+    "shop_order_id": {"type": "string", "minLength": 1, "maxLength": 128}
+  }
+}

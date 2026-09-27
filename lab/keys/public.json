@@ -1,0 +1,58 @@
+{
+ "coordinator-1": {
+  "nostr_pubkey": "6eac25bc912ab49582890fa47837d574e6d7932620d5410fcffec31a8f87d520",
+  "libp2p_peer_id": "16Uiu2HAkvJZhHcBuWxmkpZuMs1qaQn1UtT1TNBsjMWQMndE2optn"
+ },
+ "coordinator-2": {
+  "nostr_pubkey": "23c66e3b8b09d6f242e501ddbff2e6a2c786b4d36a8bdffddb1299b4c5de13dd",
+  "libp2p_peer_id": "16Uiu2HAm2xAdKYf3QgytpfL11y6Rojd93zmKsDPAwJxPGFmaEZdV"
+ },
+ "escrow-1": {
+  "nostr_pubkey": "5733593b6fb3c911be92e6d5cfc10e22520b4df2f73e057732814393440f205e",
+  "libp2p_peer_id": "16Uiu2HAmDtFBgrLmUz9YeyMGdNkTaf1UefDxM94x13aQirPM2rQr"
+ },
+ "escrow-2": {
+  "nostr_pubkey": "eb550bf025a1c630db7fe396921793f5eba13184dc65a9f80dc8c6b8aeffc306",
+  "libp2p_peer_id": "16Uiu2HAmP3X54hcmEaGXBL4QXgmrgcs6kL6tcmcp1o4uwfT9dmKE"
+ },
+ "escrow-nat": {
+  "nostr_pubkey": "d14850eb1f64db775962b8d461adae03bf3a459c9ad1a12698e14e85e49c98dc",
+  "libp2p_peer_id": "16Uiu2HAmEQWJngoMBFWptiw1K6ubkau6fXfx3XPbib9iA9ygiE4r"
+ },
+ "faucet": {
+  "nostr_pubkey": "92bcf3062681831ba12faa98ab4f8d47b4cf21647991d5b32508cb97714f5d95",
+  "libp2p_peer_id": "16Uiu2HAm3NEHKDwUz8NeNRzLpnhPFixpjz2PPqwKiqugEHkvNhho"
+ },
+ "operator-1": {
+  "nostr_pubkey": "9a5ec2c2020b1fa65d416c1f793a916ca9396f0708666ab714f88379563e13ac",
+  "libp2p_peer_id": "16Uiu2HAmPAUSpgpbqd2nxh1o21uDytdVMi77PjLD2zBRG5Y7UCCp"
+ },
+ "operator-2": {
+  "nostr_pubkey": "aa1e2688daf4a1b4da779435210ea7dea8521a63b60328fd25beb0a73732b51f",
+  "libp2p_peer_id": "16Uiu2HAm7FtRJNt3PK9u5bkykmnEc3AFiVGvdxTAB8mkd6TWWPww"
+ },
+ "relay-p2p": {
+  "nostr_pubkey": "f73a47e88d82feb7b745d2a41eddddfd91447b0ea7528749c4e172e3fef76043",
+  "libp2p_peer_id": "16Uiu2HAmFngaVFK4D5fix5qN2c6guh3LNyBkmuB42vTFW9aaeDZh"
+ },
+ "shopper-1": {
+  "nostr_pubkey": "58faf8c359a8c0c9e27e4c610a93406536f07b4585d6351a9ea3ee8fc3891ae4",
+  "libp2p_peer_id": "16Uiu2HAmM7EWPvx4ZibKEqaKTfpEwRs9Mq8hAnK5XLDVGY55KJc3"
+ },
+ "shopper-2": {
+  "nostr_pubkey": "2d76e032f910b4936e5bd4d029a5356ab55d25f097d22ce6ee2f9606934cf50c",
+  "libp2p_peer_id": "16Uiu2HAm8Ym1JkToaxCUBrvmQaBBgUEhAosPALNd4LvQiRcveZH1"
+ },
+ "user-1": {
+  "nostr_pubkey": "bad4af5253fe587c3cdc2d14d70eb49c786f316fc37e6f5150f20fc4a26bd9c0",
+  "libp2p_peer_id": "16Uiu2HAmE2FwVbZbrdbXNM6UsSRZwM4tQJ696kUmfpCNXYuz5HSa"
+ },
+ "user-2": {
+  "nostr_pubkey": "ac41447041e434466d24ae83e5627dd8b15a639d25212aece3709442bf603826",
+  "libp2p_peer_id": "16Uiu2HAmRKF3pNiJyFVQSGFUJ8MxjCcPQGzg9RAhjXX5EhNQBJg9"
+ },
+ "user-browser": {
+  "nostr_pubkey": "756e3c706ba0cc47d9d06e6e083c972694da76fc556b8b5defb7d3265d0e3bcf",
+  "libp2p_peer_id": "16Uiu2HAm6rKzv6CfBjpUR7SWDZnwuwYoC9G22ihnY5PbtDkEviLU"
+ }
+}

@@ -1,0 +1,8 @@
+# ratefeed: copies the ratemock rates into the MockAggregatorV3 feeds (docs/spec.md §7)
+interval_seconds: 5
+evm: {rpc: "http://anvil:8545", deployments: /deployments/31337.json}
+tls: {extra_ca: /caddy-data/caddy/pki/authorities/local/root.crt}
+fx:
+  sources:
+    - {type: coingecko, base: "https://rates.test/coingecko"}
+    - {type: frankfurter, base: "https://rates.test/frankfurter"}

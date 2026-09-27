@@ -1,0 +1,12 @@
+{{define "content"}}
+<h1>{{.T.catalog}}</h1>
+{{if eq .Shop.Payment "cash-only"}}<p class="notice" id="cash-only">{{.T.cashOnly}}</p>{{end}}
+<div class="products">
+{{range .Shop.Products}}
+  <div class="product" data-sku="{{.SKU}}">
+    <a href="/products/{{.SKU}}"><h2>{{.Name}}</h2></a>
+    <p>{{.SKU}} · <span class="price" data-amount="{{.Price.Amount}}">{{.Price.Display}}</span></p>
+  </div>
+{{end}}
+</div>
+{{end}}

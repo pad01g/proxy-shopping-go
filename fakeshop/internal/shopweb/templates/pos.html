@@ -1,0 +1,22 @@
+{{define "content"}}
+<h1>{{.T.posTitle}}</h1>
+<form method="post" action="/pos">
+<table id="pos-items">
+  <tr><th>SKU</th><th></th><th class="num">{{.T.price}}</th><th class="num">{{.T.qty}}</th></tr>
+  {{range .Shop.Products}}
+  <tr>
+    <td>{{.SKU}}</td><td>{{.Name}}</td><td class="num">{{.Price.Display}}</td>
+    <td class="num"><input type="number" id="qty-{{.SKU}}" name="qty.{{.SKU}}" min="0" max="99" value="{{index $.Qty .SKU}}"></td>
+  </tr>
+  {{end}}
+</table>
+<h2>{{.T.posShipping}}</h2>
+{{template "address-fields" .}}
+{{if .Quoted}}
+<p>{{.T.subtotal}}: {{.Subtotal.Display}} / {{.T.shippingFee}}: {{.Shop.Shipping.Display}}</p>
+<p>{{.T.total}}: {{template "money" (money "pos-total" .Total)}}</p>
+{{end}}
+<button id="pos-calc" type="submit" name="action" value="quote">{{.T.posCalc}}</button>
+<button id="cash-received" type="submit" name="action" value="sale">{{.T.cashReceived}}</button>
+</form>
+{{end}}

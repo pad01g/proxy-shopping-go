@@ -1,0 +1,62 @@
+# lab の公開口。*.test はすべてここへ向く（docs/lab.md）。
+# 証明書は Caddy の内部 CA（自己署名）。公開網では同じ構成で ACME の証明書に替える。
+{
+	local_certs
+	skip_install_trust
+	admin off
+}
+
+(cors) {
+	header Access-Control-Allow-Origin *
+	header Access-Control-Allow-Headers *
+	header Access-Control-Allow-Methods "GET, POST, OPTIONS"
+	@preflight method OPTIONS
+	respond @preflight 204
+}
+
+app.test {
+	handle_path /deployments/* {
+		import cors
+		root * /deployments
+		file_server
+	}
+	handle {
+		reverse_proxy web:80
+	}
+}
+
+relay-1.test {
+	reverse_proxy relay-1:7777
+}
+
+relay-2.test {
+	reverse_proxy relay-2:7777
+}
+
+esplora.test {
+	reverse_proxy esplora:3000
+}
+
+# anvil は自分で CORS のヘッダを付ける
+evm.test {
+	reverse_proxy anvil:8545
+}
+
+faucet.test {
+	reverse_proxy faucet:8080
+}
+
+safe-shop.test, us-shop.test, cash-store.test, cardgw.test {
+	reverse_proxy fakeshop:8080
+}
+
+# ブラウザが見積のレートを確かめるときに直接呼ぶ
+rates.test {
+	import cors
+	reverse_proxy fakeshop:8080
+}
+
+# 危険と判定される店は HTTP だけで開く
+http://risky-shop.test {
+	reverse_proxy fakeshop:8080
+}

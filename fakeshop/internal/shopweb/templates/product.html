@@ -1,0 +1,16 @@
+{{define "content"}}
+<h1 id="product-name">{{.Product.Name}}</h1>
+<p>SKU: <span id="product-sku">{{.Product.SKU}}</span></p>
+<p>{{.T.price}}: <span id="product-price" data-amount="{{.Product.Price.Amount}}" data-currency="{{.Product.Price.Currency}}">{{.Product.Price.Display}}</span></p>
+{{if eq .Shop.Payment "cash-only"}}
+<p class="notice" id="cash-only">{{.T.cashOnly}}</p>
+{{else}}
+<form method="post" action="/cart/add">
+  <input type="hidden" name="sku" value="{{.Product.SKU}}">
+  <label for="qty">{{.T.qty}}</label>
+  <input type="number" id="qty" name="qty" value="1" min="1" max="99">
+  <button id="add-to-cart" type="submit">{{.T.addToCart}}</button>
+</form>
+{{end}}
+<p><a href="/">{{.T.backToShop}}</a></p>
+{{end}}

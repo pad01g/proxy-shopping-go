@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/pad01g/proxy-shopping-go/shopper-bot/schema/PurchaseResult.json",
+  "title": "PurchaseResult",
+  "type": "object",
+  "required": ["request_id", "status", "evidence"],
+  "additionalProperties": false,
+  "properties": {
+    "request_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["ok", "failed", "needs_human"]},
+    "shop_order_id": {"type": "string", "minLength": 1},
+    "total": {"$ref": "Money.json"},
+    "evidence": {"type": "array", "items": {"$ref": "Evidence.json"}},
+    "error": {"type": "string"}
+  },
+  "if": {"properties": {"status": {"const": "ok"}}},
+  "then": {"required": ["shop_order_id", "total"]}
+}

@@ -1,0 +1,71 @@
+package trust
+
+import (
+	"encoding/json"
+	"fmt"
+	"strconv"
+
+	"github.com/nbd-wtf/go-nostr"
+)
+
+func sign(secret string, kind int, tags nostr.Tags, content any, createdAt nostr.Timestamp) (*nostr.Event, error) {
+	var c string
+	switch v := content.(type) {
+	case string:
+		c = v
+	default:
+		data, err := json.Marshal(v)
+		if err != nil {
+			return nil, fmt.Errorf("marshal content of kind %d: %w", kind, err)
+		}
+		c = string(data)
+	}
+	if createdAt == 0 {
+		createdAt = nostr.Now()
+	}
+	ev := &nostr.Event{Kind: kind, CreatedAt: createdAt, Tags: tags, Content: c}
+	if err := ev.Sign(secret); err != nil {
+		return nil, fmt.Errorf("sign kind %d: %w", kind, err)
+	}
+	return ev, nil
+}
+
+// NewDelegation signs a kind 30500 delegation of a coordinator to an operator.
+func NewDelegation(secret, operator, network string, version int64, revoked bool, note string) (*nostr.Event, error) {
+	tags := nostr.Tags{
+		{"d", operator}, {"v", strconv.FormatInt(version, 10)}, {"network", network},
+		{"p", operator}, {"revoked", strconv.FormatBool(revoked)},
+	}
+	return sign(secret, KindDelegation, tags, map[string]string{"note": note}, 0)
+}
+
+// NewList signs a kind 30501 list.
+func NewList(secret string, version int64, l *List) (*nostr.Event, error) {
+	if l.Network == "" {
+		return nil, fmt.Errorf("list needs a network")
+	}
+	tags := nostr.Tags{{"d", l.Network}, {"v", strconv.FormatInt(version, 10)}, {"network", l.Network}}
+	ev, err := sign(secret, KindList, tags, l, 0)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := ParseList(ev); err != nil {
+		return nil, err
+	}
+	return ev, nil
+}
+
+// NewProfile signs a kind 30502 / 30503 profile.
+func NewProfile(secret string, kind int, network string, version int64, content any) (*nostr.Event, error) {
+	tags := nostr.Tags{{"d", network}, {"v", strconv.FormatInt(version, 10)}, {"network", network}}
+	return sign(secret, kind, tags, content, 0)
+}
+
+// NewInboxRelays signs a kind 10050 event.
+func NewInboxRelays(secret string, relays []string, version int64) (*nostr.Event, error) {
+	tags := nostr.Tags{{"v", strconv.FormatInt(version, 10)}}
+	for _, r := range relays {
+		tags = append(tags, nostr.Tag{"relay", r})
+	}
+	return sign(secret, KindInboxRelays, tags, "", 0)
+}

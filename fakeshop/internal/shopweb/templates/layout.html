@@ -1,0 +1,70 @@
+{{define "layout"}}<!doctype html>
+<html lang="{{.Shop.Lang}}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{{- if eq .Shop.Payment "cash-only"}}
+<meta name="ps-payment" content="cash-only">
+<meta name="ps-region" content="{{.Shop.Region}}">
+{{- else}}
+<meta name="ps-payment-gateway" content="{{.Shop.Gateway}}">
+{{- end}}
+<title>{{if .Title}}{{.Title}} – {{end}}{{.Shop.Name}}</title>
+<style>
+body { font-family: system-ui, sans-serif; margin: 0; color: #222; background: #fafafa; }
+header { background: #2f3b52; color: #fff; padding: 12px 24px; display: flex; justify-content: space-between; align-items: center; }
+header a { color: #fff; text-decoration: none; }
+main { max-width: 760px; margin: 24px auto; padding: 0 16px; }
+table { border-collapse: collapse; width: 100%; background: #fff; }
+th, td { border-bottom: 1px solid #ddd; padding: 8px; text-align: left; }
+td.num, th.num { text-align: right; }
+label { display: block; margin-top: 10px; }
+input { padding: 6px; font-size: 15px; }
+input[type=text], input[type=tel] { width: 100%; box-sizing: border-box; }
+button { margin-top: 16px; padding: 8px 16px; font-size: 15px; }
+.notice { background: #fff3bf; padding: 10px; border-radius: 4px; }
+.error { background: #fff5f5; color: #c92a2a; padding: 10px; border-radius: 4px; }
+.products { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 16px; }
+.product { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <a href="/"><strong>{{.Shop.Name}}</strong></a>
+  {{if ne .Shop.Payment "cash-only"}}<a href="/cart" id="cart-link">{{.T.cart}} ({{.CartCount}})</a>{{end}}
+</header>
+<main>
+{{if .Error}}<p class="error" id="error">{{.Error}}</p>{{end}}
+{{template "content" .}}
+</main>
+</body>
+</html>
+{{end}}
+
+{{define "address-fields"}}
+<fieldset>
+  <legend>{{.T.shippingTo}}</legend>
+  <label for="ship-name">{{.T.name}}</label>
+  <input type="text" id="ship-name" name="name" value="{{.Address.Name}}" required>
+  <label for="ship-postal-code">{{.T.postalCode}}</label>
+  <input type="text" id="ship-postal-code" name="postal_code" value="{{.Address.PostalCode}}" required>
+  <label for="ship-address">{{.T.address}}</label>
+  <input type="text" id="ship-address" name="address" value="{{.Address.Address}}" required>
+  <label for="ship-phone">{{.T.phone}}</label>
+  <input type="tel" id="ship-phone" name="phone" value="{{.Address.Phone}}" required>
+</fieldset>
+{{end}}
+
+{{define "items-table"}}
+<table id="items">
+  <tr><th>SKU</th><th></th><th class="num">{{.T.qty}}</th><th class="num">{{.T.subtotal}}</th></tr>
+  {{range .Items}}
+  <tr class="item" data-sku="{{.SKU}}" data-qty="{{.Qty}}">
+    <td>{{.SKU}}</td><td>{{.Name}}</td><td class="num">{{.Qty}}</td><td class="num">{{.Subtotal.Display}}</td>
+  </tr>
+  {{end}}
+  <tr><td colspan="3">{{.T.shippingFee}}</td><td class="num">{{.Shop.Shipping.Display}}</td></tr>
+</table>
+{{end}}
+
+{{define "money"}}<strong id="{{.ID}}" data-amount="{{.M.Amount}}" data-currency="{{.M.Currency}}">{{.M.Display}}</strong>{{end}}

@@ -1,0 +1,9 @@
+{{define "content"}}
+<h1>{{.T.checkout}}</h1>
+{{template "items-table" .}}
+<p>{{.T.total}}: {{template "money" (money "checkout-total" .Total)}}</p>
+<form method="post" action="/checkout">
+  {{template "address-fields" .}}
+  <button id="place-order" type="submit">{{.T.placeOrder}}</button>
+</form>
+{{end}}

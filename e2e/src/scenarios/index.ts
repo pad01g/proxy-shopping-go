@@ -1,0 +1,238 @@
+// e2e のシナリオ（docs/lab.md）。a〜f はユーザーと決めたもの、g・h はタイムロックの確認。
+import { StaticSource, type UserClient } from '@proxy-shopping/core';
+import { ADDRESS, admin, assert, faucet, keys, pk, startUser, until, waitOrder, waitShopper, type LabName } from '../lab.js';
+import { acceptAndFund, placeFunded, requestQuote } from '../orders.js';
+import { delegate, operator1Entries, publishList, waitTrust } from '../setup.js';
+import { browserHappyPath } from './browser.js';
+
+export interface Ctx {
+  users: Record<'user-1' | 'user-2', UserClient>;
+  log: (line: string) => void;
+}
+
+export type Scenario = { id: string; title: string; run: (ctx: Ctx) => Promise<void> };
+
+const SAFE_SHOP = 'https://safe-shop.test/';
+const SHINJUKU = 'JP-13-13104';
+
+async function usdcOf(name: LabName): Promise<bigint> {
+  return (await startUser(name)).s.evm!.usdcBalance();
+}
+
+export const scenarios: Scenario[] = [
+  {
+    id: 'a',
+    title: '正常系: BTC（safe-shop, JPY）と USDC（us-shop, USD）。見積のレート検証、escrow の前払い手数料、shopper への支払い',
+    async run({ users, log }) {
+      const user = users['user-1'];
+      // BTC
+      const btc = await placeFunded(user, { shopUrl: SAFE_SHOP, region: SHINJUKU, sku: 'A-100', payment: 'btc-signet', shopper: 'shopper-1', escrow: 'escrow-1' });
+      assert(btc.quoteCheck?.fx?.level === 'ok', `fx level ${btc.quoteCheck?.fx?.level}`);
+      await user.release(btc.id);
+      const done = await waitOrder(user, btc.id, 'completed');
+      const so = await waitShopper('shopper-1', btc.id, ['completed']);
+      assert(so.payout_by === 'release', `payout_by ${so.payout_by}`);
+      const st = await until('BTC payout confirmed', 30_000, async () => (await fetch(`https://esplora.test/tx/${done.completedTxid}/status`).then((r) => r.json())).confirmed);
+      log(`BTC order ${btc.id.slice(0, 8)}: lock ${btc.quote!.lock_amount} sats, payout ${done.completedTxid} confirmed=${st}`);
+
+      // USDC（米国の店、USD 建て）
+      const shopperBefore = await usdcOf('shopper-1');
+      const escrowBefore = await usdcOf('escrow-1');
+      const usd = await placeFunded(user, { shopUrl: 'https://us-shop.test/', region: 'US', sku: 'U-100', payment: 'usdc-evm', shopper: 'shopper-1', escrow: 'escrow-1' });
+      assert(usd.quote!.fx!.pair === 'USDC/USD', `pair ${usd.quote!.fx!.pair}`);
+      await user.release(usd.id);
+      await waitOrder(user, usd.id, 'completed');
+      await waitShopper('shopper-1', usd.id, ['completed']);
+      const got = (await usdcOf('shopper-1')) - shopperBefore;
+      const fee = (await usdcOf('escrow-1')) - escrowBefore;
+      assert(got === BigInt(usd.quote!.lock_amount!), `shopper got ${got}, lock ${usd.quote!.lock_amount}`);
+      assert(fee === BigInt(usd.quote!.escrow_upfront_fee!), `escrow upfront fee ${fee} vs ${usd.quote!.escrow_upfront_fee}`);
+      log(`USDC order ${usd.id.slice(0, 8)}: shopper +${got}, escrow upfront +${fee}`);
+
+      // レートが大きくずれた見積には強い警告が出る（利用者側の取得元が 12% 安い BTC/USD を返す）
+      const skewed = await startUser('user-2', { rates: [new StaticSource({ 'BTC/USD': 88000, 'USD/JPY': 150, 'USDC/USD': 1 })] });
+      const q = await requestQuote(skewed.user, { shopUrl: SAFE_SHOP, region: SHINJUKU, sku: 'A-100', payment: 'btc-signet', shopper: 'shopper-1', escrow: 'escrow-1' });
+      assert(q.quoteCheck?.fx?.level === 'strong', `expected strong warning, got ${q.quoteCheck?.fx?.level} (${q.quoteCheck?.fx?.deviation})`);
+      await skewed.user.cancel(q.id);
+      skewed.s.stop();
+      log(`rate check: deviation ${q.quoteCheck?.fx?.deviation} → ${q.quoteCheck?.fx?.level}`);
+    },
+  },
+  {
+    id: 'b',
+    title: '配達失敗 → 紛争 → 誠実な escrow-1 が返金を裁定 → 利用者が連署（BTC）',
+    async run({ users, log }) {
+      const user = users['user-1'];
+      const o = await placeFunded(user, { shopUrl: SAFE_SHOP, region: SHINJUKU, sku: 'FAIL-100', payment: 'btc-signet', shopper: 'shopper-1', escrow: 'escrow-1' }, 'delivery_failed');
+      await user.openDispute(o.id, { claim: 'not_delivered', text: '配送に失敗したと通知が来ました' });
+      const c = await until('escrow-1 case collects evidence', 60_000, async () => {
+        const c = await admin('escrow-1').case(o.id);
+        return c.state === 'open' && c.delivery_address ? c : undefined;
+      });
+      assert(c.delivery_address?.address === ADDRESS.address, 'escrow decrypted the delivery address from key_for_escrow');
+      // 購入画面のスクリーンショットは 1 通に収まらないので、添付として分けて届く（spec §4.9）
+      const shot = await until('escrow-1 assembled the screenshot', 60_000, async () =>
+        Object.values((await admin('escrow-1').case(o.id)).attachments ?? {}).find((a) => a.mime === 'image/png' && a.data_b64));
+      log(`screenshot attachment assembled: ${Math.round((shot.data_b64!.length * 3) / 4 / 1024)} KiB`);
+      const lock = BigInt(o.quote!.lock_amount!) - BigInt(o.quote!.payout_fee_reserve ?? '0');
+      const fee = (lock * 200n) / 10_000n;
+      await admin('escrow-1').rule(o.id, { user: String(lock - fee), shopper: '0', reason: '配送失敗のため全額返金' });
+      await waitOrder(user, o.id, 'ruled');
+      const problems = await user.reviewRuling(o.id);
+      assert(problems.length === 0, `ruling review: ${problems.join('; ')}`);
+      const settled = await user.countersignRuling(o.id);
+      await waitShopper('shopper-1', o.id, ['settled', 'closed']);
+      log(`dispute ${o.id.slice(0, 8)}: refunded ${lock - fee} sats to user (escrow fee ${fee}), tx ${settled.settledTxid}`);
+    },
+  },
+  {
+    id: 'c',
+    title: 'escrow-2 の不正な裁定 → 通報 → operator-1 が一覧から外し、規約の bond を没収して補償（USDC）',
+    async run({ users, log }) {
+      const user = users['user-1'];
+      const o = await placeFunded(user, { shopUrl: SAFE_SHOP, region: SHINJUKU, sku: 'FAIL-100', payment: 'usdc-evm', shopper: 'shopper-1', escrow: 'escrow-2' }, 'delivery_failed');
+      await user.openDispute(o.id, { claim: 'not_delivered', text: '届いていません' });
+      await until('escrow-2 case open', 60_000, async () => (await admin('escrow-2').case(o.id)).state === 'open');
+      // 配送に失敗したのに、全額を shopper に配分する
+      const lock = BigInt(o.quote!.lock_amount!);
+      const fee = (lock * 200n) / 10_000n;
+      await admin('escrow-2').rule(o.id, { user: '0', shopper: String(lock - fee), reason: '（不正）shopper に全額' });
+      // shopper-1 は accept_rulings: always なので連署して執行する
+      await waitShopper('shopper-1', o.id, ['settled']);
+      await waitOrder(user, o.id, ['ruled', 'settled']);
+      const problems = await user.reviewRuling(o.id);
+      log(`user sees the ruling as: ${problems.join('; ') || '(no automatic objection)'}`);
+
+      await user.report(o.id, { subject: 'escrow', text: '配送失敗なのに全額を shopper に配分した' });
+      const report = await until('operator-1 received the report', 60_000, async () =>
+        (await admin('operator-1').reports()).find((r) => r.report.order_id === o.id));
+      assert(report.from === pk('user-1') && report.report.subject === pk('escrow-2'), 'report from user-1 about escrow-2');
+      assert(report.invalid_evidence === 0, `invalid evidence ${report.invalid_evidence}`);
+      assert(report.report.evidence.length >= 4, `evidence messages ${report.report.evidence.length}`);
+
+      // operator-1: 一覧の新しい版から escrow-2 を外す
+      const v = await publishList('operator-1', 'Kanto + US operator', ['JP-13', 'US'], operator1Entries().filter((e) => e.escrow !== pk('escrow-2')));
+      await waitTrust(['shopper-1', 'escrow-nat', 'operator-1'], 'operator-1', v.version);
+      const offers = await user.discoverOffers({ shopUrl: SAFE_SHOP, region: SHINJUKU, payment: 'usdc-evm', refresh: true });
+      assert(!offers.some((x) => x.entry.escrow === pk('escrow-2')), 'escrow-2 is no longer offered');
+
+      // 規約（プロトコルの外）: bond を没収して利用者に補償する
+      const op = (await startUser('operator-1')).s;
+      const before = await usdcOf('user-1');
+      await op.evm!.bondSlash(keys('escrow-2').evmAddress, keys('user-1').evmAddress, lock);
+      const comp = (await usdcOf('user-1')) - before;
+      assert(comp === lock, `compensation ${comp}`);
+      op.stop();
+      log(`fraud ${o.id.slice(0, 8)}: reported, list v${v.version} without escrow-2, bond slashed ${comp} to user`);
+    },
+  },
+  {
+    id: 'd',
+    title: 'coordinator-2 が operator-2 の委任を失効 → その一覧の組み合わせが候補から消える',
+    async run({ users, log }) {
+      const user = users['user-2'];
+      const osaka = { shopUrl: SAFE_SHOP, region: 'JP-27-27100', payment: 'btc-signet' as const };
+      const before = await user.discoverOffers({ ...osaka, refresh: true });
+      assert(before.some((x) => x.entry.provenance.operator === pk('operator-2')), `operator-2 offers before revoke: ${before.length}`);
+      const d = await delegate('coordinator-2', 'operator-2', true);
+      await until('offers from operator-2 disappear', 60_000, async () =>
+        !(await user.discoverOffers({ ...osaka, refresh: true })).some((x) => x.entry.provenance.operator === pk('operator-2')));
+      // shopper-2 のノードも同じ判断をする: その組み合わせでの注文は trust で断る
+      await until('shopper-2 dropped operator-2', 60_000, async () => {
+        const t = (await admin('shopper-2').trust()) as { effective?: Array<{ operator: string }> };
+        return !(t.effective ?? []).some((e) => e.operator === pk('operator-2'));
+      });
+      await delegate('coordinator-2', 'operator-2'); // 次の実行のために戻す
+      log(`revoked operator-2 (delegation v${d.version}); offers for JP-27 went from ${before.length} to 0 and came back after re-delegation`);
+    },
+  },
+  {
+    id: 'e',
+    title: 'NAT: NAT の内側のブラウザが公開の Web 画面から注文し、NAT の内側の escrow には libp2p の relay 経由で届く',
+    async run({ log }) {
+      const nat = await admin('escrow-nat').status();
+      assert(nat.reachability === 'private', `escrow-nat reachability ${nat.reachability}`);
+      assert(nat.addrs.some((a) => a.includes('/p2p-circuit')), 'escrow-nat has a relay address');
+      const st = (await admin('shopper-1').p2pStatus(nat.peer_id)) as { pubkey?: string; content?: string };
+      assert(JSON.stringify(st).includes(pk('escrow-nat')), `status over libp2p: ${JSON.stringify(st).slice(0, 200)}`);
+      log(`libp2p /ps/status from shopper-1 to escrow-nat via circuit relay: ok`);
+      // 利用者のブラウザも NAT の内側（この runner 自体が router の内側にいる）
+      const r = await browserHappyPath();
+      log(`browser (behind NAT) order ${r.orderId.slice(0, 8)} completed, payout ${r.txid}`);
+    },
+  },
+  {
+    id: 'f',
+    title: 'shopper の方針: 危険な店と地域外の現金店を断り、地域内の shopper は現金店の注文を受けて届ける',
+    async run({ users, log }) {
+      const user = users['user-2'];
+      const risky = await requestQuote(user, { shopUrl: 'http://risky-shop.test/', region: 'US', sku: 'R-100', payment: 'usdc-evm', shopper: 'shopper-1', escrow: 'escrow-1' });
+      assert(risky.status === 'rejected' && risky.quote?.reject_reason === 'risk', `risky: ${risky.status} ${risky.quote?.reject_reason}`);
+      const cash = { shopUrl: 'https://cash-store.test/', region: SHINJUKU, sku: 'C-100', payment: 'btc-signet' as const, escrow: 'escrow-1' as const };
+      const far = await requestQuote(user, { ...cash, shopper: 'shopper-1' });
+      assert(far.status === 'rejected' && far.quote?.reject_reason === 'region', `out of region: ${far.status} ${far.quote?.reject_reason}`);
+      const near = await acceptAndFund(user, await requestQuote(user, { ...cash, shopper: 'shopper-2' }));
+      await user.release(near.id);
+      await waitOrder(user, near.id, 'completed');
+      const so = await waitShopper('shopper-2', near.id, ['completed']);
+      log(`risky → ${risky.quote?.reject_reason}; cash-store via shopper-1 (JP-27) → ${far.quote?.reject_reason}; via shopper-2 (JP-13) → ${so.state}`);
+    },
+  },
+  {
+    id: 'g',
+    title: 'タイムロック T1: 利用者が受け取り確認をしないまま T1 を過ぎると、shopper が単独で受け取る（BTC）',
+    async run({ users, log }) {
+      const user = users['user-2'];
+      const o = await placeFunded(user, { shopUrl: SAFE_SHOP, region: SHINJUKU, sku: 'A-100', payment: 'btc-signet', shopper: 'shopper-1', escrow: 'escrow-1' });
+      const t1 = o.quote!.timelock!.t1;
+      const { btc } = await faucet.height();
+      await faucet.mine(t1 - btc + 1);
+      const so = await waitShopper('shopper-1', o.id, ['claimed'], 120_000);
+      log(`T1=${t1}: shopper-1 claimed alone, tx ${so.payout_tx}`);
+    },
+  },
+  {
+    id: 'h',
+    title: 'タイムロック T2: shopper が消えたら、T2 を過ぎた後に利用者が単独で取り戻す（USDC）',
+    async run({ users, log }) {
+      const user = users['user-2'];
+      const o = await requestQuote(user, { shopUrl: SAFE_SHOP, region: SHINJUKU, sku: 'A-200', payment: 'usdc-evm', shopper: 'shopper-2', escrow: 'escrow-1' });
+      await stopService('shopper-2');
+      try {
+        await user.acceptQuote(o.id);
+        await user.fund(o.id);
+        const now = (await faucet.height()).evm_time;
+        await faucet.evmTime(o.quote!.timelock!.t2 - now + 1);
+        const before = await usdcOf('user-2');
+        const r = await user.refundAfterTimelock(o.id);
+        const back = (await usdcOf('user-2')) - before;
+        assert(back === BigInt(o.quote!.lock_amount!), `refund ${back} vs lock ${o.quote!.lock_amount}`);
+        log(`T2=${o.quote!.timelock!.t2}: user-2 refunded ${back} alone, tx ${r.refundTxid}`);
+      } finally {
+        await startService('shopper-2');
+      }
+    },
+  },
+];
+
+// shopper-2 を「消す」: compose の外から止められないので、docker の API を使う（runner に socket を渡している）
+async function docker(path: string, method = 'POST'): Promise<void> {
+  const { request } = await import('node:http');
+  await new Promise<void>((resolve, reject) => {
+    const req = request({ socketPath: '/var/run/docker.sock', path, method }, (res) => {
+      res.resume();
+      res.on('end', () => ((res.statusCode ?? 500) < 400 ? resolve() : reject(new Error(`docker ${path}: ${res.statusCode}`))));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+const container = (service: string) => `${process.env.COMPOSE_PROJECT ?? 'pslab'}-${service}-1`;
+async function stopService(service: string) {
+  await docker(`/containers/${container(service)}/stop`);
+}
+async function startService(service: string) {
+  await docker(`/containers/${container(service)}/start`);
+  await until(`${service} back`, 60_000, async () => !!(await admin(service).status()).pubkey);
+}
+

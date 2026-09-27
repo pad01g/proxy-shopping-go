@@ -1,0 +1,12 @@
+{{define "content"}}
+<h1>Super cheap secure pay!!!</h1>
+<p>Order <strong id="pay-order">{{.Order.ID}}</strong> · Amount {{template "money" (money "pay-amount" .Order.Total)}}</p>
+<form method="post" action="/cheap-pay">
+  <input type="hidden" name="order" value="{{.Order.ID}}">
+  <label for="card-number">Card number</label><input type="text" id="card-number" name="number" required>
+  <label for="card-exp">Expiry</label><input type="text" id="card-exp" name="exp" required>
+  <label for="card-cvc">CVC</label><input type="text" id="card-cvc" name="cvc" required>
+  <label for="card-name">Name</label><input type="text" id="card-name" name="name" required>
+  <button id="pay" type="submit">Pay now</button>
+</form>
+{{end}}

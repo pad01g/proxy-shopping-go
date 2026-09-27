@@ -1,0 +1,26 @@
+{
+  "network": "ps-lab",
+  "relays": [
+    "wss://relay-1.test",
+    "wss://relay-2.test"
+  ],
+  "coordinators": [
+    "6eac25bc912ab49582890fa47837d574e6d7932620d5410fcffec31a8f87d520",
+    "23c66e3b8b09d6f242e501ddbff2e6a2c786b4d36a8bdffddb1299b4c5de13dd"
+  ],
+  "esplora": "https://esplora.test",
+  "evm_rpc": "https://evm.test",
+  "chain_id": 31337,
+  "deployments_url": "/deployments/31337.json",
+  "rates": [
+    {
+      "type": "coingecko",
+      "base": "https://rates.test/coingecko"
+    },
+    {
+      "type": "frankfurter",
+      "base": "https://rates.test/frankfurter"
+    }
+  ],
+  "faucet_url": "https://faucet.test"
+}

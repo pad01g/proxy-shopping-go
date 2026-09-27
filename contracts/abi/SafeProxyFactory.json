@@ -1,0 +1,139 @@
+[
+  {
+    "type": "function",
+    "name": "createChainSpecificProxyWithNonce",
+    "inputs": [
+      {
+        "name": "_singleton",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "initializer",
+        "type": "bytes",
+        "internalType": "bytes"
+      },
+      {
+        "name": "saltNonce",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "proxy",
+        "type": "address",
+        "internalType": "contract SafeProxy"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "createProxyWithCallback",
+    "inputs": [
+      {
+        "name": "_singleton",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "initializer",
+        "type": "bytes",
+        "internalType": "bytes"
+      },
+      {
+        "name": "saltNonce",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "callback",
+        "type": "address",
+        "internalType": "contract IProxyCreationCallback"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "proxy",
+        "type": "address",
+        "internalType": "contract SafeProxy"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "createProxyWithNonce",
+    "inputs": [
+      {
+        "name": "_singleton",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "initializer",
+        "type": "bytes",
+        "internalType": "bytes"
+      },
+      {
+        "name": "saltNonce",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "proxy",
+        "type": "address",
+        "internalType": "contract SafeProxy"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "getChainId",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "proxyCreationCode",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes",
+        "internalType": "bytes"
+      }
+    ],
+    "stateMutability": "pure"
+  },
+  {
+    "type": "event",
+    "name": "ProxyCreation",
+    "inputs": [
+      {
+        "name": "proxy",
+        "type": "address",
+        "indexed": true,
+        "internalType": "contract SafeProxy"
+      },
+      {
+        "name": "singleton",
+        "type": "address",
+        "indexed": false,
+        "internalType": "address"
+      }
+    ],
+    "anonymous": false
+  }
+]

@@ -1,0 +1,7 @@
+{
+  "_comment": "Lab test cards only. Real deployments point BOT_CARDS_FILE at a secret file.",
+  "cards": {
+    "default": {"number": "4242424242424242", "exp": "12/30", "cvc": "123", "name": "PS LAB SHOPPER"},
+    "declined": {"number": "4000000000000002", "exp": "12/30", "cvc": "123", "name": "PS LAB SHOPPER"}
+  }
+}

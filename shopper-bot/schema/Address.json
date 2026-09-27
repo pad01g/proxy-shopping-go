@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/pad01g/proxy-shopping-go/shopper-bot/schema/Address.json",
+  "title": "Address",
+  "type": "object",
+  "required": ["name", "postal_code", "address", "phone"],
+  "additionalProperties": false,
+  "properties": {
+    "name": {"type": "string", "minLength": 1, "maxLength": 200},
+    "postal_code": {"type": "string", "minLength": 1, "maxLength": 20},
+    "address": {"type": "string", "minLength": 1, "maxLength": 500},
+    "phone": {"type": "string", "minLength": 1, "maxLength": 40}
+  }
+}
