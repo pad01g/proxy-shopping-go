@@ -9,8 +9,16 @@ import (
 	"github.com/pad01g/proxy-shopping-go/node/internal/proto"
 )
 
-// maxAttempts bounds the retries of an action that keeps failing the same transient way.
-const maxAttempts = 50
+// Pacing of the retries of a pending action that fails for a reason that may go away: the first after
+// retryBase, doubling up to retryMax. An action is given up after actionTTL, unless it sent a transaction:
+// that one is watched until the chain decides.
+var (
+	retryBase = 3 * time.Second
+	retryMax  = 10 * time.Minute
+	actionTTL = 7 * 24 * time.Hour
+	// waitPoll is how often a sent transaction is looked at (waiting is not an attempt).
+	waitPoll = 10 * time.Second
+)
 
 // actionOrder is the order in which pending actions of one order are worked off.
 var actionOrder = []string{ActQuote, ActRefund, ActRelease, ActRuling, ActClaim}
@@ -20,15 +28,19 @@ func (e *Engine) kick(ctx context.Context, id string) {
 	e.background(ctx, "work", id, func(ctx context.Context) { e.work(ctx, id) })
 }
 
-// retryPending restarts the workers of orders with pending actions (after a failure or a restart).
+// retryPending restarts the workers of orders with pending actions that are due (after a failure or a restart).
 func (e *Engine) retryPending(ctx context.Context) {
 	orders, err := e.Orders()
 	if err != nil {
 		return
 	}
+	now := time.Now().Unix()
 	for _, o := range orders {
-		if len(o.Pending) > 0 {
-			e.kick(ctx, o.ID)
+		for _, a := range o.Pending {
+			if a.Next <= now {
+				e.kick(ctx, o.ID)
+				break
+			}
 		}
 	}
 }
@@ -41,7 +53,7 @@ func (e *Engine) work(ctx context.Context, id string) {
 			return
 		}
 		a := o.Pending[kind]
-		if a == nil {
+		if a == nil || a.Next > time.Now().Unix() {
 			continue
 		}
 		actx, cancel := context.WithTimeout(ctx, 3*time.Minute)
@@ -63,14 +75,19 @@ func (e *Engine) run(ctx context.Context, o *Order, kind string, a *Action) erro
 		return e.offerRefund(ctx, o)
 	}
 	if a.Tx != "" {
-		done, err := e.sentTx(ctx, o, kind, a)
-		if err != nil {
+		st, err := e.sentTx(ctx, o, kind, a)
+		switch {
+		case err != nil:
 			return err
-		}
-		if done {
+		case st == txFinal:
 			e.finish(ctx, o, kind, a, a.Tx)
 			return nil
+		case st == txSeen:
+			// on its way: the order is paid out, the transaction is watched until it is final
+			e.finish(ctx, o, kind, a, a.Tx)
+			return errWaiting
 		}
+		// txGone: prepared and sent anew
 	}
 	if !o.funded() {
 		return contract.Mismatchf("the escrow is no longer open")
@@ -95,10 +112,17 @@ func (e *Engine) run(ctx context.Context, o *Order, kind string, a *Action) erro
 		return err
 	}
 	e.finish(ctx, o, kind, a, txid)
+	if p.tx != nil {
+		// BTC: watched until it has its confirmations
+		a.Tx = txid
+		if st, err := e.sentTx(ctx, o, kind, a); err != nil || st != txFinal {
+			return errWaiting
+		}
+	}
 	return nil
 }
 
-// finish records a payout of ours that reached the chain and tells the parties.
+// finish records a payout of ours that reached the chain and tells the parties (once).
 func (e *Engine) finish(ctx context.Context, o *Order, kind string, a *Action, txid string) {
 	switch kind {
 	case ActClaim:
@@ -142,7 +166,16 @@ func (e *Engine) finish(ctx context.Context, o *Order, kind string, a *Action, t
 	}
 }
 
-// settle removes a finished action or records why it has to be tried again.
+// backoffAfter is the pause after attempt n of an action.
+func backoffAfter(n int) time.Duration {
+	d := retryBase
+	for i := 1; i < n && d < retryMax; i++ {
+		d *= 2
+	}
+	return min(d, retryMax)
+}
+
+// settle removes a finished action or records why it has to be tried again, and when.
 func (e *Engine) settle(ctx context.Context, o *Order, kind string, err error) {
 	gaveUp := false
 	_, _ = e.update(o.ID, func(o *Order) error {
@@ -150,20 +183,27 @@ func (e *Engine) settle(ctx context.Context, o *Order, kind string, err error) {
 		if a == nil {
 			return errSkip
 		}
+		now := time.Now()
 		switch {
 		case err == nil:
 			delete(o.Pending, kind)
-		case contract.IsDefinite(err) || a.Attempts+1 >= maxAttempts:
+		case errors.Is(err, errWaiting):
+			// a sent transaction on its way is not a failed attempt
+			a.Error, a.Next = err.Error(), now.Add(waitPoll).Unix()
+		case a.Tx != "" && !errors.Is(err, errSuperseded):
+			// never forget a transaction we sent while the chain has not decided about it
+			a.Attempts++
+			a.Error, a.Next = err.Error(), now.Add(backoffAfter(a.Attempts)).Unix()
+			o.note(kind + " transaction " + a.Tx + ": " + err.Error())
+		case contract.IsDefinite(err) || now.Sub(time.Unix(a.Since, 0)) > actionTTL:
 			delete(o.Pending, kind)
 			o.Error = kind + ": " + err.Error()
 			o.note(kind + " abandoned: " + err.Error())
 			gaveUp = true
 		default:
 			a.Attempts++
-			a.Error = err.Error()
-			if !errors.Is(err, errWaiting) {
-				o.note(kind + " failed, will retry: " + err.Error())
-			}
+			a.Error, a.Next = err.Error(), now.Add(backoffAfter(a.Attempts)).Unix()
+			o.note(kind + " failed, will retry: " + err.Error())
 		}
 		return nil
 	})

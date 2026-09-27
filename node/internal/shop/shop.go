@@ -30,6 +30,8 @@ type Info struct {
 	Gateway  string `json:"gateway,omitempty"`
 	CashOnly bool   `json:"cash_only"`
 	Region   string `json:"region,omitempty"`
+	// FinalHost is the host that answered when the page redirected to another host ("" when it did not).
+	FinalHost string `json:"final_host,omitempty"`
 }
 
 // Inspector fetches shop pages and catalogs. Certificates are always verified: a shop whose certificate does not
@@ -71,13 +73,25 @@ func checkPublic(address string) error {
 		return fmt.Errorf("%w: %s", ErrPrivateAddress, host)
 	}
 	ip = ip.Unmap()
-	if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || cgnat.Contains(ip) {
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
 		return fmt.Errorf("%w: %s", ErrPrivateAddress, ip)
+	}
+	for _, p := range refused {
+		if p.Contains(ip) {
+			return fmt.Errorf("%w: %s", ErrPrivateAddress, ip)
+		}
 	}
 	return nil
 }
 
-var cgnat = netip.MustParsePrefix("100.64.0.0/10")
+// refused are further ranges that are not the shop itself: carrier-grade NAT, and the IPv6 prefixes that carry
+// an IPv4 address (NAT64, 6to4), through which any IPv4 address, private ones included, can be reached.
+var refused = []netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("2002::/16"),
+}
 
 // ParseURL checks a shop URL.
 func ParseURL(raw string) (*url.URL, error) {
@@ -95,11 +109,19 @@ func (in *Inspector) Inspect(ctx context.Context, raw string) (*Info, error) {
 		return nil, err
 	}
 	info := &Info{URL: raw, Host: strings.ToLower(u.Hostname()), HTTPS: u.Scheme == "https"}
-	body, err := get(ctx, in.HTTP, raw)
+	body, hops, err := get(ctx, in.HTTP, raw)
 	if err != nil {
 		return nil, err
 	}
-	info.CertOK = info.HTTPS
+	// the page read is the one at the end of the redirects: TLS counts only if every hop was HTTPS (the client
+	// verified each certificate), and the page must still be the shop's host for its allowlist entry to count
+	info.CertOK = true
+	for _, h := range hops {
+		info.CertOK = info.CertOK && h.Scheme == "https"
+	}
+	if last := hops[len(hops)-1]; !strings.EqualFold(last.Hostname(), info.Host) {
+		info.FinalHost = strings.ToLower(last.Hostname())
+	}
 	meta := metaTags(body)
 	info.Gateway = strings.ToLower(meta["ps-payment-gateway"])
 	info.CashOnly = meta["ps-payment"] == "cash-only"
@@ -107,20 +129,27 @@ func (in *Inspector) Inspect(ctx context.Context, raw string) (*Info, error) {
 	return info, nil
 }
 
-func get(ctx context.Context, hc *http.Client, raw string) ([]byte, error) {
+// get reads raw and returns the body and the URLs of every hop, the requested one first and the one that
+// answered last.
+func get(ctx context.Context, hc *http.Client, raw string) ([]byte, []*url.URL, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	res, err := hc.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer res.Body.Close()
-	if res.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("GET %s: HTTP %d", raw, res.StatusCode)
+	var hops []*url.URL
+	for r := res; r != nil && r.Request != nil; r = r.Request.Response {
+		hops = append([]*url.URL{r.Request.URL}, hops...)
 	}
-	return io.ReadAll(io.LimitReader(res.Body, 4<<20))
+	if res.StatusCode/100 != 2 {
+		return nil, hops, fmt.Errorf("GET %s: HTTP %d", raw, res.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(res.Body, 4<<20))
+	return body, hops, err
 }
 
 // metaTags returns name → content of the <meta> tags of a page.
@@ -163,7 +192,7 @@ type Policy struct {
 func (p Policy) Score(info *Info) (int, []string) {
 	score := 0
 	var why []string
-	if slices.Contains(p.Allowlist, info.Host) {
+	if slices.Contains(p.Allowlist, info.Host) && info.FinalHost == "" {
 		score += 50
 		why = append(why, "allowlisted host +50")
 	}
@@ -215,7 +244,7 @@ func (in *Inspector) Catalog(ctx context.Context, raw string) (*Catalog, error) 
 	if err != nil {
 		return nil, err
 	}
-	body, err := get(ctx, in.HTTP, u.Scheme+"://"+u.Host+"/api/products")
+	body, _, err := get(ctx, in.HTTP, u.Scheme+"://"+u.Host+"/api/products")
 	if err != nil {
 		return nil, fmt.Errorf("catalog: %w", err)
 	}

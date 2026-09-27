@@ -12,13 +12,13 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/nbd-wtf/go-nostr"
 
 	"github.com/pad01g/proxy-shopping-go/node/internal/amount"
@@ -81,11 +81,46 @@ type Case struct {
 	Attachments map[string]*Attachment `json:"attachments,omitempty"`
 
 	Ruling *proto.Ruling `json:"ruling,omitempty"`
+	// RulingSent is the dispute.ruling inner sent to each party (pubkey → id); a party missing here gets it on
+	// the next round of the background checks.
+	RulingSent map[string]string `json:"ruling_sent,omitempty"`
 	// ClaimedPayout is the transaction a party says carried out the ruling; the case closes once the chain
 	// shows the escrow spent.
 	ClaimedPayout string   `json:"claimed_payout,omitempty"`
 	PayoutTx      string   `json:"payout_tx,omitempty"`
 	History       []string `json:"history"`
+
+	// Verified: the funding of Agreement was verified on chain against our own key for the order (§4.7). Until
+	// then the case is a stub: Agreement is empty, and the agreements named for the order are Candidates.
+	Verified   bool        `json:"verified"`
+	Candidates []candidate `json:"candidates,omitempty"`
+	// Claims are the dispute.open messages received; the case opens with the first one of a party of the
+	// verified agreement.
+	Claims []claim `json:"claims,omitempty"`
+	// EvidenceIDs are the inner ids of the dispute.evidence messages taken (a resent message counts once).
+	EvidenceIDs []string `json:"evidence_ids,omitempty"`
+	// Checks and NextCheck pace the checks of a pending case (exponential backoff).
+	Checks    int   `json:"checks,omitempty"`
+	NextCheck int64 `json:"next_check,omitempty"`
+}
+
+// candidate is an agreement named for the order (by an escrow.notice or the evidence of a dispute.open) whose
+// funding is not verified yet.
+type candidate struct {
+	RequestID string         `json:"request_id"`
+	Events    []*nostr.Event `json:"events"`
+	Failed    string         `json:"failed,omitempty"` // why it definitely does not verify
+}
+
+// claim is a dispute.open received.
+type claim struct {
+	From           string                `json:"from"`
+	EventID        string                `json:"event_id"`
+	RequestID      string                `json:"request_id,omitempty"` // of the agreement in its evidence, if any
+	Claim          string                `json:"claim"`
+	Text           string                `json:"text,omitempty"`
+	RequestedSplit *proto.RequestedSplit `json:"requested_split,omitempty"`
+	At             int64                 `json:"at"`
 }
 
 // Attachment is one evidence item received in chunks; DataB64 is set once all chunks arrived and the hash
@@ -105,7 +140,21 @@ const (
 	maxAttachmentsPerParty = 4
 	maxChunks              = 64 // 64 × 12 KiB = 768 KiB per item
 	maxEvidencePerParty    = 32
+	maxCandidates          = 4 // agreements kept per order while none is verified
+	maxClaims              = 8
+	maxText                = 2000
 )
+
+// Pacing of the checks of pending cases: the first retry after CheckBase, doubling up to CheckMax; a case that
+// could not be verified within PendingTTL owes nothing.
+var (
+	CheckBase  = 5 * time.Second
+	CheckMax   = time.Hour
+	PendingTTL = 7 * 24 * time.Hour
+)
+
+// watchParallel bounds the chain checks the background loop runs at once.
+const watchParallel = 8
 
 func (c *Case) note(format string, args ...any) {
 	c.Updated = time.Now().Unix()
@@ -148,6 +197,10 @@ type Engine struct {
 	busy   sync.Map   // background checks in progress, by order id
 	jobs   sync.WaitGroup
 	base   atomic.Pointer[context.Context] // the context of Start, for background checks
+	sem    chan struct{}                   // bounds the chain checks of the background loop
+	// inbox returns the stored received messages of an order (the messenger's); a stub case keeps only the
+	// ids of the dispute.open messages and reads them from here once the case opens.
+	inbox func(orderID string) []*nostr.Event
 }
 
 // Wait waits for the background checks that are running.
@@ -158,8 +211,9 @@ func New(d Deps) *Engine {
 	if d.Log == nil {
 		d.Log = slog.Default()
 	}
-	e := &Engine{Deps: d, log: d.Log.With("component", "escrow")}
+	e := &Engine{Deps: d, log: d.Log.With("component", "escrow"), sem: make(chan struct{}, watchParallel)}
 	m := d.Messenger
+	e.inbox = m.Inbox
 	m.Handle(proto.TypeEscrowNotice, e.onNotice)
 	m.Handle(proto.TypeDisputeOpen, e.onDisputeOpen)
 	m.Handle(proto.TypeDisputeEvidence, e.onEvidence)
@@ -229,14 +283,34 @@ func (e *Engine) watch(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	now := time.Now().Unix()
 	for _, c := range cases {
+		id := c.OrderID
 		switch c.State {
 		case CaseFeePending:
-			e.checkFee(ctx, c.OrderID)
-		case CaseOpen, CaseRuled:
-			e.checkSpent(ctx, c.OrderID)
+			if c.NextCheck > now {
+				continue
+			}
+			e.limited(ctx, id, func(ctx context.Context) { e.evaluate(ctx, id) })
+		case CaseOpen:
+			e.limited(ctx, id, func(ctx context.Context) { e.checkSpent(ctx, id) })
+		case CaseRuled:
+			e.limited(ctx, id, func(ctx context.Context) { e.sendRuling(ctx, id); e.checkSpent(ctx, id) })
 		}
 	}
+}
+
+// limited runs fn in the background like background, at most watchParallel at once.
+func (e *Engine) limited(ctx context.Context, id string, fn func(ctx context.Context)) {
+	e.background(ctx, id, func(ctx context.Context) {
+		select {
+		case e.sem <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+		defer func() { <-e.sem }()
+		fn(ctx)
+	})
 }
 
 // background runs fn unless a check of the same order is running. fn gets the engine's context: the context of
@@ -258,10 +332,43 @@ func (e *Engine) background(ctx context.Context, id string, fn func(ctx context.
 	}()
 }
 
+// notice is an escrow.notice received.
 type notice struct {
 	From     string         `json:"from"`
 	Received int64          `json:"received"`
 	Events   []*nostr.Event `json:"events"`
+}
+
+func (n notice) requestID() string {
+	for _, ev := range n.Events {
+		if ev != nil && giftwrap.Type(ev) == proto.TypeOrderRequest {
+			return ev.ID
+		}
+	}
+	return ""
+}
+
+// noticeSet is what the notices bucket holds per order: every notice naming a different request (bounded),
+// since only the chain tells which of them is the real order (§4.7).
+type noticeSet struct {
+	Notices []notice `json:"notices,omitempty"`
+	// the single notice of earlier versions
+	From     string         `json:"from,omitempty"`
+	Received int64          `json:"received,omitempty"`
+	Events   []*nostr.Event `json:"events,omitempty"`
+}
+
+func (s *noticeSet) list() []notice {
+	if len(s.Notices) == 0 && len(s.Events) > 0 {
+		return []notice{{From: s.From, Received: s.Received, Events: s.Events}}
+	}
+	return s.Notices
+}
+
+func (e *Engine) notices(orderID string) []notice {
+	var s noticeSet
+	_, _ = e.DB.Get(bucketNotices, orderID, &s)
+	return s.list()
 }
 
 func (e *Engine) onNotice(ctx context.Context, msg *messenger.Message) {
@@ -275,32 +382,84 @@ func (e *Engine) onNotice(ctx context.Context, msg *messenger.Message) {
 		e.log.Warn("invalid escrow.notice", "order", msg.OrderID, "err", err)
 		return
 	}
-	// a later notice may complete or correct the funding, but never replace the request
-	err = store.Modify(e.DB, bucketNotices, o.ID, func(old *notice, exists bool) error {
-		if exists && len(old.Events) > 0 && old.Events[0].ID != o.RequestEvent.ID {
-			return fmt.Errorf("a notice with another request (%s) is already recorded", old.Events[0].ID)
+	// a later notice of the same request may complete or correct the funding; notices of other requests are
+	// kept too (a stranger may have sent one first) until the chain shows which one is funded
+	rec := notice{From: msg.From, Received: time.Now().Unix(), Events: o.Events()}
+	var dropped bool
+	err = store.Modify(e.DB, bucketNotices, o.ID, func(s *noticeSet, _ bool) error {
+		list := s.list()
+		for i := range list {
+			if list[i].requestID() == o.RequestEvent.ID {
+				list[i] = rec
+				*s = noticeSet{Notices: list}
+				return nil
+			}
 		}
-		*old = notice{From: msg.From, Received: time.Now().Unix(), Events: o.Events()}
+		if len(list) >= maxCandidates {
+			dropped = true
+			return store.ErrStop
+		}
+		*s = noticeSet{Notices: append(list, rec)}
 		return nil
 	})
 	if err != nil {
 		e.log.Warn("escrow.notice not recorded", "order", o.ID, "err", err)
 		return
 	}
+	if dropped {
+		e.log.Warn("escrow.notice dropped: too many requests for one order", "order", o.ID, "request", o.RequestEvent.ID)
+		return
+	}
 	e.log.Info("escrow.notice recorded", "order", o.ID, "asset", o.Quote.Asset, "lock", o.Quote.LockAmount)
+	// a case waiting for a verifiable agreement looks again
+	var recheck bool
+	e.mu.Lock()
+	_ = store.Modify(e.DB, bucketCases, o.ID, func(c *Case, exists bool) error {
+		if !exists {
+			return store.ErrStop
+		}
+		if c.Verified {
+			if c.requestID() != o.RequestEvent.ID {
+				c.note("escrow.notice of %s names another request (%s) than the verified order, ignored", msg.From, o.RequestEvent.ID)
+				return nil
+			}
+			return store.ErrStop
+		}
+		recheck = c.reopen()
+		return nil
+	})
+	e.mu.Unlock()
+	if recheck {
+		e.background(ctx, o.ID, func(ctx context.Context) { e.evaluate(ctx, o.ID) })
+	}
 }
 
-// agreement assembles the signed order (§4.7): the messages of the escrow.notice when there is one (differing
-// evidence messages are ignored and reported), else the evidence messages.
-func (e *Engine) agreement(orderID string, evidence []*nostr.Event) (*contract.Order, []string, error) {
-	var n notice
-	_, _ = e.DB.Get(bucketNotices, orderID, &n)
-	evs, ignored, err := contract.Select(orderID, n.Events, evidence)
-	if err != nil {
-		return nil, nil, err
+// requestID is the id of the request of the verified agreement.
+func (c *Case) requestID() string {
+	for _, ev := range c.Agreement {
+		if ev != nil && giftwrap.Type(ev) == proto.TypeOrderRequest {
+			return ev.ID
+		}
 	}
-	o, err := contract.FromEvents(evs)
-	return o, ignored, err
+	return ""
+}
+
+// reopen makes an unverified case check its candidates again (a new one arrived); it tells whether a check is
+// due.
+func (c *Case) reopen() bool {
+	switch c.State {
+	case CaseNoObligation:
+		if c.Verified {
+			return false
+		}
+		c.State = CaseFeePending
+		c.note("another agreement was named: checking again")
+		fallthrough
+	case CaseFeePending:
+		c.Checks, c.NextCheck = 0, 0
+		return true
+	}
+	return false
 }
 
 func (e *Engine) onDisputeOpen(ctx context.Context, msg *messenger.Message) {
@@ -308,103 +467,360 @@ func (e *Engine) onDisputeOpen(ctx context.Context, msg *messenger.Message) {
 	if err := msg.Decode(&d); err != nil {
 		return
 	}
-	e.mu.Lock()
-	if c, ok, _ := e.caseDoc(msg.OrderID); ok {
-		e.mu.Unlock()
-		e.log.Info("dispute already open", "order", msg.OrderID, "state", c.State)
-		if c.State == CaseFeePending && (msg.From == c.User || msg.From == c.Shopper) {
-			e.background(ctx, c.OrderID, func(ctx context.Context) { e.checkFee(ctx, c.OrderID) })
+	me := e.Keys.NostrPubHex()
+	// the agreement the evidence names, if it holds together and the sender is a party of it
+	var cand *candidate
+	if evs, _, err := contract.Select(msg.OrderID, nil, d.Evidence.Messages); err == nil {
+		if o, err := contract.FromEvents(evs); err == nil && o.ID == msg.OrderID && o.Request.Escrow == me && (msg.From == o.User || msg.From == o.Shopper) {
+			cand = &candidate{RequestID: o.RequestEvent.ID, Events: o.Events()}
 		}
+	}
+	party := cand != nil
+	for _, n := range e.notices(msg.OrderID) {
+		if o, err := contract.FromEvents(n.Events); err == nil && (msg.From == o.User || msg.From == o.Shopper) {
+			party = true
+		}
+	}
+	if !party {
+		e.log.Warn("dispute from a stranger, for another escrow or without a verifiable order", "order", msg.OrderID, "from", msg.From)
 		return
 	}
-	defer e.mu.Unlock()
-	o, ignored, err := e.agreement(msg.OrderID, d.Evidence.Messages)
-	if err != nil {
-		e.log.Warn("dispute without a verifiable order", "order", msg.OrderID, "err", err)
-		return
+	cl := claim{From: msg.From, EventID: msg.Inner.ID, Claim: d.Claim, Text: truncate(d.Text, maxText), RequestedSplit: d.RequestedSplit, At: time.Now().Unix()}
+	if cand != nil {
+		cl.RequestID = cand.RequestID
 	}
-	if o.Request.Escrow != e.Keys.NostrPubHex() || (msg.From != o.User && msg.From != o.Shopper) {
-		e.log.Warn("dispute from a stranger or for another escrow", "order", msg.OrderID, "from", msg.From)
-		return
-	}
-	c := &Case{
-		OrderID: o.ID, State: CaseFeePending, Opened: time.Now().Unix(), OpenedBy: msg.From, User: o.User, Shopper: o.Shopper,
-		Asset: o.Quote.Asset, Claim: d.Claim, Text: d.Text, RequestedSplit: d.RequestedSplit, Agreement: o.Events(),
-		Evidence: map[string][]proto.DisputeEvidence{msg.From: {d.Evidence}},
-	}
-	c.note("opened by %s: %s", msg.From, d.Claim)
-	for _, ig := range ignored {
-		c.note("evidence message %s differs from the escrow.notice, ignored", ig)
-	}
-	e.decryptAddress(c, o, d.Evidence)
-	if err := e.DB.Put(bucketCases, c.ID(), c); err != nil {
+	var check bool
+	e.mu.Lock()
+	err := store.Modify(e.DB, bucketCases, msg.OrderID, func(c *Case, exists bool) error {
+		if !exists {
+			// a stub until the funding and the fee are verified: the evidence stays in the inbox until then
+			*c = Case{OrderID: msg.OrderID, State: CaseFeePending, Opened: time.Now().Unix(), OpenedBy: msg.From, Claim: d.Claim}
+			c.note("dispute.open from %s: %s", msg.From, d.Claim)
+		}
+		for _, have := range c.Claims {
+			if have.EventID == cl.EventID {
+				return store.ErrStop
+			}
+		}
+		if len(c.Claims) < maxClaims {
+			c.Claims = append(c.Claims, cl)
+		}
+		if cand != nil {
+			switch {
+			case c.Verified && cand.RequestID != c.requestID():
+				c.note("dispute.open of %s names another request (%s) than the verified order, ignored", msg.From, cand.RequestID)
+			case !c.Verified && !c.hasCandidate(cand.RequestID) && len(c.Candidates) < maxCandidates:
+				c.Candidates = append(c.Candidates, *cand)
+			}
+		}
+		if exists && c.State != CaseFeePending && c.State != CaseNoObligation {
+			// a later dispute.open never takes a case back (§4.8)
+			c.note("dispute.open from %s on a %s case recorded", msg.From, c.State)
+			return nil
+		}
+		check = c.reopen()
+		return nil
+	})
+	e.mu.Unlock()
+	if err != nil && !errors.Is(err, store.ErrStop) {
 		e.log.Error("store case", "err", err)
 		return
 	}
-	e.log.Info("case opened", "order", c.OrderID, "by", msg.From)
-	// the fee check asks the chain; it must not hold up the messages
-	e.background(ctx, c.OrderID, func(ctx context.Context) { e.checkFee(ctx, c.OrderID) })
+	if check {
+		// the checks ask the chain; they must not hold up the messages
+		e.background(ctx, msg.OrderID, func(ctx context.Context) { e.evaluate(ctx, msg.OrderID) })
+	}
 }
 
-// checkFee decides whether we owe a ruling (§3.2): the upfront fee was paid, for this order only. A fee that
-// could not be checked (network, chain not caught up) keeps the case pending, to be checked again.
-func (e *Engine) checkFee(ctx context.Context, id string) {
+func (c *Case) hasCandidate(requestID string) bool {
+	for _, have := range c.Candidates {
+		if have.RequestID == requestID {
+			return true
+		}
+	}
+	return false
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
+// errFeeConflict: the upfront fee is counted for another verified order. It is checked again (the other
+// order's case may turn out not to hold) until the case expires.
+var errFeeConflict = errors.New("upfront fee counted for another order")
+
+// evaluate decides a pending case (§4.7): it looks for the agreement whose funding the chain shows paying our
+// own key for the order, then for a dispute.open of one of its parties, then for the upfront fee we are owed.
+// Anything the chain could not answer yet keeps the case pending, to be checked again with a growing pause.
+func (e *Engine) evaluate(ctx context.Context, id string) {
 	c, ok, err := e.caseDoc(id)
 	if err != nil || !ok || c.State != CaseFeePending {
 		return
 	}
-	o, err := contract.FromEvents(c.Agreement)
-	if err != nil {
-		return
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	// 1. the verified agreement
+	var o *contract.Order
+	var fund *btc.Tx
+	failed := map[string]string{}
+	var pending error
+	if c.Verified {
+		if o, err = contract.FromEvents(c.Agreement); err != nil {
+			return
+		}
+		if o.Quote.Asset == proto.AssetBTC {
+			// the fee is looked for in the funding transaction itself
+			fund, err = e.verifyFunding(cctx, o)
+			if err != nil {
+				pending = err
+				o = nil
+			}
+		}
+	} else {
+		for _, cand := range e.candidates(c) {
+			if cand.Failed != "" {
+				failed[cand.RequestID] = cand.Failed
+				continue
+			}
+			co, err := contract.FromEvents(cand.Events)
+			if err == nil && (co.ID != id || co.Request.Escrow != e.Keys.NostrPubHex()) {
+				err = contract.Mismatchf("not an order of ours")
+			}
+			var tx *btc.Tx
+			if err == nil {
+				tx, err = e.verifyFunding(cctx, co)
+			}
+			switch {
+			case err == nil:
+				o, fund = co, tx
+			case contract.IsDefinite(err):
+				failed[cand.RequestID] = err.Error()
+			default:
+				pending = err
+			}
+			if o != nil {
+				break
+			}
+		}
 	}
-	fctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	use, err := e.feePaid(fctx, o)
-	cancel()
-	if err == nil && use != "" {
-		err = e.claimFee(use, id)
+
+	// 2. the dispute of a party, 3. the fee
+	var opener *claim
+	var feeErr error
+	if o != nil {
+		for i := range c.Claims {
+			if cl := &c.Claims[i]; cl.From == o.User || cl.From == o.Shopper {
+				opener = cl
+				break
+			}
+		}
+		if opener != nil {
+			var use string
+			use, feeErr = e.feeOwed(cctx, o, fund)
+			if feeErr == nil {
+				feeErr = e.claimFee(use, id)
+			}
+		}
 	}
-	e.mu.Lock()
+
 	var opened bool
+	e.mu.Lock()
 	_ = store.Modify(e.DB, bucketCases, id, func(c *Case, exists bool) error {
 		if !exists || c.State != CaseFeePending {
 			return store.ErrStop
 		}
-		switch {
-		case err == nil:
-			c.FeePaid, c.State, opened = true, CaseOpen, true
-			c.note("upfront fee paid")
-		case contract.IsDefinite(err):
-			c.State = CaseNoObligation
-			c.note("upfront fee not paid (%v): no obligation to rule", err)
-		default:
-			c.note("upfront fee could not be checked yet: %v", err)
+		for i := range c.Candidates {
+			if why := failed[c.Candidates[i].RequestID]; why != "" && c.Candidates[i].Failed == "" {
+				c.Candidates[i].Failed = why
+				c.note("agreement %s does not verify: %s", c.Candidates[i].RequestID, why)
+			}
 		}
+		if o != nil && !c.Verified {
+			c.Verified, c.Agreement, c.Candidates = true, o.Events(), nil
+			c.User, c.Shopper, c.Asset = o.User, o.Shopper, o.Quote.Asset
+			c.note("funding of request %s verified on chain", o.RequestEvent.ID)
+			for req := range failed {
+				if req != o.RequestEvent.ID {
+					c.note("conflicting request %s recorded, not the funded order", req)
+				}
+			}
+		}
+		switch {
+		case o == nil && pending == nil:
+			c.State = CaseNoObligation
+			c.note("no agreement named for this order is funded to our key: no obligation to rule")
+			return nil
+		case o != nil && opener == nil:
+			c.note("waiting for a dispute.open of a party of the verified order")
+		case o != nil && feeErr == nil:
+			c.FeePaid, c.State, c.OpenedBy, c.Claim, c.Text, c.RequestedSplit = true, CaseOpen, opener.From, opener.Claim, opener.Text, opener.RequestedSplit
+			c.Checks, c.NextCheck = 0, 0
+			c.note("upfront fee paid; case opened by %s: %s", opener.From, opener.Claim)
+			opened = true
+			return nil
+		case o != nil && contract.IsDefinite(feeErr):
+			c.State = CaseNoObligation
+			c.note("upfront fee not owed (%v): no obligation to rule", feeErr)
+			return nil
+		case o != nil:
+			c.note("upfront fee could not be checked yet: %v", feeErr)
+		default:
+			c.note("funding could not be checked yet: %v", pending)
+		}
+		if time.Since(time.Unix(c.Opened, 0)) > PendingTTL {
+			c.State = CaseNoObligation
+			c.note("not verified within %s: no obligation to rule", PendingTTL)
+			return nil
+		}
+		c.Checks++
+		c.NextCheck = time.Now().Add(backoff(c.Checks)).Unix()
 		return nil
 	})
 	e.mu.Unlock()
-	if !opened {
-		return
-	}
-	other := o.Shopper
-	if c.OpenedBy == o.Shopper {
-		other = o.User
-	}
-	want := proto.EvidenceRequest{Want: []string{"messages", "tracking", "purchase_evidence", "delivery_key_for_escrow"}}
-	if _, err := e.Messenger.Send(ctx, other, o.ID, proto.TypeDisputeEvidenceRequest, want, o.Request.Relays); err != nil {
-		e.log.Warn("evidence request not sent", "order", o.ID, "err", err)
+	if opened {
+		e.opened(ctx, id, o)
 	}
 }
 
-// claimFee records that a fee pays for this order; a fee already counted for another order does not count.
-func (e *Engine) claimFee(use, id string) error {
-	return store.Modify(e.DB, bucketFeeUses, use, func(owner *string, exists bool) error {
-		if exists && *owner != id {
-			return contract.Mismatchf("%s already paid for order %s", use, *owner)
+// backoff is the pause before check n+1 of a pending case.
+func backoff(n int) time.Duration {
+	d := CheckBase
+	for i := 1; i < n && d < CheckMax; i++ {
+		d *= 2
+	}
+	return min(d, CheckMax)
+}
+
+// candidates lists the agreements named for a stub case: the notices first, then the evidence of disputes.
+func (e *Engine) candidates(c *Case) []candidate {
+	var out []candidate
+	seen := map[string]bool{}
+	failed := map[string]string{}
+	for _, cand := range c.Candidates {
+		failed[cand.RequestID] = cand.Failed
+	}
+	for _, n := range e.notices(c.OrderID) {
+		if id := n.requestID(); id != "" && !seen[id] {
+			seen[id] = true
+			out = append(out, candidate{RequestID: id, Events: n.Events, Failed: failed[id]})
 		}
-		if exists {
+	}
+	for _, cand := range c.Candidates {
+		if !seen[cand.RequestID] {
+			seen[cand.RequestID] = true
+			out = append(out, cand)
+		}
+	}
+	return out
+}
+
+// opened fills a case that just opened from the messages its stub left in the inbox (the dispute.open of the
+// opener, evidence and attachments that came early) and asks the parties for their evidence.
+func (e *Engine) opened(ctx context.Context, id string, o *contract.Order) {
+	c, ok, err := e.caseDoc(id)
+	if err != nil || !ok {
+		return
+	}
+	var have bool
+	var early []*nostr.Event
+	for _, ev := range e.inbox(id) {
+		if ev.PubKey != o.User && ev.PubKey != o.Shopper {
+			continue
+		}
+		switch giftwrap.Type(ev) {
+		case proto.TypeDisputeOpen:
+			var d proto.DisputeOpen
+			if ev.ID != c.claimID(ev.PubKey) || json.Unmarshal([]byte(ev.Content), &d) != nil {
+				continue
+			}
+			have = have || ev.PubKey == c.OpenedBy
+			e.mu.Lock()
+			_ = store.Modify(e.DB, bucketCases, id, func(c *Case, _ bool) error {
+				c.addEvidence(ev.PubKey, ev.ID, d.Evidence)
+				_, ignored, _ := contract.Select(id, c.Agreement, d.Evidence.Messages)
+				for _, ig := range ignored {
+					c.note("evidence message %s differs from the verified order, ignored", ig)
+				}
+				e.decryptAddress(c, o, d.Evidence)
+				return nil
+			})
+			e.mu.Unlock()
+		case proto.TypeDisputeEvidence, proto.TypeAttachment:
+			early = append(early, ev)
+		}
+	}
+	for _, ev := range early {
+		m := &messenger.Message{Inner: ev, From: ev.PubKey, Type: giftwrap.Type(ev), OrderID: id}
+		if m.Type == proto.TypeAttachment {
+			e.onAttachment(ctx, m)
+		} else {
+			e.onEvidence(ctx, m)
+		}
+	}
+	want := proto.EvidenceRequest{Want: []string{"messages", "tracking", "purchase_evidence", "delivery_key_for_escrow"}}
+	to := []string{o.Shopper}
+	if c.OpenedBy == o.Shopper {
+		to = []string{o.User}
+	}
+	if !have {
+		to = append(to, c.OpenedBy) // its dispute.open is no longer at hand
+	}
+	for _, p := range to {
+		if _, err := e.Messenger.Send(ctx, p, o.ID, proto.TypeDisputeEvidenceRequest, want, o.Request.Relays); err != nil {
+			e.log.Warn("evidence request not sent", "order", o.ID, "to", p, "err", err)
+		}
+	}
+}
+
+// claimID is the id of the first dispute.open of a party.
+func (c *Case) claimID(from string) string {
+	for _, cl := range c.Claims {
+		if cl.From == from {
+			return cl.EventID
+		}
+	}
+	return ""
+}
+
+// addEvidence appends the evidence of a party once per message id, within the bound.
+func (c *Case) addEvidence(from, id string, ev proto.DisputeEvidence) bool {
+	if slices.Contains(c.EvidenceIDs, id) {
+		return false
+	}
+	if c.Evidence == nil {
+		c.Evidence = map[string][]proto.DisputeEvidence{}
+	}
+	if len(c.Evidence[from]) >= maxEvidencePerParty {
+		c.note("evidence of %s beyond %d messages, ignored", from, maxEvidencePerParty)
+		return false
+	}
+	c.EvidenceIDs = append(c.EvidenceIDs, id)
+	c.Evidence[from] = append(c.Evidence[from], ev)
+	c.note("evidence from %s: %d messages, %d tracking entries", from, len(ev.Messages), len(ev.Tracking))
+	return true
+}
+
+// claimFee records that a fee pays for this order. A fee counted for another order whose case holds (verified,
+// fee paid) does not count; one counted for a case that no longer holds is taken over.
+func (e *Engine) claimFee(use, id string) error {
+	var owner string
+	if ok, _ := e.DB.Get(bucketFeeUses, use, &owner); ok && owner != id {
+		if oc, ok, _ := e.caseDoc(owner); ok && oc.Verified && oc.FeePaid && oc.State != CaseNoObligation {
+			return fmt.Errorf("%w: %s already paid for order %s", errFeeConflict, use, owner)
+		}
+	}
+	return store.Modify(e.DB, bucketFeeUses, use, func(cur *string, exists bool) error {
+		if exists && *cur == id {
 			return store.ErrStop
 		}
-		*owner = id
+		if exists && *cur != owner {
+			return fmt.Errorf("%w: %s was just claimed for order %s", errFeeConflict, use, *cur)
+		}
+		*cur = id
 		return nil
 	})
 }
@@ -412,25 +828,124 @@ func (e *Engine) claimFee(use, id string) error {
 // ID is the key of the case.
 func (c *Case) ID() string { return c.OrderID }
 
-// feePaid checks the upfront fee of §4.6 and returns the key of the fee for claimFee. Definite errors
-// (contract.IsDefinite) mean not paid; others mean it could not be checked.
-func (e *Engine) feePaid(ctx context.Context, o *contract.Order) (string, error) {
+// verifyFunding checks on chain that the funding of an agreement pays the contract rebuilt from its request and
+// quote with our own key for the order (§4.7): BTC, the P2WSH output with the lock amount, confirmed (the
+// funding transaction is returned, for the fee); USDC, the predicted Safe with the owners, threshold and module
+// of the order, holding the lock amount. Definite errors mean the agreement is not the funded order.
+func (e *Engine) verifyFunding(ctx context.Context, o *contract.Order) (*btc.Tx, error) {
 	if o.Funded == nil {
-		return "", contract.Mismatchf("no order.funded")
+		return nil, contract.Mismatchf("no order.funded")
+	}
+	switch o.Quote.Asset {
+	case proto.AssetBTC:
+		esc, err := contract.BTCEscrow(o.Request, o.Quote)
+		if err != nil {
+			return nil, contract.Definite(err)
+		}
+		key, err := e.Keys.EscrowOrderKey(o.ID)
+		if err != nil {
+			return nil, err
+		}
+		if !key.PubKey().IsEqual(esc.Escrow) {
+			return nil, contract.Mismatchf("the quote names another escrow key than ours for the order")
+		}
+		if e.BTC == nil {
+			return nil, errors.New("no bitcoin backend")
+		}
+		tx, _, err := contract.BTCEscrowOutput(ctx, e.BTC, esc, o.Quote, o.Funded, 1)
+		return tx, err
+	case proto.AssetUSDC:
+		if e.EVM == nil || e.Deployments == nil {
+			return nil, errors.New("no EVM backend")
+		}
+		if !common.IsHexAddress(o.Quote.EscrowEVMAddress) || common.HexToAddress(o.Quote.EscrowEVMAddress) != e.Keys.EVMAddress() {
+			return nil, contract.Mismatchf("the quote names another escrow address than ours")
+		}
+		if !common.IsHexAddress(o.Funded.Safe) {
+			return nil, contract.Mismatchf("funded without a safe address")
+		}
+		d, err := e.Deployments()
+		if err != nil {
+			return nil, err
+		}
+		os, err := contract.SafeOf(d, o.Request, o.Quote)
+		if err != nil {
+			return nil, contract.Definite(err)
+		}
+		safe := common.HexToAddress(o.Funded.Safe)
+		if err := contract.CheckSafe(ctx, e.EVM, d, os, o.ID, o.Quote, safe); err != nil {
+			return nil, err
+		}
+		lock, err := amount.ParseInt(o.Quote.LockAmount)
+		if err != nil {
+			return nil, contract.Definite(err)
+		}
+		bal, err := e.EVM.BalanceOf(ctx, d.USDC, safe)
+		if err != nil {
+			return nil, err
+		}
+		if bal.Cmp(lock) < 0 {
+			return nil, contract.ErrNotYet
+		}
+		return nil, nil
+	}
+	return nil, contract.Mismatchf("unknown asset %q", o.Quote.Asset)
+}
+
+// feeOwed checks that we are owed a ruling (§4.7): the quote's upfront fee is above 0 and at least our own
+// max(bps × lock, min), and it was paid as §4.6 says (BTC: in the verified funding transaction fund). It returns
+// the key of the fee for claimFee. Definite errors mean no obligation.
+func (e *Engine) feeOwed(ctx context.Context, o *contract.Order, fund *btc.Tx) (string, error) {
+	fee, err := amount.ParseInt(o.Quote.EscrowUpfrontFee)
+	if err != nil {
+		return "", contract.Mismatchf("escrow_upfront_fee: %v", err)
+	}
+	if fee.Sign() <= 0 {
+		return "", contract.Mismatchf("no upfront fee was quoted")
+	}
+	lock, err := amount.ParseInt(o.Quote.LockAmount)
+	if err != nil {
+		return "", contract.Mismatchf("lock_amount: %v", err)
+	}
+	cfg := e.Config.UpfrontFee
+	due := amount.BPS(lock, cfg.BPS)
+	switch o.Quote.Asset {
+	case proto.AssetBTC:
+		if cfg.MinSats != "" {
+			min, err := amount.ParseInt(cfg.MinSats)
+			if err != nil {
+				return "", fmt.Errorf("config min_sats: %w", err)
+			}
+			due = amount.Max(due, min)
+		}
+	case proto.AssetUSDC:
+		if cfg.MinUSDC != "" {
+			min, err := amount.Parse(cfg.MinUSDC)
+			if err != nil {
+				return "", fmt.Errorf("config min_usdc: %w", err)
+			}
+			due = amount.Max(due, amount.ToUnits(min, 6))
+		}
+	}
+	if fee.Cmp(due) < 0 {
+		return "", contract.Mismatchf("the quoted upfront fee %s is below our fee %s", fee, due)
 	}
 	switch o.Quote.Asset {
 	case proto.AssetBTC:
 		if o.Quote.EscrowBTCFeeAddress != e.Keys.WalletAddress() {
 			return "", contract.Mismatchf("the fee was quoted to another address")
 		}
-		if e.BTC == nil {
-			return "", errors.New("no bitcoin backend")
+		if o.Funded.FeeTxID != "" && o.Funded.FeeTxID != o.Funded.TxID {
+			return "", contract.Mismatchf("the upfront fee was not paid in the funding transaction")
 		}
-		return contract.VerifyBTCFee(ctx, e.BTC, o.Quote, o.Funded)
+		if fund == nil || fund.TxID != o.Funded.TxID {
+			return "", errors.New("funding transaction not at hand")
+		}
+		if err := contract.BTCFeePaid(fund, o.Quote); err != nil {
+			return "", err
+		}
+		return "btc-fee:" + fund.TxID, nil
 	case proto.AssetUSDC:
-		if e.EVM == nil || e.Deployments == nil {
-			return "", errors.New("no EVM backend")
-		}
 		if !common.IsHexAddress(o.Quote.EscrowEVMAddress) || common.HexToAddress(o.Quote.EscrowEVMAddress) != e.Keys.EVMAddress() {
 			return "", contract.Mismatchf("the fee was quoted to another address")
 		}
@@ -492,8 +1007,12 @@ func (e *Engine) onEvidence(ctx context.Context, msg *messenger.Message) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	_ = store.Modify(e.DB, bucketCases, msg.OrderID, func(c *Case, exists bool) error {
-		if !exists || (msg.From != c.User && msg.From != c.Shopper) {
+		// a stub keeps nothing: the message stays in the inbox and is taken when the case opens
+		if !exists || !c.Verified || c.State == CaseFeePending || c.State == CaseNoObligation || (msg.From != c.User && msg.From != c.Shopper) {
 			return store.ErrStop
+		}
+		if slices.Contains(c.EvidenceIDs, msg.Inner.ID) {
+			return store.ErrStop // a resent message counts once
 		}
 		for _, m := range ev.Messages {
 			if m == nil || giftwrap.VerifyInner(m) != nil {
@@ -501,15 +1020,9 @@ func (e *Engine) onEvidence(ctx context.Context, msg *messenger.Message) {
 				return nil
 			}
 		}
-		if c.Evidence == nil {
-			c.Evidence = map[string][]proto.DisputeEvidence{}
-		}
-		if len(c.Evidence[msg.From]) >= maxEvidencePerParty {
-			c.note("evidence of %s beyond %d messages, ignored", msg.From, maxEvidencePerParty)
+		if !c.addEvidence(msg.From, msg.Inner.ID, ev) {
 			return nil
 		}
-		c.Evidence[msg.From] = append(c.Evidence[msg.From], ev)
-		c.note("evidence from %s: %d messages, %d tracking entries", msg.From, len(ev.Messages), len(ev.Tracking))
 		if o, err := contract.FromEvents(c.Agreement); err == nil {
 			e.decryptAddress(c, o, ev)
 		}
@@ -538,7 +1051,7 @@ func (e *Engine) onAttachment(ctx context.Context, msg *messenger.Message) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	c, ok, err := e.caseDoc(msg.OrderID)
-	if err != nil || !ok || (msg.From != c.User && msg.From != c.Shopper) {
+	if err != nil || !ok || !c.Verified || c.State == CaseFeePending || c.State == CaseNoObligation || (msg.From != c.User && msg.From != c.Shopper) {
 		return
 	}
 	key := attachmentKey(c.OrderID, a.SHA256)
@@ -645,7 +1158,7 @@ func isSHA256(s string) bool {
 // escrow spent (checkSpent); a ruling must exist.
 func (e *Engine) onCountersigned(ctx context.Context, msg *messenger.Message) {
 	var ref proto.TxRef
-	if msg.Decode(&ref) != nil || ref.TxID == "" || len(ref.TxID) > 66 {
+	if msg.Decode(&ref) != nil || (!contract.IsTxID(ref.TxID) && !contract.IsTxHash(ref.TxID)) {
 		return
 	}
 	e.mu.Lock()
@@ -696,20 +1209,15 @@ func (e *Engine) checkSpent(ctx context.Context, id string) {
 		if err != nil {
 			return
 		}
-		safe := common.HexToAddress(o.Funded.Safe)
-		bal, err := e.EVM.BalanceOf(cctx, d.USDC, safe)
-		if err != nil || bal.Sign() != 0 {
+		lock, err := amount.ParseInt(o.Quote.LockAmount)
+		if err != nil {
 			return
 		}
-		by = "(safe emptied)"
-		if c.ClaimedPayout != "" {
-			if r, err := e.EVM.Receipt(cctx, common.HexToHash(c.ClaimedPayout)); err == nil && r.Status == types.ReceiptStatusSuccessful {
-				for _, t := range evm.TransfersOf(r, d.USDC) {
-					if t.From == safe {
-						by = c.ClaimedPayout
-					}
-				}
-			}
+		// paid out: the balance fell below the lock by a transfer out of the Safe (§4.8; a dust transfer into
+		// the Safe may stay behind)
+		by, err = contract.SafeSettlement(cctx, e.EVM, d, common.HexToAddress(o.Funded.Safe), lock, c.ClaimedPayout)
+		if err != nil || by == "" {
+			return
 		}
 	default:
 		return
@@ -755,7 +1263,7 @@ func (e *Engine) Rule(ctx context.Context, id string, r RuleRequest) (*proto.Rul
 		return nil, fmt.Errorf("no case %s", id)
 	}
 	if c.State == CaseFeePending {
-		e.checkFee(ctx, id)
+		e.evaluate(ctx, id)
 		if c, _, err = e.caseDoc(id); err != nil {
 			return nil, err
 		}
@@ -764,7 +1272,7 @@ func (e *Engine) Rule(ctx context.Context, id string, r RuleRequest) (*proto.Rul
 	case CaseNoObligation:
 		return nil, ErrNoObligation
 	case CaseFeePending:
-		return nil, errors.New("the upfront fee could not be checked yet; try again")
+		return nil, errors.New("the funding or the upfront fee could not be verified yet; try again")
 	case CaseRuled:
 		return nil, ErrAlreadyRuled
 	case CaseClosed:
@@ -772,6 +1280,9 @@ func (e *Engine) Rule(ctx context.Context, id string, r RuleRequest) (*proto.Rul
 			return nil, ErrAlreadyRuled
 		}
 		return nil, errors.New("case is closed")
+	}
+	if !c.Verified {
+		return nil, errors.New("case without a verified order")
 	}
 	o, err := contract.FromEvents(c.Agreement)
 	if err != nil || o.Funded == nil {
@@ -812,17 +1323,58 @@ func (e *Engine) Rule(ctx context.Context, id string, r RuleRequest) (*proto.Rul
 	if err != nil {
 		return nil, err
 	}
-	for _, to := range []string{o.User, o.Shopper} {
-		if _, err := e.Messenger.Send(ctx, to, o.ID, proto.TypeDisputeRuling, ruling, o.Request.Relays); err != nil {
-			return nil, fmt.Errorf("send ruling: %w", err)
-		}
-	}
 	e.log.Info("ruled", "order", id, "user", ruling.Split.User, "shopper", ruling.Split.Shopper, "fee", ruling.Split.EscrowFee)
+	// each party gets it on its own; one that could not be sent is sent again by the background checks
+	e.sendRuling(ctx, id)
 	return ruling, nil
 }
 
-func (e *Engine) split(total, user, shopper *big.Int) (*big.Int, error) {
+// sendRuling sends the recorded ruling of a case to the parties that did not get it yet.
+func (e *Engine) sendRuling(ctx context.Context, id string) {
+	c, ok, err := e.caseDoc(id)
+	if err != nil || !ok || c.Ruling == nil {
+		return
+	}
+	o, err := contract.FromEvents(c.Agreement)
+	if err != nil {
+		return
+	}
+	for _, to := range []string{o.User, o.Shopper} {
+		if c.RulingSent[to] != "" {
+			continue
+		}
+		ev, err := e.Messenger.Send(ctx, to, o.ID, proto.TypeDisputeRuling, c.Ruling, o.Request.Relays)
+		e.mu.Lock()
+		_ = store.Modify(e.DB, bucketCases, id, func(c *Case, _ bool) error {
+			if err != nil {
+				c.note("ruling not sent to %s, will retry: %v", to, err)
+				return nil
+			}
+			if c.RulingSent == nil {
+				c.RulingSent = map[string]string{}
+			}
+			c.RulingSent[to] = ev.ID
+			c.note("ruling sent to %s", to)
+			return nil
+		})
+		e.mu.Unlock()
+		if err != nil {
+			e.log.Warn("ruling not sent", "order", id, "to", to, "err", err)
+		}
+	}
+}
+
+// split checks user + shopper against total minus our dispute fee and returns the fee. The fee is
+// dispute_fee_bps of total, which is also its cap (§4.8); a fee below dust is not taken at all, so that the
+// payout creates no output that would not relay.
+func (e *Engine) split(total, user, shopper *big.Int, dust int64) (*big.Int, error) {
+	if total.Sign() <= 0 || user.Sign() < 0 || shopper.Sign() < 0 {
+		return nil, fmt.Errorf("nothing to divide (%s)", total)
+	}
 	fee := amount.BPS(total, e.Config.DisputeFeeBPS)
+	if fee.Cmp(big.NewInt(dust)) < 0 {
+		fee = new(big.Int)
+	}
 	rest := new(big.Int).Sub(total, fee)
 	if got := new(big.Int).Add(user, shopper); got.Cmp(rest) != 0 {
 		return nil, fmt.Errorf("user + shopper must be %s (balance %s minus dispute fee %s), got %s", rest, total, fee, got)
@@ -863,14 +1415,28 @@ func (e *Engine) ruleBTC(ctx context.Context, o *contract.Order, user, shopper *
 		return nil, fmt.Errorf("escrow already spent by %s", spent.TxID)
 	}
 	prev := btc.Outpoint{TxID: o.Funded.TxID, Vout: *o.Funded.Vout, Amount: out.Value}
-	reserve, err := amount.ParseInt(o.Quote.PayoutFeeReserve)
+	quoted, err := amount.ParseInt(o.Quote.PayoutFeeReserve)
 	if err != nil {
 		return nil, err
 	}
-	total := big.NewInt(prev.Amount - reserve.Int64())
-	fee, err := e.split(total, user, shopper)
+	lock, err := amount.ParseInt(o.Quote.LockAmount)
 	if err != nil {
 		return nil, err
+	}
+	// the reserve is the miner fee of the payout; no more than user clients accept for the lock (§4.5)
+	reserve := min(quoted.Int64(), contract.ReserveCap(lock.Int64()))
+	if reserve < 0 || reserve >= prev.Amount {
+		return nil, fmt.Errorf("payout fee reserve %d does not fit the escrow of %d sats", reserve, prev.Amount)
+	}
+	total := big.NewInt(prev.Amount - reserve)
+	fee, err := e.split(total, user, shopper, btc.DustLimit)
+	if err != nil {
+		return nil, err
+	}
+	for name, v := range map[string]*big.Int{"user": user, "shopper": shopper} {
+		if v.Sign() > 0 && v.Int64() < btc.DustLimit {
+			return nil, fmt.Errorf("the %s share of %s sats is dust (below %d): give it 0 or at least %d", name, v, btc.DustLimit, btc.DustLimit)
+		}
 	}
 	p, err := esc.NewSpend(prev, []btc.Output{
 		{Address: o.Request.UserBTCAddress, Amount: user.Int64()},
@@ -879,6 +1445,13 @@ func (e *Engine) ruleBTC(ctx context.Context, o *contract.Order, user, shopper *
 	}, btc.PathMultisig)
 	if err != nil {
 		return nil, err
+	}
+	script, err := esc.Script()
+	if err != nil {
+		return nil, err
+	}
+	if need := btc.MultisigVSize(p.UnsignedTx, script) * btc.MinRelayFeeRate; reserve < need {
+		return nil, fmt.Errorf("payout fee reserve %d sats is below the minimum relay fee %d of the payout", reserve, need)
 	}
 	key, err := e.Keys.EscrowOrderKey(o.ID)
 	if err != nil {
@@ -920,11 +1493,12 @@ func (e *Engine) ruleUSDC(ctx context.Context, o *contract.Order, user, shopper 
 	if err := contract.CheckSafe(ctx, e.EVM, d, os, o.ID, o.Quote, safe); err != nil {
 		return nil, err
 	}
+	// the split divides the balance at signing (§4.8): anyone can send the Safe a little more at any time
 	bal, err := e.EVM.BalanceOf(ctx, d.USDC, safe)
 	if err != nil {
 		return nil, err
 	}
-	fee, err := e.split(bal, user, shopper)
+	fee, err := e.split(bal, user, shopper, 0)
 	if err != nil {
 		return nil, err
 	}

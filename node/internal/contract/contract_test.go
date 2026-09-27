@@ -52,7 +52,7 @@ func TestFromEvents(t *testing.T) {
 	quote := msg(t, shopper, user, proto.TypeOrderQuote, proto.OrderQuote{Accept: true, Asset: proto.AssetBTC, LockAmount: "10"})
 	accept := msg(t, user, shopper, proto.TypeOrderAccept, proto.OrderAccept{QuoteID: quote.ID})
 	vout := uint32(0)
-	funded := msg(t, user, shopper, proto.TypeOrderFunded, proto.OrderFunded{Asset: proto.AssetBTC, TxID: "aa", Vout: &vout})
+	funded := msg(t, user, shopper, proto.TypeOrderFunded, proto.OrderFunded{Asset: proto.AssetBTC, TxID: strings.Repeat("aa", 32), Vout: &vout})
 
 	o, err := FromEvents([]*nostr.Event{funded, accept, quote, req})
 	if err != nil {
@@ -109,7 +109,7 @@ func TestSelect(t *testing.T) {
 	quote := msg(t, shopper, user, proto.TypeOrderQuote, proto.OrderQuote{Accept: true, Asset: proto.AssetBTC, LockAmount: "10"})
 	accept := msg(t, user, shopper, proto.TypeOrderAccept, proto.OrderAccept{QuoteID: quote.ID})
 	vout := uint32(0)
-	funded := msg(t, user, shopper, proto.TypeOrderFunded, proto.OrderFunded{Asset: proto.AssetBTC, TxID: "aa", Vout: &vout})
+	funded := msg(t, user, shopper, proto.TypeOrderFunded, proto.OrderFunded{Asset: proto.AssetBTC, TxID: strings.Repeat("aa", 32), Vout: &vout})
 	notice := []*nostr.Event{req, quote, accept, funded}
 
 	// mallory's own request and quote, put into the evidence of a dispute
@@ -132,7 +132,7 @@ func TestSelect(t *testing.T) {
 	}
 	// without a notice, the quote named by the accept is used, and the latest funding
 	later := *funded
-	later2 := msg(t, user, shopper, proto.TypeOrderFunded, proto.OrderFunded{Asset: proto.AssetBTC, TxID: "bb", Vout: &vout})
+	later2 := msg(t, user, shopper, proto.TypeOrderFunded, proto.OrderFunded{Asset: proto.AssetBTC, TxID: strings.Repeat("bb", 32), Vout: &vout})
 	later2.CreatedAt = later.CreatedAt + 10
 	_ = later2.Sign(user.sk)
 	other := msg(t, shopper, user, proto.TypeOrderQuote, proto.OrderQuote{Accept: true, Asset: proto.AssetBTC, LockAmount: "99"})
@@ -141,7 +141,7 @@ func TestSelect(t *testing.T) {
 		t.Fatal(err)
 	}
 	o, err = FromEvents(evs)
-	if err != nil || o.Quote.LockAmount != "10" || o.Funded.TxID != "bb" {
+	if err != nil || o.Quote.LockAmount != "10" || o.Funded.TxID != strings.Repeat("bb", 32) {
 		t.Fatalf("%+v %v", o, err)
 	}
 }
@@ -210,11 +210,42 @@ func TestVerifyBTCFundingErrors(t *testing.T) {
 	if _, err := VerifyBTCFunding(ctx, &chain{tx: good, conf: 1}, esc, q, &elsewhere, 1); !IsDefinite(err) {
 		t.Errorf("fee in another tx: %v", err)
 	}
-	if _, err := VerifyBTCFee(ctx, &chain{tx: good}, q, &elsewhere); !IsDefinite(err) {
-		t.Errorf("escrow: fee in another tx: %v", err)
+	// the escrow's check of the output alone (the fee is checked on the transaction it returns)
+	if tx, o, err := BTCEscrowOutput(ctx, &chain{tx: &noFee, conf: 1}, esc, q, f, 1); err != nil || tx != &noFee || o.Value != 1000 {
+		t.Errorf("escrow output: %v", err)
 	}
-	if use, err := VerifyBTCFee(ctx, &chain{tx: good}, q, f); err != nil || use != "btc-fee:"+txid {
-		t.Errorf("escrow fee check: %s %v", use, err)
+	// ids in another spelling are refused (they would dodge the one-order-per-funding records)
+	upper := *f
+	upper.TxID = strings.ToUpper(txid)
+	if _, err := VerifyBTCFunding(ctx, &chain{tx: good, conf: 1}, esc, q, &upper, 1); !IsDefinite(err) {
+		t.Errorf("upper-case txid: %v", err)
+	}
+}
+
+func TestCheckFundedIDs(t *testing.T) {
+	h := strings.Repeat("ab", 32)
+	for _, f := range []proto.OrderFunded{
+		{Asset: proto.AssetBTC, TxID: h, FeeTxID: h},
+		{Asset: proto.AssetUSDC, Safe: "0x" + strings.Repeat("11", 20), FundTx: "0x" + h, FeeTx: "0x" + h},
+	} {
+		if err := CheckFundedIDs(&f); err != nil {
+			t.Errorf("%+v: %v", f, err)
+		}
+	}
+	for _, f := range []proto.OrderFunded{
+		{Asset: proto.AssetBTC, TxID: strings.ToUpper(h)},
+		{Asset: proto.AssetBTC, TxID: h + "00"},
+		{Asset: proto.AssetBTC, TxID: h, FeeTxID: "0x" + h},
+		{Asset: proto.AssetUSDC, FundTx: "0x" + strings.ToUpper(h)},
+		{Asset: proto.AssetUSDC, FeeTx: h},
+		{Asset: "doge"},
+	} {
+		if err := CheckFundedIDs(&f); !IsDefinite(err) {
+			t.Errorf("%+v accepted: %v", f, err)
+		}
+	}
+	if ReserveCap(10000) != 2000 || ReserveCap(100000) != 5000 || ReserveCap(10_000_000) != 20000 {
+		t.Error("ReserveCap")
 	}
 }
 
@@ -253,12 +284,22 @@ func TestCheckBTCPayout(t *testing.T) {
 	if err := check(short, map[string]int64{shopperAddr: 89600}, nil, u.PubKey()); err == nil {
 		t.Fatal("short payout accepted")
 	}
-	skim := build([]btc.Output{{Address: shopperAddr, Amount: 89600}, {Address: userAddr, Amount: 500}}, u)
-	if err := check(skim, map[string]int64{shopperAddr: 89600}, nil, u.PubKey()); err == nil {
+	skim := build([]btc.Output{{Address: shopperAddr, Amount: 89000}, {Address: userAddr, Amount: 600}}, u)
+	if err := check(skim, map[string]int64{shopperAddr: 89000}, nil, u.PubKey()); err == nil {
 		t.Fatal("unexpected output accepted")
 	}
-	if err := check(skim, map[string]int64{shopperAddr: 89600}, map[string]int64{userAddr: 500}, u.PubKey()); err != nil {
+	if err := check(skim, map[string]int64{shopperAddr: 89000}, map[string]int64{userAddr: 600}, u.PubKey()); err != nil {
 		t.Fatalf("allowed extra output refused: %v", err)
+	}
+	// a dust output (which NewSpend never creates) makes the payout unbroadcastable
+	dp, _ := btc.DecodePSBT(skim)
+	dp.UnsignedTx.TxOut[1].Value = 500
+	dp.UnsignedTx.TxOut[0].Value = 89100
+	if err := CheckBTCPayout(dp, esc, prev, map[string]int64{shopperAddr: 89100}, map[string]int64{userAddr: 600}, 1000, nil); err == nil || !strings.Contains(err.Error(), "dust") {
+		t.Fatalf("dust output accepted: %v", err)
+	}
+	if _, err := esc.NewSpend(prev, []btc.Output{{Address: shopperAddr, Amount: 89000}, {Address: userAddr, Amount: 545}}, btc.PathMultisig); err == nil {
+		t.Fatal("NewSpend created a dust output")
 	}
 	fat := build([]btc.Output{{Address: shopperAddr, Amount: 60000}}, u)
 	if err := check(fat, map[string]int64{shopperAddr: 60000}, nil, u.PubKey()); err == nil {

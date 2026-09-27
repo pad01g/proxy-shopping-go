@@ -13,6 +13,14 @@ x-node: &node
   logging: &logging
     options: {max-size: "20m", max-file: "2"}
 
+# psnode の GET /healthz（認証なし。起動が終わると 200）
+x-node-health: &node-health
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8080/healthz"]
+    interval: 2s
+    timeout: 3s
+    retries: 90
+
 x-node-volumes: &node-volumes
   - ./lab/keys:/keys:ro
   - ./lab/nodes:/nodes:ro
@@ -45,9 +53,11 @@ services:
       - ./lab/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - deployments:/deployments:ro
+    # CA ができていて、443 で listen していること
     healthcheck:
-      test: ["CMD", "test", "-f", "/data/caddy/pki/authorities/local/root.crt"]
+      test: ["CMD-SHELL", "test -f /data/caddy/pki/authorities/local/root.crt && nc -z -w 2 127.0.0.1 443"]
       interval: 2s
+      timeout: 3s
       retries: 30
     logging: *logging
     networks:
@@ -62,15 +72,21 @@ services:
     pull_policy: build
     command: ["psrelay", "-listen", "0.0.0.0:7777", "-data", "/data", "-trusted-proxies", "172.40.0.2", "-conns-per-minute", "2000", "-events-per-minute", "6000", "-reqs-per-minute", "6000"]
     volumes: [relay1_data:/data]
+    healthcheck: &relay-health
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:7777/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
     networks: {pub: {ipv4_address: 172.40.0.10}}
   relay-2:
     <<: *node
     command: ["psrelay", "-listen", "0.0.0.0:7777", "-data", "/data", "-trusted-proxies", "172.40.0.2", "-conns-per-minute", "2000", "-events-per-minute", "6000", "-reqs-per-minute", "6000"]
     volumes: [relay2_data:/data]
+    healthcheck: *relay-health
     networks: {pub: {ipv4_address: 172.40.0.11}}
 
   p2p-relay:
-    <<: *node
+    <<: [*node, *node-health]
     command: ["psnode", "-config", "/nodes/p2p-relay.yaml"]
     volumes: *node-volumes
     depends_on: *edge-ready
@@ -83,6 +99,11 @@ services:
     image: proxy-shopping/web:dev
     volumes:
       - ./lab/web-config.json:/usr/share/nginx/html/config.json:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
     logging: *logging
     networks: {pub: {ipv4_address: 172.40.0.60}}
 
@@ -107,6 +128,11 @@ services:
     <<: *node
     command: ["esplora-lite", "-listen", "0.0.0.0:3000", "-rpc", "http://lab:lab@bitcoind:38332"]
     depends_on: [bitcoind]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:3000/blocks/tip/height"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
     networks: {pub: {ipv4_address: 172.40.0.21}}
 
   anvil:
@@ -133,6 +159,11 @@ services:
     depends_on:
       bitcoind: {condition: service_started}
       deployer: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8080/height"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
     networks: {pub: {ipv4_address: 172.40.0.23}}
 
   # ---- 店・レート
@@ -153,7 +184,7 @@ services:
 
   # ---- shopper
   shopper-1:
-    <<: *node
+    <<: [*node, *node-health]
     command: ["psnode", "-config", "/nodes/shopper-1.yaml"]
     volumes:
       - ./lab/keys:/keys:ro
@@ -164,7 +195,10 @@ services:
     depends_on: &node-deps
       <<: *edge-ready
       deployer: {condition: service_completed_successfully}
-      p2p-relay: {condition: service_started}
+      p2p-relay: {condition: service_healthy}
+      relay-1: {condition: service_healthy}
+      relay-2: {condition: service_healthy}
+      esplora: {condition: service_healthy}
     networks: {pub: {ipv4_address: 172.40.0.30}}
   bot-1:
     build: ./shopper-bot
@@ -177,7 +211,7 @@ services:
     networks: {pub: {ipv4_address: 172.40.0.31}}
 
   shopper-2:
-    <<: *node
+    <<: [*node, *node-health]
     command: ["psnode", "-config", "/nodes/shopper-2.yaml"]
     volumes:
       - ./lab/keys:/keys:ro
@@ -200,7 +234,7 @@ services:
 
   # ---- escrow / operator
   escrow-1:
-    <<: *node
+    <<: [*node, *node-health]
     command: ["psnode", "-config", "/nodes/escrow-1.yaml"]
     volumes:
       - ./lab/keys:/keys:ro
@@ -211,7 +245,7 @@ services:
     depends_on: *node-deps
     networks: {pub: {ipv4_address: 172.40.0.40}}
   escrow-2:
-    <<: *node
+    <<: [*node, *node-health]
     command: ["psnode", "-config", "/nodes/escrow-2.yaml"]
     volumes:
       - ./lab/keys:/keys:ro
@@ -222,7 +256,7 @@ services:
     depends_on: *node-deps
     networks: {pub: {ipv4_address: 172.40.0.41}}
   operator-1:
-    <<: *node
+    <<: [*node, *node-health]
     command: ["psnode", "-config", "/nodes/operator-1.yaml"]
     volumes:
       - ./lab/keys:/keys:ro
@@ -233,7 +267,7 @@ services:
     depends_on: *node-deps
     networks: {pub: {ipv4_address: 172.40.0.50}}
   operator-2:
-    <<: *node
+    <<: [*node, *node-health]
     command: ["psnode", "-config", "/nodes/operator-2.yaml"]
     volumes:
       - ./lab/keys:/keys:ro
@@ -263,7 +297,7 @@ services:
     depends_on: [router]
     networks: {home: {ipv4_address: 172.41.0.10}}
   escrow-nat:
-    <<: *node
+    <<: [*node, *node-health]
     network_mode: "service:natbox"
     command: ["psnode", "-config", "/nodes/escrow-nat.yaml"]
     volumes:
@@ -314,8 +348,19 @@ services:
       - deployments:/deployments:ro
       - ./e2e/results:/src/proxy-shopping-go/e2e/results
       - ./lab/web-config.json:/src/proxy-shopping-go/lab/web-config.json:ro
-      # シナリオ h で shopper-2 を止める（「shopper が消えた」状態を作る）ためだけに使う
-      - /var/run/docker.sock:/var/run/docker.sock
+    # シナリオ h は shopper-2 を管理 API の POST /admin/pause で止める（docker の socket は渡さない）
+    depends_on:
+      <<: *node-deps
+      web: {condition: service_healthy}
+      faucet: {condition: service_healthy}
+      shopper-1: {condition: service_healthy}
+      shopper-2: {condition: service_healthy}
+      escrow-1: {condition: service_healthy}
+      escrow-2: {condition: service_healthy}
+      escrow-nat: {condition: service_healthy}
+      operator-1: {condition: service_healthy}
+      operator-2: {condition: service_healthy}
+      router: {condition: service_started}
     networks: {home: {ipv4_address: 172.41.0.20}}
 
 volumes:

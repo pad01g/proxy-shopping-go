@@ -204,10 +204,7 @@ func TestDispatchPerOrder(t *testing.T) {
 	if maxRunning.Load() != 1 || order[0] != "1" || order[1] != "2" || order[2] != "3" {
 		t.Fatalf("messages of one order ran concurrently (%d) or out of order %v", maxRunning.Load(), order)
 	}
-	// after the timeout the next message of the stuck order runs
-	if msg := recv(t, got); msg.OrderID != "aaaa" {
-		t.Fatalf("got %+v", msg)
-	}
+	// the stuck order stays busy past the timeout while its handler runs (TestTimedOutHandlerKeepsOrderBusy)
 }
 
 func TestSenderRateLimit(t *testing.T) {

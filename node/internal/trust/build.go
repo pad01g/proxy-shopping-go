@@ -61,11 +61,13 @@ func NewProfile(secret string, kind int, network string, version int64, content 
 	return sign(secret, kind, tags, content, 0)
 }
 
-// NewInboxRelays signs a kind 10050 event.
+// NewInboxRelays signs a kind 10050 event. It carries no v tag (NIP-17 clients and relays order 10050 by
+// created_at); the version becomes its created_at, so that Version is the same either way. Events with a v tag
+// (other implementations) are accepted too.
 func NewInboxRelays(secret string, relays []string, version int64) (*nostr.Event, error) {
-	tags := nostr.Tags{{"v", strconv.FormatInt(version, 10)}}
+	tags := nostr.Tags{}
 	for _, r := range relays {
 		tags = append(tags, nostr.Tag{"relay", r})
 	}
-	return sign(secret, KindInboxRelays, tags, "", 0)
+	return sign(secret, KindInboxRelays, tags, "", nostr.Timestamp(version))
 }

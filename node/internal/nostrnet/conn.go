@@ -164,6 +164,12 @@ func (c *conn) readLoop() {
 			if s == nil || !s.filters.Match(&env.Event) {
 				continue
 			}
+			// the id must be the hash of the event: a relay could otherwise send any validly signed event
+			// under the id of another one, and a receiver remembering ids as seen would drop the real one
+			if !env.Event.CheckID() {
+				c.log.Debug("dropping event with a wrong id", "relay", c.url, "id", env.Event.ID)
+				continue
+			}
 			if ok, _ := env.Event.CheckSignature(); !ok {
 				c.log.Debug("dropping event with a bad signature", "relay", c.url, "id", env.Event.ID)
 				continue
@@ -302,24 +308,41 @@ func (c *conn) subscribe(ctx context.Context, filters nostr.Filters) (*subscript
 	return s, nil
 }
 
-// query collects the stored events of a filter until EOSE.
+// query collects the stored events of a filter until EOSE, without duplicates and at most the filter's limit
+// (MaxQueryEvents without one): a relay cannot make us hold an unbounded answer.
 func (c *conn) query(ctx context.Context, filter nostr.Filter) ([]*nostr.Event, error) {
+	max := MaxQueryEvents
+	if filter.Limit > 0 && filter.Limit < max {
+		max = filter.Limit
+	}
 	s, err := c.subscribe(ctx, nostr.Filters{filter})
 	if err != nil {
 		return nil, err
 	}
 	defer s.unsub()
 	var out []*nostr.Event
+	seen := map[string]bool{}
+	add := func(ev *nostr.Event) bool {
+		if !seen[ev.ID] {
+			seen[ev.ID] = true
+			out = append(out, ev)
+		}
+		return len(out) >= max
+	}
 	for {
 		select {
 		case ev := <-s.events:
-			out = append(out, ev)
+			if add(ev) {
+				return out, nil
+			}
 		case <-s.eose:
 			// the reader may have queued events just before EOSE
 			for {
 				select {
 				case ev := <-s.events:
-					out = append(out, ev)
+					if add(ev) {
+						return out, nil
+					}
 				default:
 					return out, nil
 				}

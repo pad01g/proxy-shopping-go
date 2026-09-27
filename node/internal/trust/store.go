@@ -18,15 +18,30 @@ const bucket = "trust"
 // ErrOutOfScope is returned by Put for events of authors the configured coordinators do not reach (§10).
 var ErrOutOfScope = errors.New("author is not reachable from the configured coordinators")
 
+// ErrFull is returned by Put for a new address when the store holds its capacity (SetCapacity).
+var ErrFull = errors.New("trust store is full")
+
+// MaxParked is how many valid events outside the scope are kept aside, in case the scope grows to them: gossip
+// and relays do not keep the order of delegation → list → profile, so a profile may arrive before the list that
+// names its author (review 2, item 7).
+var MaxParked = 1000
+
 // Store holds the newest version of every trust and profile event.
 type Store struct {
 	db *store.DB // may be nil (memory only)
 
-	mu     sync.RWMutex
-	events map[Key]*nostr.Event
-	scope  *scope // nil: everything valid is accepted (tests, tools)
+	mu       sync.RWMutex
+	events   map[Key]*nostr.Event
+	scope    *scope // nil: everything valid is accepted (tests, tools, the p2p relay)
+	capacity int    // 0: unbounded
+	maxPark  int    // MaxParked at NewStore
+	parked   map[Key]*nostr.Event
+	parkedQ  []Key // insertion order, for eviction
 
-	changed chan struct{}
+	watchMu  sync.Mutex
+	watchers []chan struct{}
+	changed  <-chan struct{}
+	onAdmit  []func(ev *nostr.Event)
 }
 
 // scope is the acceptance range of §10: the coordinators' delegations, the lists of the delegated operators, and
@@ -41,7 +56,8 @@ type scope struct {
 
 // NewStore loads the persisted events.
 func NewStore(db *store.DB) (*Store, error) {
-	s := &Store{db: db, events: map[Key]*nostr.Event{}, changed: make(chan struct{}, 1)}
+	s := &Store{db: db, events: map[Key]*nostr.Event{}, parked: map[Key]*nostr.Event{}, maxPark: max(MaxParked, 1)}
+	s.changed = s.Watch()
 	if db == nil {
 		return s, nil
 	}
@@ -68,19 +84,153 @@ func (s *Store) SetScope(coordinators []string, network string, own ...string) i
 		s.scope.own[pk] = true
 	}
 	dropped := s.rescopeLocked()
+	admitted, more := s.admitParkedLocked()
+	dropped = append(dropped, more...)
 	s.mu.Unlock()
 	s.persistDrops(dropped)
+	s.persistAdmitted(admitted)
 	s.signal()
 	return len(dropped)
 }
 
-// Changes is signalled (coalesced) whenever the scope may have changed.
+// SetCapacity bounds the number of addresses held (0: unbounded). The p2p relay, which keeps every valid event
+// without a scope, uses it.
+func (s *Store) SetCapacity(n int) {
+	s.mu.Lock()
+	s.capacity = n
+	s.mu.Unlock()
+}
+
+// Changes is signalled (coalesced) whenever the scope may have changed. It is the first watcher (the bridge).
 func (s *Store) Changes() <-chan struct{} { return s.changed }
 
+// Watch returns a new channel signalled (coalesced) whenever the scope may have changed.
+func (s *Store) Watch() <-chan struct{} {
+	ch := make(chan struct{}, 1)
+	s.watchMu.Lock()
+	s.watchers = append(s.watchers, ch)
+	s.watchMu.Unlock()
+	return ch
+}
+
+// OnAdmit registers a callback for parked events that the grown scope now admits (the store held them aside).
+// It runs outside the store's lock.
+func (s *Store) OnAdmit(fn func(ev *nostr.Event)) {
+	s.watchMu.Lock()
+	s.onAdmit = append(s.onAdmit, fn)
+	s.watchMu.Unlock()
+}
+
 func (s *Store) signal() {
-	select {
-	case s.changed <- struct{}{}:
-	default:
+	s.watchMu.Lock()
+	defer s.watchMu.Unlock()
+	for _, ch := range s.watchers {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// Park keeps a valid event outside the scope aside (bounded by MaxParked; the newest version per address), so that
+// it is admitted if the scope grows to its author. It reports whether it was kept.
+func (s *Store) Park(ev *nostr.Event) bool {
+	if Validate(ev) != nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.scope == nil || s.scope.allows(ev) {
+		return false
+	}
+	return s.parkLocked(ev)
+}
+
+func (s *Store) parkLocked(ev *nostr.Event) bool {
+	k := KeyOf(ev)
+	if old, ok := s.parked[k]; ok {
+		if old.ID == ev.ID || !Newer(ev, old) {
+			return false
+		}
+		s.parked[k] = ev
+		return true
+	}
+	for len(s.parked) >= s.maxPark && len(s.parkedQ) > 0 {
+		oldest := s.parkedQ[0]
+		s.parkedQ = s.parkedQ[1:]
+		delete(s.parked, oldest)
+	}
+	s.parked[k] = ev
+	s.parkedQ = append(s.parkedQ, k)
+	return true
+}
+
+// Parked is the number of events held aside.
+func (s *Store) Parked() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.parked)
+}
+
+// admitParkedLocked moves the parked events the scope now allows into the store (again and again, as an admitted
+// delegation or list widens the scope further) and returns them, and the keys a rescope dropped meanwhile.
+func (s *Store) admitParkedLocked() (admitted []*nostr.Event, dropped []Key) {
+	if s.scope == nil || len(s.parked) == 0 {
+		return nil, nil
+	}
+	for {
+		widened := false
+		for k, ev := range s.parked {
+			if !s.scope.allows(ev) {
+				continue
+			}
+			delete(s.parked, k)
+			if old, ok := s.events[k]; ok && (old.ID == ev.ID || !Newer(ev, old)) {
+				continue
+			}
+			s.events[k] = ev
+			admitted = append(admitted, ev)
+			if IsTrustKind(ev.Kind) {
+				widened = true
+			}
+		}
+		if !widened {
+			break
+		}
+		dropped = append(dropped, s.rescopeLocked()...)
+	}
+	q := s.parkedQ[:0]
+	for _, k := range s.parkedQ {
+		if _, ok := s.parked[k]; ok {
+			q = append(q, k)
+		}
+	}
+	s.parkedQ = q
+	kept := admitted[:0]
+	for _, ev := range admitted { // a later rescope may have dropped (and parked) an admitted one again
+		if s.events[KeyOf(ev)] == ev {
+			kept = append(kept, ev)
+		}
+	}
+	return kept, dropped
+}
+
+func (s *Store) persistAdmitted(evs []*nostr.Event) {
+	if len(evs) == 0 {
+		return
+	}
+	if s.db != nil {
+		for _, ev := range evs {
+			_ = s.db.Put(bucket, KeyOf(ev).String(), ev)
+		}
+	}
+	s.watchMu.Lock()
+	fns := slices.Clone(s.onAdmit)
+	s.watchMu.Unlock()
+	for _, ev := range evs {
+		for _, fn := range fns {
+			fn(ev)
+		}
 	}
 }
 
@@ -106,6 +256,7 @@ func (s *Store) rescopeLocked() []Key {
 		if !sc.allows(ev) {
 			delete(s.events, k)
 			dropped = append(dropped, k)
+			s.parkLocked(ev) // back if the scope grows to it again
 		}
 	}
 	return dropped
@@ -183,6 +334,7 @@ func (s *Store) Put(ev *nostr.Event) (bool, error) {
 	k := KeyOf(ev)
 	s.mu.Lock()
 	if s.scope != nil && !s.scope.allows(ev) {
+		s.parkLocked(ev)
 		s.mu.Unlock()
 		return false, ErrOutOfScope
 	}
@@ -191,11 +343,19 @@ func (s *Store) Put(ev *nostr.Event) (bool, error) {
 		s.mu.Unlock()
 		return false, nil
 	}
+	if !ok && s.capacity > 0 && len(s.events) >= s.capacity {
+		s.mu.Unlock()
+		return false, ErrFull
+	}
 	s.events[k] = ev
 	var dropped []Key
+	var admitted []*nostr.Event
 	rescoped := s.scope != nil && IsTrustKind(ev.Kind)
 	if rescoped {
 		dropped = s.rescopeLocked()
+		var more []Key
+		admitted, more = s.admitParkedLocked()
+		dropped = append(dropped, more...)
 	}
 	s.mu.Unlock()
 	s.persistDrops(dropped)
@@ -207,6 +367,7 @@ func (s *Store) Put(ev *nostr.Event) (bool, error) {
 			return true, fmt.Errorf("persist %s: %w", k, err)
 		}
 	}
+	s.persistAdmitted(admitted)
 	return true, nil
 }
 

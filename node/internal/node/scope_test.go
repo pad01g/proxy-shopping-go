@@ -18,6 +18,9 @@ import (
 
 func newTestNode(t *testing.T, ctx context.Context, relay, coordinators, extra string) *Node {
 	t.Helper()
+	if coordinators == "" {
+		coordinators = fmt.Sprintf("%q", newActor().pk)
+	}
 	yaml := fmt.Sprintf("role: operator\nmnemonic_file: %s\ndata_dir: %s\nnostr: {relays: [%q], allow_private_relays: true}\np2p: {listen: [\"/ip4/127.0.0.1/tcp/0\"]}\ntrust: {coordinators: [%s]}\n%s",
 		filepath.Join("..", "..", "..", "lab", "keys", "operator-2.mnemonic"), t.TempDir(), relay, coordinators, extra)
 	cfg, err := config.Parse([]byte(yaml))
@@ -113,7 +116,7 @@ func TestInboxCacheBounded(t *testing.T) {
 }
 
 func TestAdminTokenRequiredOffLoopback(t *testing.T) {
-	base := "role: operator\nmnemonic_file: /k\n"
+	base := "role: operator\nmnemonic_file: /k\n" + someCoordinator()
 	for listen, ok := range map[string]bool{
 		`{listen: "0.0.0.0:8080"}`: false, `{listen: ":8080"}`: false, `{listen: "172.40.0.30:8080"}`: false,
 		`{listen: "127.0.0.1:8080"}`: true, `{listen: "[::1]:8080"}`: true, `{listen: "localhost:8080"}`: true,
@@ -134,8 +137,8 @@ func TestNodeRefusesPrivateRelays(t *testing.T) {
 	relay := testutil.StartRelay(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	yaml := fmt.Sprintf("role: operator\nmnemonic_file: %s\ndata_dir: %s\nnostr: {relays: [%q]}\np2p: {listen: [\"/ip4/127.0.0.1/tcp/0\"]}\n",
-		filepath.Join("..", "..", "..", "lab", "keys", "operator-2.mnemonic"), t.TempDir(), relay)
+	yaml := fmt.Sprintf("role: operator\nmnemonic_file: %s\ndata_dir: %s\nnostr: {relays: [%q]}\np2p: {listen: [\"/ip4/127.0.0.1/tcp/0\"]}\n%s",
+		filepath.Join("..", "..", "..", "lab", "keys", "operator-2.mnemonic"), t.TempDir(), relay, someCoordinator())
 	cfg, err := config.Parse([]byte(yaml))
 	if err != nil {
 		t.Fatal(err)

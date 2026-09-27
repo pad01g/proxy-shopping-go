@@ -48,6 +48,9 @@ trust: {coordinators: [%q]}
 
 	do := func(method, path, token, body string) (int, string) {
 		req, _ := http.NewRequest(method, srv.URL+path, strings.NewReader(body))
+		if method == "POST" {
+			req.Header.Set("Content-Type", "application/json")
+		}
 		if token != "" {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
@@ -106,8 +109,8 @@ trust: {coordinators: [%q]}
 
 func TestPublishVersioned(t *testing.T) {
 	relay := testutil.StartRelay(t)
-	cfg, err := config.Parse([]byte(fmt.Sprintf("role: operator\nmnemonic_file: %s\ndata_dir: %s\nnostr: {relays: [%q], allow_private_relays: true}\np2p: {listen: [\"/ip4/127.0.0.1/tcp/0\"]}\n",
-		filepath.Join("..", "..", "..", "lab", "keys", "operator-2.mnemonic"), t.TempDir(), relay)))
+	cfg, err := config.Parse([]byte(fmt.Sprintf("role: operator\nmnemonic_file: %s\ndata_dir: %s\nnostr: {relays: [%q], allow_private_relays: true}\np2p: {listen: [\"/ip4/127.0.0.1/tcp/0\"]}\n%s",
+		filepath.Join("..", "..", "..", "lab", "keys", "operator-2.mnemonic"), t.TempDir(), relay, someCoordinator())))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,4 +140,10 @@ func TestPublishVersioned(t *testing.T) {
 	if changed.ID == first.ID || trust.Version(changed) <= trust.Version(first) || len(trust.InboxRelays(changed)) != 2 {
 		t.Fatal("changed relays not published as a newer version")
 	}
+}
+
+// someCoordinator is a trust section with a random coordinator (every role but relay needs one).
+func someCoordinator() string {
+	pk, _ := nostr.GetPublicKey(nostr.GeneratePrivateKey())
+	return fmt.Sprintf("trust: {coordinators: [%q]}\n", pk)
 }

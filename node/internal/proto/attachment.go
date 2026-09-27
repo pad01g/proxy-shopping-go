@@ -10,7 +10,7 @@ import (
 // NIP-44 encrypts at most 64 KiB, and the wrap carries the seal which carries the inner as base64,
 // so an inner event must stay well below that (spec §4.9).
 const (
-	MaxInnerBytes     = 30_000
+	MaxInnerBytes     = 28_000
 	InlineEvidenceMax = 8 << 10  // evidence data up to this size travels inside messages
 	AttachmentChunk   = 12 << 10 // raw bytes per attachment message (the wrap grows to about 2.3x)
 )

@@ -85,7 +85,7 @@ func (e *Engine) onRequest(ctx context.Context, msg *messenger.Message) {
 // arrived before the one it builds on (relays do not keep order), and was therefore skipped.
 func (e *Engine) replay(ctx context.Context, id, from, typ string, h messenger.Handler) {
 	var last *nostr.Event
-	for _, ev := range e.Messenger.Inbox(id) {
+	for _, ev := range e.inbox(id) {
 		if ev.PubKey == from && giftwrap.Type(ev) == typ && (last == nil || ev.CreatedAt >= last.CreatedAt) {
 			last = ev
 		}
@@ -116,36 +116,116 @@ func (e *Engine) onEscrowKey(ctx context.Context, msg *messenger.Message) {
 	})
 }
 
-// doQuote answers a request (the pending quote action). A quote that could not be sent stays pending.
+// doQuote answers a request (the pending quote action). The quote is stored with its state before it is sent,
+// so that an order.accept arriving right after it finds the order quoted, and a quote that could not be sent is
+// sent again as it was. The messenger keeps a sent message in its outbox before it leaves: a quote an earlier
+// attempt sent (and then crashed) is found there, and no second quote is made.
 func (e *Engine) doQuote(ctx context.Context, o *Order) error {
-	if o.State != StateRequested {
+	if o.Events["quote"] != nil {
 		return nil
 	}
-	q, info, score, err := e.buildQuote(ctx, o)
-	if err != nil {
-		var rj *rejection
-		if !errors.As(err, &rj) {
-			e.log.Warn("quote failed", "order", o.ID, "err", err)
-			rj = &rejection{reason: proto.RejectUnavailable, detail: "the quote could not be made"}
+	if ev := e.sentQuote(o); ev != nil {
+		return e.recordQuote(ctx, o.ID, ev)
+	}
+	q := o.Quote
+	if o.State == StateRequested {
+		var info *shop.Info
+		var score int
+		var err error
+		q, info, score, err = e.buildQuote(ctx, o)
+		if err != nil {
+			var rj *rejection
+			if !errors.As(err, &rj) {
+				e.log.Warn("quote failed", "order", o.ID, "err", err)
+				rj = &rejection{reason: proto.RejectUnavailable, detail: "the quote could not be made"}
+			}
+			q = &proto.OrderQuote{Accept: false, RejectReason: rj.reason, Detail: rj.detail}
 		}
-		q = &proto.OrderQuote{Accept: false, RejectReason: rj.reason, Detail: rj.detail}
+		var don *Donation
+		if q.Accept {
+			o.Shop = info
+			if btcAddr, evmAddr, bps := e.donation(o); bps > 0 {
+				don = &Donation{BTCAddress: btcAddr, EVMAddress: evmAddr, BPS: bps}
+			}
+		}
+		if _, err := e.update(o.ID, func(cur *Order) error {
+			if cur.State != StateRequested {
+				return errSkip
+			}
+			cur.Quote, cur.Shop, cur.Score, cur.ChainExpiresAt, cur.Donation = q, info, score, o.ChainExpiresAt, don
+			if q.Accept {
+				cur.set(StateQuoted, fmt.Sprintf("lock %s %s", q.LockAmount, q.Asset))
+			} else {
+				cur.set(StateRejected, q.RejectReason+": "+q.Detail)
+			}
+			return nil
+		}); err != nil {
+			if errors.Is(err, errSkip) {
+				return nil
+			}
+			return err
+		}
+	}
+	if q == nil {
+		return contract.Mismatchf("no quote to send in state %s", o.State)
 	}
 	ev, err := e.send(ctx, o, o.User, proto.TypeOrderQuote, q)
 	if err != nil {
 		return err
 	}
-	_, err = e.update(o.ID, func(cur *Order) error {
-		cur.Quote, cur.Shop, cur.Score, cur.ChainExpiresAt = q, info, score, o.ChainExpiresAt
-		cur.Events["quote"] = ev
-		if q.Accept {
-			cur.set(StateQuoted, fmt.Sprintf("lock %s %s", q.LockAmount, q.Asset))
-		} else {
-			cur.set(StateRejected, q.RejectReason+": "+q.Detail)
+	e.log.Info("quoted", "order", o.ID, "accept", q.Accept, "reason", q.RejectReason, "detail", q.Detail)
+	return e.recordQuote(ctx, o.ID, ev)
+}
+
+// sentQuote finds an order.quote of ours for the order in the messenger's outbox (the latest).
+func (e *Engine) sentQuote(o *Order) *nostr.Event {
+	var last *nostr.Event
+	for _, ev := range e.Messenger.Outbox(o.ID) {
+		if giftwrap.Type(ev) == proto.TypeOrderQuote && giftwrap.Recipient(ev) == o.User && (last == nil || ev.CreatedAt >= last.CreatedAt) {
+			last = ev
+		}
+	}
+	return last
+}
+
+// recordQuote stores the quote message that was sent, and looks again at an order.accept that came before.
+func (e *Engine) recordQuote(ctx context.Context, id string, ev *nostr.Event) error {
+	o, err := e.update(id, func(o *Order) error {
+		if o.Events["quote"] != nil {
+			return errSkip
+		}
+		o.Events["quote"] = ev
+		if o.Quote == nil || o.State == StateRequested {
+			// sent by an attempt that crashed before the state was stored
+			var q proto.OrderQuote
+			if json.Unmarshal([]byte(ev.Content), &q) == nil {
+				o.Quote = &q
+				if q.Accept {
+					o.set(StateQuoted, fmt.Sprintf("lock %s %s", q.LockAmount, q.Asset))
+				} else {
+					o.set(StateRejected, q.RejectReason+": "+q.Detail)
+				}
+			}
 		}
 		return nil
 	})
-	e.log.Info("quoted", "order", o.ID, "accept", q.Accept, "reason", q.RejectReason, "detail", q.Detail)
-	return err
+	if errors.Is(err, errSkip) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if o.State == StateQuoted {
+		e.replay(ctx, id, o.User, proto.TypeOrderAccept, e.onAccept)
+	}
+	return nil
+}
+
+// WantsRetry tells the messenger whether unacknowledged messages about an order are resent: to the user of an
+// order we keep, but not for a rejected request, which is answered once (§4.10).
+func (e *Engine) WantsRetry(orderID string) bool {
+	o, ok, err := e.Order(orderID)
+	return err == nil && ok && o.State != StateRejected
 }
 
 // Limits of the bot schema (shopper-bot/schema) checked before quoting.

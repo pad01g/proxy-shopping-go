@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"reflect"
 	"sync"
 	"time"
 
@@ -32,6 +33,14 @@ const (
 	maxSyncEvents  = 20000
 	resyncInterval = 5 * time.Minute
 	maxSynced      = 1024 // peers remembered for resyncInterval before the map is swept
+)
+
+// PeerEventsPerMinute is the quota of gossiped events taken from one peer (the rest is ignored, not passed on).
+// ScopeResyncDelay is how long after a change of the trust scope the node syncs again with its peers (the events
+// of the authors that just came into the scope were refused before), and at most how often.
+var (
+	PeerEventsPerMinute = 600
+	ScopeResyncDelay    = 2 * time.Second
 )
 
 // TopicTrust and TopicProfiles name the gossipsub topics of a network.
@@ -66,6 +75,15 @@ type Service struct {
 	mu     sync.Mutex
 	onNew  []NewEventFunc
 	synced map[peer.ID]time.Time
+	quota  map[peer.ID]*peerBucket
+
+	peerRate    int           // PeerEventsPerMinute at NewService
+	resyncDelay time.Duration // ScopeResyncDelay at NewService
+}
+
+type peerBucket struct {
+	tokens float64
+	at     time.Time
 }
 
 // ServiceOptions configure the service.
@@ -92,6 +110,7 @@ func NewService(ctx context.Context, o ServiceOptions) (*Service, error) {
 	s := &Service{
 		h: o.Host, ps: ps, store: o.Store, network: o.Network, secret: o.Secret, role: o.Role,
 		log: o.Log.With("component", "gossip"), topics: map[string]*pubsub.Topic{}, synced: map[peer.ID]time.Time{},
+		quota: map[peer.ID]*peerBucket{}, peerRate: PeerEventsPerMinute, resyncDelay: ScopeResyncDelay,
 	}
 	for _, name := range []string{TopicTrust(o.Network), TopicProfiles(o.Network)} {
 		if err := ps.RegisterTopicValidator(name, s.validator(name)); err != nil {
@@ -113,7 +132,74 @@ func NewService(ctx context.Context, o ServiceOptions) (*Service, error) {
 	o.Host.Network().Notify(&network.NotifyBundle{ConnectedF: func(_ network.Network, c network.Conn) {
 		go s.maybeSync(ctx, c.RemotePeer())
 	}})
+	// events held aside until the scope grew to them are passed on like new ones
+	o.Store.OnAdmit(func(ev *nostr.Event) {
+		s.log.Info("stored parked event", "kind", ev.Kind, "pubkey", ev.PubKey[:12], "v", trust.Version(ev))
+		s.notify(ev, "parked")
+		go func() {
+			if err := s.Publish(ctx, ev); err != nil {
+				s.log.Debug("gossip of a parked event failed", "err", err)
+			}
+		}()
+	})
+	go s.resyncOnScopeChange(ctx, o.Store.Watch())
 	return s, nil
+}
+
+// resyncOnScopeChange syncs again with every connected peer when the authors of the scope changed: the events of
+// the authors that just came in were refused (or parked, bounded) before.
+func (s *Service) resyncOnScopeChange(ctx context.Context, changes <-chan struct{}) {
+	last, _ := s.store.Authors()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-changes:
+		}
+		select { // a delegation, a list and profiles tend to arrive together
+		case <-ctx.Done():
+			return
+		case <-time.After(s.resyncDelay):
+		}
+		now, ok := s.store.Authors()
+		if !ok || reflect.DeepEqual(now, last) {
+			continue
+		}
+		last = now
+		for _, id := range s.h.Network().Peers() {
+			go s.syncNow(ctx, id)
+		}
+	}
+}
+
+// allowFrom takes one event of a peer's quota.
+func (s *Service) allowFrom(id peer.ID) bool {
+	if s.peerRate <= 0 {
+		return true
+	}
+	rate := float64(s.peerRate)
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b := s.quota[id]
+	if b == nil {
+		if len(s.quota) >= maxSynced {
+			for p, q := range s.quota {
+				if q.tokens+now.Sub(q.at).Minutes()*rate >= rate {
+					delete(s.quota, p)
+				}
+			}
+		}
+		b = &peerBucket{tokens: rate, at: now}
+		s.quota[id] = b
+	}
+	b.tokens = min(rate, b.tokens+now.Sub(b.at).Minutes()*rate)
+	b.at = now
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
 }
 
 // OnNewEvent registers a callback for newly stored events (the Nostr bridge).
@@ -142,17 +228,30 @@ func topicFor(network string, kind int) (string, bool) {
 	return "", false
 }
 
-func (s *Service) validator(topic string) pubsub.Validator {
-	return func(_ context.Context, _ peer.ID, msg *pubsub.Message) bool {
+// validator rejects invalid events and ignores (does not pass on) valid ones over the sending peer's quota or
+// outside our scope; those are parked in case the scope grows to them (§10). A node without a scope (the p2p
+// relay) passes on every valid event within the quotas.
+func (s *Service) validator(topic string) pubsub.ValidatorEx {
+	return func(_ context.Context, from peer.ID, msg *pubsub.Message) pubsub.ValidationResult {
 		var ev nostr.Event
 		if err := json.Unmarshal(msg.Data, &ev); err != nil {
-			return false
+			return pubsub.ValidationReject
 		}
 		if t, ok := topicFor(s.network, ev.Kind); !ok || t != topic {
-			return false
+			return pubsub.ValidationReject
+		}
+		if trust.Validate(&ev) != nil {
+			return pubsub.ValidationReject
+		}
+		if !s.allowFrom(from) {
+			return pubsub.ValidationIgnore
 		}
 		// only what our coordinators reach is stored and passed on (§10)
-		return trust.Validate(&ev) == nil && s.store.InScope(&ev)
+		if !s.store.InScope(&ev) {
+			s.store.Park(&ev)
+			return pubsub.ValidationIgnore
+		}
+		return pubsub.ValidationAccept
 	}
 }
 
@@ -316,6 +415,14 @@ func (s *Service) maybeSync(ctx context.Context, id peer.ID) {
 		s.mu.Unlock()
 		return
 	}
+	s.mu.Unlock()
+	s.syncNow(ctx, id)
+}
+
+// syncNow syncs from a peer (after identify) and remembers when.
+func (s *Service) syncNow(ctx context.Context, id peer.ID) {
+	s.mu.Lock()
+	now := time.Now()
 	if len(s.synced) >= maxSynced {
 		// entries older than the interval no longer suppress anything
 		for p, at := range s.synced {

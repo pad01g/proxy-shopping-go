@@ -121,6 +121,10 @@ func PriceLines(shop *catalog.Shop, lines []Line) ([]Item, money.Money, error) {
 
 // Create records a new order. Card orders start unpaid; cash orders are
 // paid on the spot.
+// ErrSoldOut is returned for SOLDOUT- SKUs: the order fails before any payment, which is how the lab
+// exercises a purchase that the shopper cannot complete (and must refund).
+var ErrSoldOut = errors.New("sold out")
+
 func (s *Store) Create(shop *catalog.Shop, lines []Line, addr Address, payment string) (Order, error) {
 	items, subtotal, err := PriceLines(shop, lines)
 	if err != nil {
@@ -128,6 +132,11 @@ func (s *Store) Create(shop *catalog.Shop, lines []Line, addr Address, payment s
 	}
 	if err := addr.Validate(); err != nil {
 		return Order{}, err
+	}
+	for _, l := range lines {
+		if strings.HasPrefix(l.SKU, "SOLDOUT-") {
+			return Order{}, fmt.Errorf("%w: %s", ErrSoldOut, l.SKU)
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

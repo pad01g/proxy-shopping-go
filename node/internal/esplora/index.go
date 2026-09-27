@@ -191,6 +191,18 @@ func (ix *Index) Tip() (int64, string) {
 	return b.Height, b.Hash
 }
 
+// Block returns the indexed block with a hash (newest blocks are looked up first).
+func (ix *Index) Block(hash string) (blockRef, bool) {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	for i := len(ix.blocks) - 1; i >= 0; i-- {
+		if b := ix.blocks[i]; b.Hash == hash {
+			return blockRef{Hash: b.Hash, Height: b.Height, Time: b.Time}, true
+		}
+	}
+	return blockRef{}, false
+}
+
 // BlockHash returns the hash of the indexed block at a height.
 func (ix *Index) BlockHash(height int64) (string, bool) {
 	ix.mu.RLock()

@@ -45,6 +45,9 @@ func CheckBTCPayout(p *psbt.Packet, esc btc.Escrow, prev btc.Outpoint, want map[
 	got := map[string]int64{}
 	var total int64
 	for _, o := range outs {
+		if o.Amount < btc.DustLimit {
+			return fmt.Errorf("payout has a dust output of %d sats to %s: it would not relay", o.Amount, o.Address)
+		}
 		got[o.Address] += o.Amount
 		total += o.Amount
 	}

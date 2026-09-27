@@ -5,13 +5,18 @@ package relay
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"slices"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
+	"github.com/fiatjaf/eventstore"
 	eventbadger "github.com/fiatjaf/eventstore/badger"
 	"github.com/fiatjaf/khatru"
 	"github.com/fiatjaf/khatru/policies"
@@ -23,14 +28,17 @@ import (
 // protocol has no use for metadata (kind 0).
 var DefaultKinds = []int{5, 10050, 1059, 30500, 30501, 30502, 30503}
 
-// Default limits. Every limit is per minute; a negative value in Options switches it off.
+// Default limits. Every limit is per minute; a negative value in Options switches it off. Client addresses are
+// IPv4 addresses and IPv6 /64 prefixes. The per-address limits are generous (many users can share one address
+// behind a NAT); the per-connection limits do most of the work.
 const (
-	DefaultEventsPerMinute     = 600 // per client address
-	DefaultConnEventsPerMinute = 300 // per connection
-	DefaultReqsPerMinute       = 600 // filters of REQs per client address
-	DefaultConnsPerMinute      = 120 // new connections per client address
-	DefaultMaxSubscriptions    = 32  // open REQs per connection
-	DefaultMaxLimit            = 1000
+	DefaultEventsPerMinute       = 3000 // per client address
+	DefaultConnEventsPerMinute   = 300  // per connection
+	DefaultConnMessagesPerMinute = 1200 // frames of any kind per connection, counted before parsing or verifying
+	DefaultReqsPerMinute         = 3000 // filters of REQs per client address
+	DefaultConnsPerMinute        = 600  // new connections per client address
+	DefaultMaxSubscriptions      = 32   // open REQs per connection
+	DefaultMaxLimit              = 1000
 )
 
 // Options configure a relay. Zero values take the defaults.
@@ -42,13 +50,14 @@ type Options struct {
 	Name          string
 	Log           *slog.Logger
 
-	EventsPerMinute     int      // events per client address
-	ConnEventsPerMinute int      // events per connection
-	ReqsPerMinute       int      // REQ filters per client address
-	ConnsPerMinute      int      // new connections per client address
-	MaxSubscriptions    int      // open REQs per connection
-	MaxLimit            int      // cap of a filter's limit
-	TrustedProxies      []string // IPs / CIDRs of reverse proxies whose X-Forwarded-For names the client
+	EventsPerMinute       int      // events per client address
+	ConnEventsPerMinute   int      // events per connection
+	ConnMessagesPerMinute int      // frames per connection (before parsing and signature checks)
+	ReqsPerMinute         int      // REQ filters per client address
+	ConnsPerMinute        int      // new connections per client address
+	MaxSubscriptions      int      // open REQs per connection
+	MaxLimit              int      // cap of a filter's limit
+	TrustedProxies        []string // IPs / CIDRs of reverse proxies whose X-Forwarded-For names the client
 }
 
 // Server is a running relay.
@@ -61,9 +70,18 @@ type Server struct {
 	proxies    proxies
 	ipEvents   *limiter[string]
 	connEvents *limiter[*khatru.WebSocket]
+	connFrames *limiter[*khatru.WebSocket]
 	ipFilters  *limiter[string]
 	connLimit  *limiter[string]
 	subs       subscriptions
+
+	replaceMu sync.Mutex // replacements are read-compare-write
+
+	// khatru runs every client frame in a goroutine it does not track, so a store call may come after Close; the
+	// store (badger) panics then. closeMu makes Close wait for running calls and refuse later ones.
+	closeMu   sync.RWMutex
+	closed    bool
+	xffWarned atomic.Bool
 }
 
 func orDefault(v, def int) int {
@@ -89,6 +107,7 @@ func New(opts Options) (*Server, error) {
 	}
 	opts.EventsPerMinute = orDefault(opts.EventsPerMinute, DefaultEventsPerMinute)
 	opts.ConnEventsPerMinute = orDefault(opts.ConnEventsPerMinute, DefaultConnEventsPerMinute)
+	opts.ConnMessagesPerMinute = orDefault(opts.ConnMessagesPerMinute, DefaultConnMessagesPerMinute)
 	opts.ReqsPerMinute = orDefault(opts.ReqsPerMinute, DefaultReqsPerMinute)
 	opts.ConnsPerMinute = orDefault(opts.ConnsPerMinute, DefaultConnsPerMinute)
 	opts.MaxSubscriptions = orDefault(opts.MaxSubscriptions, DefaultMaxSubscriptions)
@@ -109,7 +128,8 @@ func New(opts Options) (*Server, error) {
 	s := &Server{
 		opts: opts, db: db, Relay: khatru.NewRelay(), log: opts.Log.With("component", "psrelay"), proxies: px,
 		ipEvents: newLimiter[string](opts.EventsPerMinute), connEvents: newLimiter[*khatru.WebSocket](opts.ConnEventsPerMinute),
-		ipFilters: newLimiter[string](opts.ReqsPerMinute), connLimit: newLimiter[string](opts.ConnsPerMinute),
+		connFrames: newLimiter[*khatru.WebSocket](opts.ConnMessagesPerMinute),
+		ipFilters:  newLimiter[string](opts.ReqsPerMinute), connLimit: newLimiter[string](opts.ConnsPerMinute),
 		subs: subscriptions{open: map[*khatru.WebSocket]map[context.Context]struct{}{}},
 	}
 	r := s.Relay
@@ -118,19 +138,92 @@ func New(opts Options) (*Server, error) {
 	r.Info.SupportedNIPs = []any{1, 9, 11, 17, 40, 44, 59}
 	r.MaxMessageSize = int64(opts.MaxEventSize) + 4096
 
-	r.StoreEvent = append(r.StoreEvent, db.SaveEvent)
-	r.QueryEvents = append(r.QueryEvents, db.QueryEvents)
-	r.DeleteEvent = append(r.DeleteEvent, db.DeleteEvent)
-	// replaceable and addressable kinds (10050, 30500–30503) keep only their latest event
-	r.ReplaceEvent = append(r.ReplaceEvent, db.ReplaceEvent)
+	r.StoreEvent = append(r.StoreEvent, s.guarded(db.SaveEvent))
+	r.QueryEvents = append(r.QueryEvents, s.query)
+	r.DeleteEvent = append(r.DeleteEvent, s.guarded(db.DeleteEvent))
+	// replaceable and addressable kinds (10050, 30500–30503) keep only their latest event, by v (§2.1)
+	r.ReplaceEvent = append(r.ReplaceEvent, s.guarded(s.replaceEvent))
 	r.RejectConnection = append(r.RejectConnection, s.rejectConnection)
+	// a frame limit before khatru parses and verifies anything (it verifies signatures before RejectEvent)
+	r.RejectMessage = append(r.RejectMessage, s.limitFrame)
+	r.OnDisconnect = append(r.OnDisconnect, s.forgetConnection)
 	// rate limits first, so that refused events cost no verification against the store
 	r.RejectEvent = append(r.RejectEvent, s.limitEvent, s.rejectEvent, policies.PreventTimestampsInTheFuture(10*time.Minute))
 	r.OverwriteFilter = append(r.OverwriteFilter, s.overwriteFilter)
 	r.RejectFilter = append(r.RejectFilter, s.rejectFilter)
 	r.OverwriteDeletionOutcome = append(r.OverwriteDeletionOutcome, s.deletionOutcome)
 	// no COUNT (NIP-45): nothing in the protocol needs it, and it would bypass the REQ limits
+	if len(px) == 0 {
+		s.log.Info("no -trusted-proxies: X-Forwarded-For is ignored and limits apply to the peer address")
+	}
 	return s, nil
+}
+
+// versioned tells whether replacements of a kind are decided by the v tag (§2.1): the trust and profile kinds,
+// and 10050 when both events carry a v (else created_at, as other clients expect).
+func versioned(kind int) bool { return kind >= 30500 && kind <= 30503 }
+
+// newer tells whether a replaces b (§2.1): the higher v, the same v and the smaller id. Kinds without versions (and
+// 10050 unless both carry a v) compare created_at the same way.
+func newer(a, b *nostr.Event) bool {
+	va, vb := int64(a.CreatedAt), int64(b.CreatedAt)
+	if versioned(a.Kind) || (a.Kind == 10050 && hasV(a) && hasV(b)) {
+		va, vb = version(a), version(b)
+	}
+	if va != vb {
+		return va > vb
+	}
+	return a.ID < b.ID
+}
+
+func hasV(ev *nostr.Event) bool { return ev.Tags.Find("v") != nil }
+
+// version is the v tag, -1 when it is missing or malformed.
+func version(ev *nostr.Event) int64 {
+	if t := ev.Tags.Find("v"); len(t) >= 2 {
+		if n, err := strconv.ParseInt(t[1], 10, 64); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return -1
+}
+
+// replaceEvent stores a replaceable or addressable event unless a newer one of its address is stored, and deletes
+// the older ones. Unlike the event store's own ReplaceEvent it decides by v, not created_at (§2.1): an old version
+// signed again later (a newer created_at) must not evict a newer version.
+func (s *Server) replaceEvent(ctx context.Context, ev *nostr.Event) error {
+	s.replaceMu.Lock()
+	defer s.replaceMu.Unlock()
+	f := nostr.Filter{Kinds: []int{ev.Kind}, Authors: []string{ev.PubKey}, Limit: 100}
+	if nostr.IsAddressableKind(ev.Kind) {
+		f.Tags = nostr.TagMap{"d": []string{ev.Tags.GetD()}}
+	}
+	ch, err := s.db.QueryEvents(ctx, f)
+	if err != nil {
+		return fmt.Errorf("query the stored versions: %w", err)
+	}
+	var older []*nostr.Event
+	for prev := range ch {
+		if nostr.IsAddressableKind(ev.Kind) && prev.Tags.GetD() != ev.Tags.GetD() {
+			continue
+		}
+		if prev.ID == ev.ID {
+			return eventstore.ErrDupEvent
+		}
+		if newer(prev, ev) {
+			return eventstore.ErrDupEvent // accepted as a duplicate: not stored and not passed to subscribers
+		}
+		older = append(older, prev)
+	}
+	if err := s.db.SaveEvent(ctx, ev); err != nil {
+		return err
+	}
+	for _, prev := range older {
+		if err := s.db.DeleteEvent(ctx, prev); err != nil {
+			return fmt.Errorf("delete the older version %s: %w", prev.ID, err)
+		}
+	}
+	return nil
 }
 
 func (s *Server) accepts(kind int) bool { return slices.Contains(s.opts.Kinds, kind) }
@@ -149,10 +242,23 @@ func (s *Server) rejectEvent(_ context.Context, ev *nostr.Event) (bool, string) 
 }
 
 // ServeHTTP serves WebSocket and NIP-11 requests.
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.Relay.ServeHTTP(w, r) }
+// GET /healthz answers 200 once the relay serves (for container health checks).
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/healthz" && r.Header.Get("Upgrade") == "" {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("ok\n"))
+		return
+	}
+	s.Relay.ServeHTTP(w, r)
+}
 
 // Prune deletes gift wraps older than the retention period and returns how many.
 func (s *Server) Prune(ctx context.Context) (int, error) {
+	s.closeMu.RLock()
+	defer s.closeMu.RUnlock()
+	if s.closed {
+		return 0, errClosed
+	}
 	until := nostr.Timestamp(time.Now().Add(-time.Duration(s.opts.RetentionDays) * 24 * time.Hour).Unix())
 	n := 0
 	for {
@@ -194,5 +300,49 @@ func (s *Server) RunPruner(ctx context.Context, every time.Duration) {
 	}
 }
 
-// Close closes the event store.
-func (s *Server) Close() { s.db.Close() }
+var errClosed = errors.New("error: relay is shutting down")
+
+// guarded runs a store call unless the relay is closed.
+func (s *Server) guarded(fn func(context.Context, *nostr.Event) error) func(context.Context, *nostr.Event) error {
+	return func(ctx context.Context, ev *nostr.Event) error {
+		s.closeMu.RLock()
+		defer s.closeMu.RUnlock()
+		if s.closed {
+			return errClosed
+		}
+		return fn(ctx, ev)
+	}
+}
+
+// query runs a store query unless the relay is closed; the results are collected before the lock is released.
+func (s *Server) query(ctx context.Context, f nostr.Filter) (chan *nostr.Event, error) {
+	s.closeMu.RLock()
+	defer s.closeMu.RUnlock()
+	if s.closed {
+		return nil, errClosed
+	}
+	ch, err := s.db.QueryEvents(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	var evs []*nostr.Event
+	for ev := range ch {
+		evs = append(evs, ev)
+	}
+	out := make(chan *nostr.Event, len(evs))
+	for _, ev := range evs {
+		out <- ev
+	}
+	close(out)
+	return out, nil
+}
+
+// Close closes the event store once running store calls returned.
+func (s *Server) Close() {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	if !s.closed {
+		s.closed = true
+		s.db.Close()
+	}
+}

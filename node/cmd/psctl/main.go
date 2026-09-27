@@ -61,7 +61,7 @@ type common struct {
 func (c *common) register(fs *flag.FlagSet) {
 	fs.StringVar(&c.mnemonic, "mnemonic-file", "", "BIP39 mnemonic of the signer")
 	fs.StringVar(&c.network, "network", "ps-lab", "network name")
-	fs.Int64Var(&c.version, "version", 0, "version (v tag); 0 means the current UNIX time")
+	fs.Int64Var(&c.version, "version", 0, "version (v tag); 0 means max(the published version + 1, the current UNIX time)")
 	fs.Var(&c.publish, "publish", "relay URLs to publish to (comma separated or repeated)")
 	fs.StringVar(&c.node, "node", "", "psnode admin URL to POST the event to")
 	fs.StringVar(&c.token, "token", os.Getenv("PS_ADMIN_TOKEN"), "psnode admin token")
@@ -75,11 +75,79 @@ func (c *common) keys() (*keys.Set, error) {
 	return keys.LoadMnemonicFile(c.mnemonic)
 }
 
-func (c *common) v() int64 {
-	if c.version > 0 {
-		return c.version
+// v picks the version of a new event of (kind, pubkey, d) (§2.1): --version when given (with a warning when it
+// is not above what the relays of --publish or the node of --node already hold: they keep the old one), else
+// max(the known version + 1, now).
+func (c *common) v(kind int, pubkey, d string) int64 {
+	known := c.known(kind, pubkey, d)
+	return pickVersion(c.version, known, time.Now().Unix(), os.Stderr)
+}
+
+func pickVersion(explicit, known, now int64, warn io.Writer) int64 {
+	if explicit > 0 {
+		if explicit <= known {
+			fmt.Fprintf(warn, "psctl: warning: --version %d is not above the published version %d; relays and nodes keep the published one\n", explicit, known)
+		}
+		return explicit
 	}
-	return time.Now().Unix()
+	return max(known+1, now)
+}
+
+// known is the highest version of (kind, pubkey, d) on the relays of --publish and the node of --node (0 when
+// none is found or they cannot be asked).
+func (c *common) known(kind int, pubkey, d string) int64 {
+	if len(c.publish) == 0 && c.node == "" {
+		return 0
+	}
+	tc, err := httpx.TLSConfig(c.extraCA)
+	if err != nil {
+		return 0
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	var evs []*nostr.Event
+	if len(c.publish) > 0 {
+		f := nostr.Filter{Kinds: []int{kind}, Authors: []string{pubkey}, Limit: 20}
+		if d != "" {
+			f.Tags = nostr.TagMap{"d": {d}}
+		}
+		pool := nostrnet.NewPool(tc, nil)
+		evs = append(evs, pool.Query(ctx, c.publish, f)...)
+		pool.Close()
+	}
+	if c.node != "" {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(c.node, "/")+"/trust", nil)
+		if err == nil {
+			if c.token != "" {
+				req.Header.Set("Authorization", "Bearer "+c.token)
+			}
+			if res, err := httpx.Client(tc, 15*time.Second).Do(req); err == nil {
+				var body struct {
+					Events []*nostr.Event `json:"events"`
+				}
+				if res.StatusCode/100 == 2 {
+					_ = json.NewDecoder(io.LimitReader(res.Body, 8<<20)).Decode(&body)
+				}
+				res.Body.Close()
+				evs = append(evs, body.Events...)
+			}
+		}
+	}
+	return maxVersion(evs, kind, pubkey, d)
+}
+
+func maxVersion(evs []*nostr.Event, kind int, pubkey, d string) int64 {
+	var out int64
+	for _, ev := range evs {
+		if ev == nil || ev.Kind != kind || ev.PubKey != pubkey || (d != "" && trust.Tag(ev, "d") != d) {
+			continue
+		}
+		if ok, _ := ev.CheckSignature(); !ok {
+			continue
+		}
+		out = max(out, trust.Version(ev))
+	}
+	return out
 }
 
 func main() {
@@ -173,7 +241,7 @@ func cmdDelegate(args []string) error {
 	if err != nil {
 		return err
 	}
-	ev, err := trust.NewDelegation(s.NostrSecretHex(), pk, c.network, c.v(), *revoke, *note)
+	ev, err := trust.NewDelegation(s.NostrSecretHex(), pk, c.network, c.v(trust.KindDelegation, s.NostrPubHex(), pk), *revoke, *note)
 	if err != nil {
 		return err
 	}
@@ -204,7 +272,7 @@ func cmdList(args []string) error {
 	if l.ReportTo == "" {
 		l.ReportTo = s.NostrPubHex()
 	}
-	ev, err := trust.NewList(s.NostrSecretHex(), c.v(), &l)
+	ev, err := trust.NewList(s.NostrSecretHex(), c.v(trust.KindList, s.NostrPubHex(), l.Network), &l)
 	if err != nil {
 		return err
 	}
@@ -235,7 +303,7 @@ func cmdProfile(args []string) error {
 	}
 	var compact bytes.Buffer
 	_ = json.Compact(&compact, data)
-	ev, err := trust.NewProfile(s.NostrSecretHex(), k, c.network, c.v(), compact.String())
+	ev, err := trust.NewProfile(s.NostrSecretHex(), k, c.network, c.v(k, s.NostrPubHex(), c.network), compact.String())
 	if err != nil {
 		return err
 	}
@@ -256,7 +324,7 @@ func cmdInbox(args []string) error {
 	if len(relays) == 0 {
 		return errors.New("at least one --relay is required")
 	}
-	ev, err := trust.NewInboxRelays(s.NostrSecretHex(), relays, c.v())
+	ev, err := trust.NewInboxRelays(s.NostrSecretHex(), relays, c.v(trust.KindInboxRelays, s.NostrPubHex(), ""))
 	if err != nil {
 		return err
 	}

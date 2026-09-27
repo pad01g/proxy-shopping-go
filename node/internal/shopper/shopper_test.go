@@ -46,6 +46,7 @@ func labKeys(t *testing.T, name string) *keys.Set {
 // env is a shopper engine (shopper-1) with a trust store naming it with escrow-1 under operator-1, and user-1.
 type env struct {
 	e                *Engine
+	inbox            inboxRec // what the messenger would have stored of the messages handed to the handlers
 	chain            *fakeChain
 	user, esc        *keys.Set
 	opSK, otherOpSK  string
@@ -56,6 +57,7 @@ type env struct {
 func newEnv(t *testing.T) *env {
 	t.Helper()
 	purchaseRetry = 10 * time.Millisecond
+	retryBase, waitPoll = 20*time.Millisecond, 20*time.Millisecond
 	db, err := store.Open(filepath.Join(t.TempDir(), "s.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -83,10 +85,11 @@ func newEnv(t *testing.T) *env {
 		}
 	}
 	cfg := &config.Shopper{Payments: []string{"btc-signet"}, Currencies: []string{"JPY"}, TrackingPollSeconds: 1,
-		Confirmations: 1, AcceptRulings: "always", MinT1RemainingSeconds: 3600, QuoteTTLSeconds: 900}
+		Confirmations: 1, PayoutConfirmations: 1, AcceptRulings: "always", MinT1RemainingSeconds: 3600, QuoteTTLSeconds: 900}
 	v.e = New(Deps{Keys: k, Messenger: m, Trust: st, Coordinators: []string{v.coordPK}, Network: "ps-lab", DB: db, Config: cfg,
 		BTC: v.chain})
 	t.Cleanup(v.e.Wait) // before the store closes
+	v.e.inbox = v.inbox.get
 	// a bot that is down unless a test starts its own
 	_, v.e.Bot = startBot(t, func(proto.PurchaseRequest, int) (int, any) { return 502, "down" })
 	return v
@@ -117,10 +120,11 @@ type fakeChain struct {
 	txErr        error
 	broadcastErr error
 	broadcasts   int
+	autoConf     int64 // confirmations a broadcast transaction gets at once
 }
 
 func newFakeChain() *fakeChain {
-	return &fakeChain{txs: map[string]*btc.Tx{}, conf: map[string]int64{}, outspend: map[string]*btc.Outspend{}, tip: 100}
+	return &fakeChain{txs: map[string]*btc.Tx{}, conf: map[string]int64{}, outspend: map[string]*btc.Outspend{}, tip: 100, autoConf: 1}
 }
 
 func (c *fakeChain) TipHeight(context.Context) (int64, error) {
@@ -170,6 +174,9 @@ func (c *fakeChain) Broadcast(_ context.Context, txHex string) (string, error) {
 	}
 	id := tx.TxHash().String()
 	c.txs[id] = &btc.Tx{TxID: id}
+	if c.conf[id] < c.autoConf {
+		c.conf[id] = c.autoConf
+	}
 	return id, nil
 }
 
@@ -267,7 +274,31 @@ func (v *env) msg(t *testing.T, senderSK, id, typ string, body any) *messenger.M
 	if err != nil {
 		t.Fatal(err)
 	}
+	v.inbox.add(ev)
 	return &messenger.Message{Inner: ev, From: ev.PubKey, Type: typ, OrderID: id}
+}
+
+type inboxRec struct {
+	mu  sync.Mutex
+	evs []*nostr.Event
+}
+
+func (r *inboxRec) add(ev *nostr.Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.evs = append(r.evs, ev)
+}
+
+func (r *inboxRec) get(orderID string) []*nostr.Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []*nostr.Event
+	for _, ev := range r.evs {
+		if giftwrap.OrderID(ev) == orderID {
+			out = append(out, ev)
+		}
+	}
+	return out
 }
 
 func (v *env) order(t *testing.T, id string) *Order {
@@ -499,7 +530,7 @@ func TestPurchaseIsIdempotent(t *testing.T) {
 			if n == 1 {
 				return 409, map[string]string{"error": "in_progress"}
 			}
-			return 200, proto.PurchaseResult{RequestID: req.RequestID, Status: "ok", ShopOrderID: "S-1",
+			return 200, proto.PurchaseResult{RequestID: req.RequestID, Status: "ok", ShopOrderID: "S-1", Total: &proto.Money{Amount: "4000", Currency: "JPY"},
 				Evidence: []proto.Evidence{{Kind: "screenshot", SHA256: strings.Repeat("0", 64), MIME: "image/png", DataB64: shot}}}
 		case '2':
 			return 422, map[string]string{"error": "schema"}
@@ -726,6 +757,7 @@ func TestCountersignedNeedsTheChain(t *testing.T) {
 	_, _ = v.e.update(oid, func(o *Order) error { o.Ruling = &proto.Ruling{}; return nil })
 	v.e.onCountersigned(ctx, v.msg(t, v.user.NostrSecretHex(), oid, proto.TypeDisputeCountersigned, claim))
 	v.e.watchEscrows(ctx)
+	v.e.Wait()
 	if got := v.order(t, oid); got.State != StateDisputed || got.PayoutTx != "" || !got.funded() {
 		t.Fatalf("a message alone settled the order: %s", got.State)
 	}
@@ -734,6 +766,7 @@ func TestCountersignedNeedsTheChain(t *testing.T) {
 		c.outspend[fmt.Sprintf("%s:%d", o.Outpoint.TxID, o.Outpoint.Vout)] = &btc.Outspend{Spent: true, TxID: claim.TxID}
 	})
 	v.e.watchEscrows(ctx)
+	v.e.Wait()
 	if got := v.order(t, oid); got.State != StateSettled || got.PayoutTx != claim.TxID {
 		t.Fatalf("%s %s", got.State, got.PayoutTx)
 	}

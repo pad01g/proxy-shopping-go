@@ -54,6 +54,15 @@ func (o *Order) lock() *big.Int {
 	return n
 }
 
+// orderDonation is the donation of the order: fixed at quote time, or (orders quoted by earlier versions) read
+// from the list now.
+func (e *Engine) orderDonation(o *Order) (btcAddr, evmAddr string, bps int64) {
+	if o.Donation != nil {
+		return o.Donation.BTCAddress, o.Donation.EVMAddress, min(o.Donation.BPS, maxDonationBPS)
+	}
+	return e.donation(o)
+}
+
 // donation returns the donation address and bps (capped at 1%) of the list the order was placed under (§2.3):
 // the list of the request's operator, and only while that operator's row for this order is effective (delegated
 // and not revoked). A list of any other operator is never used.
@@ -142,7 +151,7 @@ func (e *Engine) prepareRelease(ctx context.Context, o *Order, a *Action) (*payo
 		pay := o.lock().Int64() - o.reserve()
 		extra := map[string]int64{}
 		want := map[string]int64{o.Quote.ShopperBTCAddress: pay}
-		if addr, _, bps := e.donation(o); addr != "" {
+		if addr, _, bps := e.orderDonation(o); addr != "" && bps > 0 {
 			max := amount.BPS(big.NewInt(pay), bps).Int64()
 			extra[addr] = max
 			want[o.Quote.ShopperBTCAddress] = pay - max
@@ -260,8 +269,10 @@ func (e *Engine) offerRefund(ctx context.Context, o *Order) error {
 	return err
 }
 
-// onRuling records a ruling of the order's escrow. We countersign it automatically only for an open dispute,
-// and only if our policy agrees; the checks of the payout itself run when the pending action is carried out.
+// onRuling records a ruling of the order's escrow. We countersign it automatically only for a dispute we know
+// of (a dispute.open copy or an evidence request of the escrow), and only if our policy agrees; a ruling that
+// comes first is kept and looked at when the dispute becomes known (§4.8). The checks of the payout itself run
+// when the pending action is carried out.
 func (e *Engine) onRuling(ctx context.Context, msg *messenger.Message) {
 	var r proto.Ruling
 	if err := msg.Decode(&r); err != nil {
@@ -281,16 +292,30 @@ func (e *Engine) onRuling(ctx context.Context, msg *messenger.Message) {
 		o.Ruling = &r
 		o.Events["ruling"] = msg.Inner
 		o.note(fmt.Sprintf("ruling user=%s shopper=%s fee=%s: %s", r.Split.User, r.Split.Shopper, r.Split.EscrowFee, r.Reason))
-		if why := e.declineRuling(o, &r); why != "" {
-			o.note("ruling not countersigned: " + why)
-			return nil
-		}
-		o.addPending(ActRuling, &Action{Event: msg.Inner})
+		e.decideRuling(o)
 		return nil
 	})
 	if err == nil {
 		e.kick(ctx, msg.OrderID)
 	}
+}
+
+// decideRuling looks at the stored ruling once the dispute is known: it becomes a pending countersign, or is
+// declined. A declined ruling does not stop the T1 claim.
+func (e *Engine) decideRuling(o *Order) {
+	if o.Ruling == nil || o.RulingDecided || o.Pending[ActRuling] != nil {
+		return
+	}
+	if o.Dispute == nil {
+		o.note("ruling kept until the dispute is known")
+		return
+	}
+	o.RulingDecided = true
+	if why := e.declineRuling(o, o.Ruling); why != "" {
+		o.note("ruling not countersigned: " + why)
+		return
+	}
+	o.addPending(ActRuling, &Action{Event: o.Events["ruling"]})
 }
 
 // declineRuling tells why we do not countersign a ruling ("" = we do).
@@ -342,7 +367,9 @@ func (e *Engine) prepareRuling(ctx context.Context, o *Order, a *Action) (*payou
 		if r.PSBT == "" {
 			return nil, contract.Mismatchf("ruling without psbt")
 		}
-		if want := o.Outpoint.Amount - o.reserve(); sum.Int64() != want {
+		// the escrow divides the output minus the reserve (capped as user clients cap it, §4.5)
+		reserve := min(o.reserve(), contract.ReserveCap(o.lock().Int64()))
+		if want := o.Outpoint.Amount - reserve; sum.Int64() != want {
 			return nil, contract.Mismatchf("split sums to %s, escrow holds %d after the reserve", sum, want)
 		}
 		esc, err := contract.BTCEscrow(&o.Request, o.Quote)
@@ -362,7 +389,7 @@ func (e *Engine) prepareRuling(ctx context.Context, o *Order, a *Action) (*payou
 		add(o.Request.UserBTCAddress, parts["user"])
 		add(o.Quote.ShopperBTCAddress, parts["shopper"])
 		add(o.Quote.EscrowBTCFeeAddress, parts["escrow_fee"])
-		if err := contract.CheckBTCPayout(p, esc, *o.Outpoint, want, nil, o.reserve(), esc.Escrow); err != nil {
+		if err := contract.CheckBTCPayout(p, esc, *o.Outpoint, want, nil, reserve, esc.Escrow); err != nil {
 			return nil, contract.Definite(err)
 		}
 		return e.signBTC(o, esc, p)
@@ -378,8 +405,9 @@ func (e *Engine) prepareRuling(ctx context.Context, o *Order, a *Action) (*payou
 		if err != nil {
 			return nil, err
 		}
-		if sum.Cmp(bal) != 0 {
-			return nil, contract.Mismatchf("split sums to %s, safe holds %s", sum, bal)
+		// the escrow divides the balance when it signs; more may have arrived since (§4.8)
+		if sum.Cmp(o.lock()) < 0 || sum.Cmp(bal) > 0 {
+			return nil, contract.Mismatchf("split sums to %s, not between the lock %s and the safe balance %s", sum, o.lock(), bal)
 		}
 		want := map[common.Address]*big.Int{}
 		add := func(a string, v *big.Int) {
@@ -401,7 +429,7 @@ func (e *Engine) prepareRuling(ctx context.Context, o *Order, a *Action) (*payou
 // escrow spent (watchEscrows); a message alone never ends an order (§4.8, §4.10).
 func (e *Engine) onCountersigned(ctx context.Context, msg *messenger.Message) {
 	var ref proto.TxRef
-	if msg.Decode(&ref) != nil || ref.TxID == "" || len(ref.TxID) > 66 {
+	if msg.Decode(&ref) != nil || (!contract.IsTxID(ref.TxID) && !contract.IsTxHash(ref.TxID)) {
 		return
 	}
 	_, _ = e.update(msg.OrderID, func(o *Order) error {
@@ -418,7 +446,8 @@ func (e *Engine) onCountersigned(ctx context.Context, msg *messenger.Message) {
 	})
 }
 
-// watchEscrows notices escrows spent by others and claims delivered orders after T1.
+// watchEscrows notices escrows spent by others and claims delivered orders after T1. It works on a snapshot of
+// the orders and never waits for the lock of an order (a payout of the order may hold it for minutes).
 func (e *Engine) watchEscrows(ctx context.Context) {
 	orders, err := e.Orders()
 	if err != nil {
@@ -440,10 +469,16 @@ func (e *Engine) watchEscrows(ctx context.Context) {
 	}
 }
 
-// claimable: a delivered order whose user neither released nor had a ruling carried out by T1. An order the
-// escrow ruled is not claimed: the ruling decides it.
+// claimable: a delivered order whose user neither released nor had a ruling carried out by T1. A ruling we are
+// countersigning holds the claim back; one we declined (or that failed) does not: the escrow is still unspent,
+// and the user could have countersigned it (§4.8, §4.10).
 func (o *Order) claimable() bool {
-	return o.ShipStatus == "delivered" && o.PayoutTx == "" && o.Ruling == nil
+	return o.ShipStatus == "delivered" && o.PayoutTx == "" && o.Pending[ActRuling] == nil
+}
+
+// spentLater handles a spent escrow in the background (spent waits for the lock of the order).
+func (e *Engine) spentLater(ctx context.Context, id, txid string) {
+	e.background(ctx, "spent", id, func(ctx context.Context) { e.spent(ctx, id, txid) })
 }
 
 func (e *Engine) watchBTC(ctx context.Context, o *Order) {
@@ -452,7 +487,7 @@ func (e *Engine) watchBTC(ctx context.Context, o *Order) {
 		return
 	}
 	if spent.Spent {
-		e.spent(ctx, o.ID, spent.TxID)
+		e.spentLater(ctx, o.ID, spent.TxID)
 		return
 	}
 	if !o.claimable() || o.Pending[ActClaim] != nil {
@@ -470,12 +505,20 @@ func (e *Engine) watchSafe(ctx context.Context, o *Order) {
 	if err != nil {
 		return
 	}
-	bal, err := e.EVM.BalanceOf(ctx, d.USDC, common.HexToAddress(o.Safe))
+	// paid out: the balance fell below the lock by a transfer out of the Safe (§4.8; dust sent to the Safe
+	// may stay behind)
+	hint := o.ClaimedPayout
+	for _, a := range o.Pending {
+		if a.Tx != "" {
+			hint = a.Tx
+		}
+	}
+	by, err := contract.SafeSettlement(ctx, e.EVM, d, common.HexToAddress(o.Safe), o.lock(), hint)
 	if err != nil {
 		return
 	}
-	if bal.Sign() == 0 {
-		e.spent(ctx, o.ID, "")
+	if by != "" {
+		e.spentLater(ctx, o.ID, by)
 		return
 	}
 	if !o.claimable() || o.Pending[ActClaim] != nil {
@@ -566,7 +609,7 @@ func (e *Engine) spent(ctx context.Context, id, txid string) {
 		return
 	}
 	for _, a := range o.Pending {
-		if a.Tx != "" && (txid == "" || a.Tx == txid) {
+		if a.Tx != "" && (txid == "" || strings.EqualFold(a.Tx, txid)) {
 			e.kick(ctx, id)
 			return
 		}
@@ -615,21 +658,27 @@ func (e *Engine) emptiedSafe(ctx context.Context, o *Order, hash string) bool {
 	return false
 }
 
-// errWaiting means a sent transaction is not mined yet.
-var errWaiting = errors.New("transaction sent, waiting for it to be mined")
+// errWaiting means a sent transaction is not mined (or not confirmed enough) yet.
+var errWaiting = errors.New("transaction sent, waiting for the chain")
 
-// txPatience is how long a sent EVM transaction may stay unmined before it is sent again.
+// errSuperseded: the escrow was spent by another transaction than the one we sent.
+var errSuperseded = &contract.Mismatch{Err: errors.New("the escrow was spent by another transaction")}
+
+// txPatience is how long a sent EVM transaction may stay unmined before it is sent again (with a higher fee).
 const txPatience = 10 * time.Minute
 
-// submit sends a prepared payout. The transaction id is stored on the action before it is sent, so that after
-// a crash or a lost answer the next attempt looks for it instead of sending another one.
+// payoutConfirmations is how many confirmations a BTC payout of ours needs to be final.
+func (e *Engine) payoutConfirmations() int64 { return max(e.cfg.PayoutConfirmations, 1) }
+
+// submit sends a prepared payout. The transaction is stored on the action before it is sent, so that after a
+// crash or a lost answer the next attempt looks for it instead of sending another one.
 func (e *Engine) submit(ctx context.Context, o *Order, kind string, p *payout) (string, error) {
 	if p.tx != nil {
-		txid := p.tx.TxHash().String()
-		if err := e.setTx(o.ID, kind, txid); err != nil {
+		txid, raw := p.tx.TxHash().String(), btc.TxHex(p.tx)
+		if err := e.setTx(o.ID, kind, txid, raw); err != nil {
 			return "", err
 		}
-		if _, err := e.BTC.Broadcast(ctx, btc.TxHex(p.tx)); err != nil {
+		if _, err := e.BTC.Broadcast(ctx, raw); err != nil {
 			// already broadcast (by an earlier attempt) counts as sent
 			if _, terr := e.BTC.Tx(ctx, txid); terr == nil {
 				return txid, nil
@@ -638,28 +687,35 @@ func (e *Engine) submit(ctx context.Context, o *Order, kind string, p *payout) (
 		}
 		return txid, nil
 	}
-	hash, err := e.EVM.Send(ctx, e.Keys.EVM, p.to, p.data, nil)
+	var stuck common.Hash
+	if a := o.Pending[kind]; a != nil && a.Stuck != "" {
+		stuck = common.HexToHash(a.Stuck)
+	}
+	hash, err := e.EVM.SendReplacing(ctx, e.Keys.EVM, p.to, p.data, nil, stuck)
 	if err != nil {
 		return "", err
 	}
-	if err := e.setTx(o.ID, kind, hash.Hex()); err != nil {
+	if err := e.setTx(o.ID, kind, hash.Hex(), ""); err != nil {
 		return "", err
 	}
 	wctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	if _, err := e.EVM.Wait(wctx, hash); err != nil {
+		if wctx.Err() != nil && ctx.Err() == nil {
+			return "", errWaiting // not mined yet; the next attempts watch it
+		}
 		return "", err
 	}
 	return hash.Hex(), nil
 }
 
-func (e *Engine) setTx(id, kind, tx string) error {
+func (e *Engine) setTx(id, kind, tx, raw string) error {
 	_, err := e.update(id, func(o *Order) error {
 		a := o.Pending[kind]
 		if a == nil {
 			return errSkip
 		}
-		a.Tx, a.Sent = tx, time.Now().Unix()
+		a.Tx, a.Raw, a.Sent = tx, raw, time.Now().Unix()
 		return nil
 	})
 	if errors.Is(err, errSkip) {
@@ -668,29 +724,70 @@ func (e *Engine) setTx(id, kind, tx string) error {
 	return err
 }
 
-// sentTx checks the transaction an earlier attempt sent. done: it is on the chain (BTC: known to Esplora; EVM:
-// mined and successful). Otherwise the action either waits (errWaiting) or sends anew (Tx cleared).
-func (e *Engine) sentTx(ctx context.Context, o *Order, kind string, a *Action) (done bool, err error) {
+// States of a transaction an earlier attempt sent.
+const (
+	txGone  = iota // not on the chain: prepare and send it anew
+	txSeen         // on its way (BTC: known to Esplora, not confirmed enough)
+	txFinal        // BTC: enough confirmations; EVM: mined and successful
+)
+
+// sentTx looks at the transaction an earlier attempt sent. A BTC transaction that dropped out is broadcast
+// again as it was; one whose escrow another transaction spent is superseded. An EVM transaction that stays
+// unmined past txPatience, or reverted, is prepared anew (Tx cleared).
+func (e *Engine) sentTx(ctx context.Context, o *Order, kind string, a *Action) (int, error) {
 	if o.Quote.Asset == proto.AssetBTC {
-		if _, err := e.BTC.Tx(ctx, a.Tx); err == nil {
-			return true, nil
-		} else if !btc.IsNotFound(err) {
-			return false, err
+		_, err := e.BTC.Tx(ctx, a.Tx)
+		switch {
+		case err == nil:
+			conf, err := e.BTC.Confirmations(ctx, a.Tx)
+			if err != nil {
+				return txSeen, nil
+			}
+			if conf >= e.payoutConfirmations() {
+				return txFinal, nil
+			}
+			return txSeen, nil
+		case !btc.IsNotFound(err):
+			return txGone, err
 		}
-		return false, nil // rebuilt and broadcast again; the same inputs give the same transaction
+		if a.Raw == "" {
+			return txGone, nil // rebuilt and broadcast again; the same inputs give the same transaction
+		}
+		if _, berr := e.BTC.Broadcast(ctx, a.Raw); berr == nil {
+			e.log.Info("payout broadcast again", "order", o.ID, "tx", a.Tx)
+			return txSeen, nil
+		} else if o.Outpoint != nil {
+			if sp, err := e.BTC.Outspend(ctx, o.Outpoint.TxID, o.Outpoint.Vout); err == nil && sp.Spent && !strings.EqualFold(sp.TxID, a.Tx) {
+				e.spentLater(ctx, o.ID, sp.TxID)
+				return txGone, errSuperseded
+			}
+			return txGone, fmt.Errorf("broadcast again: %w", berr)
+		}
+		return txGone, nil
 	}
 	r, err := e.EVM.Receipt(ctx, common.HexToHash(a.Tx))
 	switch {
 	case errors.Is(err, ethereum.NotFound):
 		if time.Since(time.Unix(a.Sent, 0)) < txPatience {
-			return false, errWaiting
+			return txGone, errWaiting
 		}
 	case err != nil:
-		return false, err
+		return txGone, err
 	case r.Status == types.ReceiptStatusSuccessful:
-		return true, nil
+		return txFinal, nil
 	}
-	// reverted, or dropped for too long: start over (the checks see a moved nonce or an empty escrow)
-	a.Tx = ""
-	return false, e.setTx(o.ID, kind, "")
+	// reverted, or not mined for too long: start over (the checks see a moved nonce or an empty escrow). A
+	// transaction still waiting is replaced: same nonce, higher fee
+	stuck := ""
+	if err != nil {
+		stuck = a.Tx
+	}
+	a.Tx, a.Stuck = "", stuck
+	_, uerr := e.update(o.ID, func(o *Order) error {
+		if cur := o.Pending[kind]; cur != nil {
+			cur.Tx, cur.Raw, cur.Stuck = "", "", stuck
+		}
+		return nil
+	})
+	return txGone, uerr
 }

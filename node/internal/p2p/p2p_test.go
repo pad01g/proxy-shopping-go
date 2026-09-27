@@ -9,6 +9,7 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/nbd-wtf/go-nostr"
 
 	"github.com/pad01g/proxy-shopping-go/node/internal/testutil"
@@ -135,11 +136,11 @@ func TestSyncKeepsOnlyScope(t *testing.T) {
 	}
 	var msg pubsub.Message
 	msg.Message = &pb.Message{Data: mustJSON(t, bad)}
-	if a.svc.validator(TopicTrust("ps-test"))(ctx, relay.h.ID(), &msg) {
+	if a.svc.validator(TopicTrust("ps-test"))(ctx, relay.h.ID(), &msg) == pubsub.ValidationAccept {
 		t.Fatal("gossip validator passes an event outside the scope")
 	}
 	msg.Message = &pb.Message{Data: mustJSON(t, good)}
-	if !a.svc.validator(TopicTrust("ps-test"))(ctx, relay.h.ID(), &msg) {
+	if a.svc.validator(TopicTrust("ps-test"))(ctx, relay.h.ID(), &msg) != pubsub.ValidationAccept {
 		t.Fatal("gossip validator refuses an event in the scope")
 	}
 }
@@ -151,4 +152,79 @@ func mustJSON(t *testing.T, v any) []byte {
 		t.Fatal(err)
 	}
 	return data
+}
+
+// Events that arrive (by trust-sync) before the delegation that brings their authors into the scope are not lost:
+// they are parked, and a change of the scope syncs again with the peers (review 2, item 7).
+func TestOutOfOrderEventsKept(t *testing.T) {
+	old, oldDelay := trust.MaxParked, ScopeResyncDelay
+	trust.MaxParked, ScopeResyncDelay = 1, 200*time.Millisecond // parking alone cannot hold both
+	t.Cleanup(func() { trust.MaxParked, ScopeResyncDelay = old, oldDelay })
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	relay := startNode(t, ctx, Options{Listen: []string{"/ip4/127.0.0.1/tcp/0"}, Reachability: "public"}, "relay")
+	coord, op, sh, es := nostr.GeneratePrivateKey(), nostr.GeneratePrivateKey(), nostr.GeneratePrivateKey(), nostr.GeneratePrivateKey()
+	coordPub, _ := nostr.GetPublicKey(coord)
+	opPub, _ := nostr.GetPublicKey(op)
+	shPub, _ := nostr.GetPublicKey(sh)
+	esPub, _ := nostr.GetPublicKey(es)
+	list, _ := trust.NewList(op, 1, &trust.List{Network: "ps-test", Entries: []trust.Entry{{Region: "JP", Shopper: shPub, Escrow: esPub, Shops: []string{"*"}, Payments: []string{"btc-signet"}}}})
+	profile, _ := trust.NewProfile(sh, trust.KindShopperProfile, "ps-test", 1, trust.ShopperProfile{Name: "s"})
+	for _, ev := range []*nostr.Event{list, profile} {
+		if _, err := relay.st.Put(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a := startNode(t, ctx, Options{Listen: []string{"/ip4/127.0.0.1/tcp/0"}}, "shopper")
+	a.st.SetScope([]string{coordPub}, "ps-test")
+	if err := a.h.Connect(ctx, peerInfo(t, relay.h.FullAddrs()[0])); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, ctx, "first trust-sync", func() bool { return a.st.Parked() == 1 })
+	// the delegation arrives some other way (the Nostr bridge, say)
+	d, _ := trust.NewDelegation(coord, opPub, "ps-test", 1, false, "")
+	if _, err := a.st.Put(d); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, ctx, "list and profile after the scope grew", func() bool {
+		return a.st.Get(trust.KeyOf(list)) != nil && a.st.Get(trust.KeyOf(profile)) != nil
+	})
+}
+
+// A node without a scope (the p2p relay) passes on every valid event, within a per-peer quota (item 6).
+func TestRelayQuota(t *testing.T) {
+	old := PeerEventsPerMinute
+	PeerEventsPerMinute = 3
+	t.Cleanup(func() { PeerEventsPerMinute = old })
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	relay := startNode(t, ctx, Options{Listen: []string{"/ip4/127.0.0.1/tcp/0"}, Reachability: "public"}, "relay")
+	v := relay.svc.validator(TopicProfiles("ps-test"))
+	var results []pubsub.ValidationResult
+	for i := 0; i < 5; i++ {
+		ev, _ := trust.NewInboxRelays(nostr.GeneratePrivateKey(), []string{"wss://x"}, 1)
+		var msg pubsub.Message
+		msg.Message = &pb.Message{Data: mustJSON(t, ev)}
+		results = append(results, v(ctx, "peer-a", &msg))
+	}
+	for i, want := range []pubsub.ValidationResult{pubsub.ValidationAccept, pubsub.ValidationAccept, pubsub.ValidationAccept, pubsub.ValidationIgnore, pubsub.ValidationIgnore} {
+		if results[i] != want {
+			t.Fatalf("event %d: %v, want %v", i, results[i], want)
+		}
+	}
+	ev, _ := trust.NewInboxRelays(nostr.GeneratePrivateKey(), []string{"wss://x"}, 1)
+	var msg pubsub.Message
+	msg.Message = &pb.Message{Data: mustJSON(t, ev)}
+	if v(ctx, "peer-b", &msg) != pubsub.ValidationAccept {
+		t.Fatal("another peer's quota used up")
+	}
+}
+
+func peerInfo(t *testing.T, addr string) peer.AddrInfo {
+	t.Helper()
+	info, err := peer.AddrInfoFromString(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return *info
 }

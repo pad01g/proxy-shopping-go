@@ -76,6 +76,16 @@ func (l *limiter[K]) available(key K) bool {
 	return l.refill(key, l.now()).tokens >= 1
 }
 
+// forget drops the bucket of a key (a closed connection).
+func (l *limiter[K]) forget(key K) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.buckets, key)
+}
+
 // sweep forgets the buckets that are full again, so the map does not grow with every client ever seen.
 func (l *limiter[K]) sweep(now time.Time) {
 	if now.Sub(l.lastSweep) < time.Minute {
@@ -113,6 +123,16 @@ func parseProxies(list []string) (proxies, error) {
 		out = append(out, n)
 	}
 	return out, nil
+}
+
+// fromTrusted tells whether the peer of a request is a trusted proxy.
+func (p proxies) fromTrusted(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && p.trusted(ip)
 }
 
 func (p proxies) trusted(ip net.IP) bool {
@@ -199,16 +219,50 @@ func (s *subscriptions) count(ws *khatru.WebSocket) int {
 	return len(s.open[ws])
 }
 
+// addressKey is the rate limit key of a client address: the IPv4 address, or the /64 prefix of an IPv6 address
+// (one subscriber usually holds a whole /64, so per-address IPv6 limits would be no limits).
+func addressKey(addr string) string {
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return addr
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String()
+	}
+	return (&net.IPNet{IP: ip.Mask(net.CIDRMask(64, 128)), Mask: net.CIDRMask(64, 128)}).String()
+}
+
 func (s *Server) ipOf(ctx context.Context) string {
 	if ws := khatru.GetConnection(ctx); ws != nil {
-		return s.proxies.clientIP(ws.Request)
+		return addressKey(s.proxies.clientIP(ws.Request))
 	}
 	return ""
 }
 
-// rejectConnection limits new WebSocket connections per client address.
+// rejectConnection limits new WebSocket connections per client address. It also warns (once) when a peer that is
+// not a trusted proxy sends X-Forwarded-For: the relay is probably behind a proxy that -trusted-proxies does not
+// name, so every client shares the proxy's limits.
 func (s *Server) rejectConnection(r *http.Request) bool {
-	return !s.connLimit.allow(s.proxies.clientIP(r))
+	if r.Header.Get("X-Forwarded-For") != "" && !s.proxies.fromTrusted(r) && s.xffWarned.CompareAndSwap(false, true) {
+		host, _, _ := net.SplitHostPort(r.RemoteAddr)
+		s.log.Error("X-Forwarded-For from a peer that is not a trusted proxy: if the relay is behind a reverse proxy, "+
+			"set -trusted-proxies to its address, or all clients share its rate limits", "peer", host)
+	}
+	return !s.connLimit.allow(addressKey(s.proxies.clientIP(r)))
+}
+
+// limitFrame is the per-connection frame limit, applied before khatru parses a frame or verifies a signature.
+func (s *Server) limitFrame(ctx context.Context) bool {
+	ws := khatru.GetConnection(ctx)
+	return ws != nil && !s.connFrames.allow(ws)
+}
+
+// forgetConnection drops the per-connection buckets of a closed connection.
+func (s *Server) forgetConnection(ctx context.Context) {
+	if ws := khatru.GetConnection(ctx); ws != nil {
+		s.connFrames.forget(ws)
+		s.connEvents.forget(ws)
+	}
 }
 
 // limitEvent applies the per-address and per-connection event limits.

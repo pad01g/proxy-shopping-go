@@ -356,7 +356,7 @@ func TestProductsAPI(t *testing.T) {
 		}
 	}
 	b.getJSON("http://safe-shop.test/api/products", &p)
-	if p.Currency != "JPY" || p.Shipping.Amount != "800" || len(p.Products) != 3 || p.Products[1].Price.Amount != "12000" {
+	if p.Currency != "JPY" || p.Shipping.Amount != "800" || len(p.Products) != 4 || p.Products[1].Price.Amount != "12000" {
 		t.Fatalf("products = %+v", p)
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"runtime/debug"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
@@ -46,12 +47,30 @@ var (
 	// are dropped without an ack, so an honest sender delivers them with a later resend.
 	SenderRate  = 30
 	SenderBurst = 30
+	// StrangerRate and StrangerBurst limit the messages accepted per minute from all senders together that are
+	// not a counterparty of ours (§4.10); counterparties (a party of an order we keep) are not limited.
+	StrangerRate  = 60
+	StrangerBurst = 60
+	// CounterpartyRate and CounterpartyBurst are only a backstop per (counterparty, order), far above what an
+	// order needs (a dispute's attachments come in a burst of up to 4 × 64), against a party flooding its order.
+	CounterpartyRate  = 300
+	CounterpartyBurst = 600
+
+	// BacklogPage and BacklogInterval: stored wraps are read page by page backwards (until) down to WrapMaxAge at
+	// start and then every BacklogInterval, so that more than one subscription limit of junk cannot hide older
+	// messages (§4.10: the subscription itself reads the newest 1000).
+	SubscribeLimit  = 1000
+	BacklogPage     = 500
+	BacklogInterval = time.Hour
+	// AckWorkers send the queued acks; acks are queued per recipient and never dropped.
+	AckWorkers = 4
 
 	// WrapMaxAge: older wraps are ignored and their ids forgotten (a resend stops after RetryLimit anyway).
 	WrapMaxAge = 14 * 24 * time.Hour
 	// HistoryRetention keeps handled inbox and finished outbox entries of an order (disputes read them as
-	// evidence until T2, which is about 40 days by default); OtherRetention is for messages without an order.
-	HistoryRetention = 60 * 24 * time.Hour
+	// evidence until T2: t1 = (delivery_days + 21) days and t2 = t1 + 14 days by default, and a user may accept
+	// up to max_t2 = 120 days, §4.5.1); OtherRetention is for messages without an order.
+	HistoryRetention = 120 * 24 * time.Hour
 	OtherRetention   = 30 * 24 * time.Hour
 	// PruneInterval is how often old entries are removed.
 	PruneInterval = time.Hour
@@ -80,9 +99,18 @@ type Handler func(ctx context.Context, m *Message)
 // Resolver returns the inbox relays of a pubkey (10050), or nil.
 type Resolver func(pubkey string) []string
 
-// RetryFunc tells whether unacknowledged messages to a recipient about an order are resent (§4.10: replies to
-// somebody without an order with us are sent once).
+// RetryFunc tells whether a pubkey is a counterparty of an order we keep: unacknowledged messages to it about the
+// order are resent (§4.10: replies to somebody without an order with us are sent once), and messages from it
+// about the order are not rate limited.
 type RetryFunc func(to, orderID string) bool
+
+// AcceptFunc tells whether a message from a sender that is not a counterparty is taken at all (§4.10: a message no
+// role accepts is neither stored nor acked). Counterparties are always accepted.
+type AcceptFunc func(msg *Message) bool
+
+// HintsFunc returns relays where the sender of a message reads (e.g. the relays of its order request), used for
+// the ack and other replies when the sender has no inbox relays (10050).
+type HintsFunc func(msg *Message) []string
 
 type outboxEntry struct {
 	Inner    *nostr.Event `json:"inner"`
@@ -125,6 +153,8 @@ type Messenger struct {
 	k           int
 	resolve     Resolver
 	retry       RetryFunc
+	accepts     AcceptFunc
+	hints       HintsFunc
 	log         *slog.Logger
 
 	mu       sync.Mutex
@@ -136,10 +166,33 @@ type Messenger struct {
 
 	// the package defaults at New
 	retryInterval, retryLimit, handlerTimeout time.Duration
+	subLimit, backlogPage                     int
+	backlogInterval                           time.Duration
 
-	disp    *dispatcher
-	senders *rateLimiter
-	acks    chan struct{} // bounds concurrent ack sending
+	disp      *dispatcher
+	senders   *rateLimiter
+	strangers *rateLimiter // all non-counterparty senders together (one key)
+	parties   *rateLimiter // per (counterparty, order)
+
+	// known remembers (sender, order) of messages stored in this run, so that the next message of a just
+	// accepted request counts as a counterparty's before the handler created the order
+	knownMu sync.Mutex
+	known   map[string]time.Time
+
+	ackMu    sync.Mutex
+	ackq     map[ackKey]*ackBatch
+	ackOrder []ackKey
+	ackWake  chan struct{}
+	acked    map[string]time.Time // inner id → when an ack was last queued (duplicates are not acked every time)
+
+	paused atomic.Bool
+}
+
+type ackKey struct{ to, orderID string }
+
+type ackBatch struct {
+	ids   []string
+	hints []string
 }
 
 // Config configures a messenger.
@@ -151,7 +204,9 @@ type Config struct {
 	Defaults []string // relays of recipients without inbox relays (usually = Inbox)
 	K        int
 	Resolve  Resolver
-	Retry    RetryFunc // nil: resend everything
+	Retry    RetryFunc  // nil: resend everything, nobody is a known counterparty
+	Accepts  AcceptFunc // nil: accept every message
+	Hints    HintsFunc  // nil: no hints but the relay a message came from
 	Log      *slog.Logger
 }
 
@@ -172,10 +227,14 @@ func New(c Config) (*Messenger, error) {
 	}
 	m := &Messenger{
 		secret: c.Secret, Pub: pub, pool: c.Pool, db: c.DB, inbox: c.Inbox, defaults: c.Defaults, k: c.K,
-		resolve: c.Resolve, retry: c.Retry, log: c.Log.With("component", "messenger"),
+		resolve: c.Resolve, retry: c.Retry, accepts: c.Accepts, hints: c.Hints, log: c.Log.With("component", "messenger"),
 		handlers: map[string]Handler{}, outbox: map[string]*outMeta{},
-		senders: newRateLimiter(SenderRate, SenderBurst), acks: make(chan struct{}, 16),
+		senders: newRateLimiter(SenderRate, SenderBurst), strangers: newRateLimiter(StrangerRate, StrangerBurst),
+		parties: newRateLimiter(CounterpartyRate, CounterpartyBurst),
+		known:   map[string]time.Time{},
+		ackq:    map[ackKey]*ackBatch{}, ackWake: make(chan struct{}, 1), acked: map[string]time.Time{},
 		retryInterval: RetryInterval, retryLimit: RetryLimit, handlerTimeout: HandlerTimeout,
+		subLimit: SubscribeLimit, backlogPage: max(BacklogPage, 1), backlogInterval: BacklogInterval,
 	}
 	m.disp = newDispatcher(m)
 	if err := m.loadOutbox(); err != nil {
@@ -208,16 +267,69 @@ func (m *Messenger) handler(typ string) Handler {
 }
 
 // Start handles what a previous run left unhandled, subscribes to our inbox and runs the resend loop until
-// ctx ends. Register the handlers before.
+// ctx ends. Register the handlers before. Start may be called again after the context of the previous call ended
+// (Pause / resume of the node); handlers still running from before keep their order busy until they return.
 func (m *Messenger) Start(ctx context.Context) {
 	m.disp.start(ctx)
 	m.redispatch()
-	filter := nostr.Filter{Kinds: []int{giftwrap.KindWrap}, Tags: nostr.TagMap{"p": {m.Pub}}, Limit: 1000}
+	filter := nostr.Filter{Kinds: []int{giftwrap.KindWrap}, Tags: nostr.TagMap{"p": {m.Pub}}, Limit: m.subLimit}
 	m.pool.Subscribe(ctx, m.inbox, nostr.Filters{filter}, func(relay string, ev *nostr.Event) {
 		m.receive(ctx, relay, ev)
 	})
+	for i := 0; i < max(AckWorkers, 1); i++ {
+		go m.ackLoop(ctx)
+	}
+	go m.backlogLoop(ctx)
 	go m.resendLoop(ctx)
 	go m.pruneLoop(ctx)
+}
+
+// SetPaused stops (true) or resumes publishing: while paused nothing is sent, messages to send are kept in the
+// outbox and go out with the resend loop after the pause. The node pauses the whole network activity with it and
+// by ending the context of Start (admin POST /admin/pause).
+func (m *Messenger) SetPaused(p bool) { m.paused.Store(p) }
+
+// Paused tells whether publishing is paused.
+func (m *Messenger) Paused() bool { return m.paused.Load() }
+
+// backlogLoop reads the stored wraps of our inbox relays backwards, page by page, down to WrapMaxAge.
+func (m *Messenger) backlogLoop(ctx context.Context) {
+	t := time.NewTicker(m.backlogInterval)
+	defer t.Stop()
+	for {
+		for _, relay := range m.inbox {
+			m.readBacklog(ctx, relay)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+func (m *Messenger) readBacklog(ctx context.Context, relay string) {
+	since := nostr.Timestamp(time.Now().Add(-WrapMaxAge).Unix())
+	until := nostr.Now()
+	for ctx.Err() == nil {
+		f := nostr.Filter{Kinds: []int{giftwrap.KindWrap}, Tags: nostr.TagMap{"p": {m.Pub}}, Since: &since, Until: &until, Limit: m.backlogPage}
+		evs := m.pool.Query(ctx, []string{relay}, f)
+		oldest := until
+		for _, ev := range evs {
+			m.receive(ctx, relay, ev)
+			oldest = min(oldest, ev.CreatedAt)
+		}
+		if len(evs) < m.backlogPage {
+			return
+		}
+		if oldest >= until { // a full page within one second: step past it
+			oldest = until - 1
+		}
+		if oldest < since {
+			return
+		}
+		until = oldest
+	}
 }
 
 // RelaysFor returns where to deliver messages for a pubkey: its inbox relays, else the hints, else our
@@ -233,16 +345,18 @@ func (m *Messenger) RelaysFor(pubkey string, hints []string) []string {
 	if len(r) == 0 {
 		r = m.defaults
 	}
-	return capRelays(r)
+	return m.capRelays(r)
 }
 
-func capRelays(r []string) []string {
+// capRelays drops duplicates and the relays the pool would refuse (private addresses unless allowed, bad URLs)
+// before it takes the first MaxRelays, so that unusable entries do not take the places (§4.10).
+func (m *Messenger) capRelays(r []string) []string {
 	out := make([]string, 0, min(len(r), MaxRelays))
 	for _, u := range r {
 		if len(out) == MaxRelays {
 			break
 		}
-		if u != "" && !slices.Contains(out, u) {
+		if u != "" && !slices.Contains(out, u) && (m.pool == nil || m.pool.Allowed(u)) {
 			out = append(out, u)
 		}
 	}
@@ -262,6 +376,11 @@ func (m *Messenger) Send(ctx context.Context, to, orderID, typ string, body any,
 	wrap, err := giftwrap.Wrap(m.secret, inner, giftwrap.Options{})
 	if err != nil {
 		return nil, err
+	}
+	// relays refuse larger contents, so the message would never arrive (§4.9)
+	if n := len(wrap.Content); n > giftwrap.MaxWrapContent {
+		return nil, fmt.Errorf("%s message: wrap content is %d bytes, over the %d bytes relays store (§4.9; inner %d bytes)",
+			typ, n, giftwrap.MaxWrapContent, len(inner.String()))
 	}
 	e := &outboxEntry{Inner: inner, Wrap: wrap, To: to, Relays: m.RelaysFor(to, hints), Created: time.Now().Unix()}
 	if typ == proto.TypeAck {
@@ -293,6 +412,11 @@ func (m *Messenger) deliver(ctx context.Context, e *outboxEntry) {
 			return
 		}
 		e.Wrap = wrap
+	}
+	if m.paused.Load() {
+		// kept in the outbox: the resend loop sends it after the pause (acks are queued again by the duplicate)
+		m.log.Debug("paused, not sending", "type", giftwrap.Type(e.Inner), "to", e.To)
+		return
 	}
 	need := min(m.k, len(e.Relays))
 	var ok []string
@@ -437,23 +561,54 @@ func (m *Messenger) receive(ctx context.Context, relay string, wrap *nostr.Event
 	if time.Since(wrap.CreatedAt.Time()) > WrapMaxAge || m.db.Has(bucketWraps, wrap.ID) {
 		return
 	}
+	// only an id that is the hash of this very wrap may be remembered as seen: a relay could otherwise send junk
+	// under the id of a real wrap and have us drop the real one (the pool checks this too)
+	if wrap.Kind != giftwrap.KindWrap || giftwrap.Verify(wrap) != nil {
+		m.log.Debug("dropping an event with a wrong id or signature", "id", wrap.ID, "relay", relay)
+		return
+	}
 	inner, err := giftwrap.Unwrap(m.secret, wrap)
 	if err != nil {
-		_ = m.db.Put(bucketWraps, wrap.ID, time.Now().Unix())
+		m.seen(wrap)
 		m.log.Debug("dropping wrap", "id", wrap.ID, "relay", relay, "err", err)
 		return
 	}
 	typ := giftwrap.Type(inner)
 	msg := &Message{Inner: inner, From: inner.PubKey, Type: typ, OrderID: giftwrap.OrderID(inner), Relay: relay}
 	if typ == proto.TypeAck {
-		_ = m.db.Put(bucketWraps, wrap.ID, time.Now().Unix())
+		m.seen(wrap)
 		m.markAcked(msg)
 		return
 	}
-	if !m.senders.allow(inner.PubKey, time.Now()) {
-		// not remembered as seen: the sender's resend (or this wrap at our next reconnect) gets another chance
-		m.log.Debug("sender over the rate limit, dropping", "from", short(inner.PubKey), "type", typ)
+	// a message we already stored (a resend in a new wrap, or the copy on another relay) costs no rate limit
+	// tokens: it is only acked again, because the sender resends until one of our acks arrives
+	if m.db.Has(bucketInbox, inner.ID) {
+		m.seen(wrap)
+		m.queueAck(msg, false)
 		return
+	}
+	if m.isCounterparty(msg.From, msg.OrderID) {
+		if !m.parties.allow(msg.From+"|"+msg.OrderID, time.Now()) {
+			m.log.Warn("counterparty flooding its order, dropping", "from", short(msg.From), "order", msg.OrderID, "type", typ)
+			return
+		}
+	} else {
+		// §4.10: what no role takes from a stranger is neither stored nor acked. The wrap is not remembered as seen,
+		// so that it is looked at again at the next reconnect (the order may exist by then).
+		if m.accepts != nil && !m.accepts(msg) {
+			m.log.Debug("not accepted from a non-counterparty, dropping", "from", short(msg.From), "type", typ, "order", msg.OrderID)
+			return
+		}
+		// not remembered as seen either: the sender's resend (or this wrap at our next reconnect) gets another chance
+		now := time.Now()
+		if !m.senders.allow(inner.PubKey, now) {
+			m.log.Debug("sender over the rate limit, dropping", "from", short(inner.PubKey), "type", typ)
+			return
+		}
+		if !m.strangers.allow("", now) {
+			m.log.Debug("non-counterparty senders over the global rate limit, dropping", "from", short(inner.PubKey), "type", typ)
+			return
+		}
 	}
 	// store before acking and before handling, so that neither a crash nor a full queue loses it
 	fresh := false
@@ -471,9 +626,9 @@ func (m *Messenger) receive(ctx context.Context, relay string, wrap *nostr.Event
 		}
 		return
 	}
-	_ = m.db.Put(bucketWraps, wrap.ID, time.Now().Unix())
-	// ack duplicates too: the sender resends until one of our acks arrives
-	m.ack(ctx, inner)
+	m.seen(wrap)
+	m.remember(msg.From, msg.OrderID)
+	m.queueAck(msg, fresh)
 	if !fresh {
 		return
 	}
@@ -481,19 +636,175 @@ func (m *Messenger) receive(ctx context.Context, relay string, wrap *nostr.Event
 	m.disp.enqueue(msg)
 }
 
-// ack sends the ack in the background; when too many are in flight it is skipped (the sender resends).
-func (m *Messenger) ack(ctx context.Context, inner *nostr.Event) {
-	select {
-	case m.acks <- struct{}{}:
-	default:
+func (m *Messenger) seen(wrap *nostr.Event) { _ = m.db.Put(bucketWraps, wrap.ID, time.Now().Unix()) }
+
+// knownTTL and maxKnown bound the memory of recently stored (sender, order) pairs.
+const (
+	knownTTL = 30 * time.Minute
+	maxKnown = 10000
+)
+
+// isCounterparty tells whether from is a party of an order we keep, or sent a message about the order that we
+// stored recently (its handler may not have created the order yet).
+func (m *Messenger) isCounterparty(from, orderID string) bool {
+	if orderID == "" {
+		return false
+	}
+	m.knownMu.Lock()
+	at, ok := m.known[from+"|"+orderID]
+	m.knownMu.Unlock()
+	if ok && time.Since(at) < knownTTL {
+		return true
+	}
+	return m.retry != nil && m.retry(from, orderID)
+}
+
+func (m *Messenger) remember(from, orderID string) {
+	if orderID == "" {
 		return
 	}
-	go func() {
-		defer func() { <-m.acks }()
-		if _, err := m.Send(ctx, inner.PubKey, giftwrap.OrderID(inner), proto.TypeAck, proto.Ack{IDs: []string{inner.ID}}, nil); err != nil {
-			m.log.Warn("ack failed", "id", inner.ID, "err", err)
+	now := time.Now()
+	m.knownMu.Lock()
+	defer m.knownMu.Unlock()
+	if len(m.known) >= maxKnown {
+		for k, at := range m.known {
+			if now.Sub(at) >= knownTTL {
+				delete(m.known, k)
+			}
 		}
-	}()
+		for k := range m.known { // still full: forget arbitrary ones
+			if len(m.known) < maxKnown*9/10 {
+				break
+			}
+			delete(m.known, k)
+		}
+	}
+	m.known[from+"|"+orderID] = now
+}
+
+// ackRepeat: a duplicate is acked again only this long after the last ack of the same message, so that replaying
+// a message does not make us send an ack per copy.
+const (
+	ackRepeat  = 10 * time.Second
+	maxAckIDs  = 100 // ids per ack message
+	maxAckSeen = 20000
+)
+
+// queueAck queues the ack of a stored message. Acks are batched per recipient and order and sent by the ack
+// workers, so none is dropped under load. A duplicate (fresh false) is acked at most every ackRepeat.
+func (m *Messenger) queueAck(msg *Message, fresh bool) {
+	now := time.Now()
+	id := msg.Inner.ID
+	m.ackMu.Lock()
+	last, ok := m.acked[id]
+	m.ackMu.Unlock()
+	if ok && !fresh && now.Sub(last) < ackRepeat {
+		return
+	}
+	var hints []string
+	if m.hints != nil {
+		hints = m.hints(msg)
+	}
+	if msg.Relay != "" && !slices.Contains(hints, msg.Relay) {
+		hints = append(hints, msg.Relay)
+	}
+	m.ackMu.Lock()
+	defer m.ackMu.Unlock()
+	if len(m.acked) >= maxAckSeen {
+		for k, at := range m.acked {
+			if now.Sub(at) >= ackRepeat {
+				delete(m.acked, k)
+			}
+		}
+	}
+	m.acked[id] = now
+	k := ackKey{to: msg.From, orderID: msg.OrderID}
+	b := m.ackq[k]
+	if b == nil {
+		b = &ackBatch{}
+		m.ackq[k] = b
+		m.ackOrder = append(m.ackOrder, k)
+	}
+	if !slices.Contains(b.ids, id) {
+		b.ids = append(b.ids, id)
+	}
+	for _, h := range hints {
+		if !slices.Contains(b.hints, h) {
+			b.hints = append(b.hints, h)
+		}
+	}
+	select {
+	case m.ackWake <- struct{}{}:
+	default:
+	}
+}
+
+// nextAck takes up to maxAckIDs queued ids of the first recipient.
+func (m *Messenger) nextAck() (ackKey, []string, []string, bool) {
+	m.ackMu.Lock()
+	defer m.ackMu.Unlock()
+	if len(m.ackOrder) == 0 {
+		return ackKey{}, nil, nil, false
+	}
+	k := m.ackOrder[0]
+	b := m.ackq[k]
+	n := min(len(b.ids), maxAckIDs)
+	ids := slices.Clone(b.ids[:n])
+	hints := slices.Clone(b.hints)
+	if n == len(b.ids) {
+		delete(m.ackq, k)
+		m.ackOrder = m.ackOrder[1:]
+	} else {
+		b.ids = b.ids[n:]
+		m.ackOrder = append(m.ackOrder[1:], k)
+	}
+	if len(m.ackOrder) > 0 {
+		select {
+		case m.ackWake <- struct{}{}:
+		default:
+		}
+	}
+	return k, ids, hints, true
+}
+
+// ackLoop sends queued acks until ctx ends (what is left stays queued for the next Start).
+func (m *Messenger) ackLoop(ctx context.Context) {
+	for {
+		if m.paused.Load() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+				continue
+			}
+		}
+		k, ids, hints, ok := m.nextAck()
+		if !ok {
+			select {
+			case <-ctx.Done():
+				return
+			case <-m.ackWake:
+				continue
+			}
+		}
+		if _, err := m.Send(ctx, k.to, k.orderID, proto.TypeAck, proto.Ack{IDs: ids}, hints); err != nil {
+			m.log.Warn("ack failed", "ids", len(ids), "to", short(k.to), "err", err)
+		}
+		if ctx.Err() != nil {
+			return
+		}
+	}
+}
+
+// PendingAcks is the number of acks queued and not yet sent (for tests and status).
+func (m *Messenger) PendingAcks() int {
+	m.ackMu.Lock()
+	defer m.ackMu.Unlock()
+	n := 0
+	for _, b := range m.ackq {
+		n += len(b.ids)
+	}
+	return n
 }
 
 func (m *Messenger) markAcked(msg *Message) {
@@ -525,40 +836,47 @@ func (m *Messenger) markAcked(msg *Message) {
 	}
 }
 
-// handle runs the handler of one message, recovering from a panic, and marks the message handled.
-func (m *Messenger) handle(ctx context.Context, msg *Message) {
+// handle runs the handler of one message, recovering from a panic, and marks the message handled when the handler
+// returned within its time (and not because we shut down). When the handler overruns its timeout (or we shut
+// down while it runs), handle returns a channel that closes when the handler finally returns: the dispatcher keeps
+// the order busy until then (so that two handlers of one order never run at once) and frees the worker.
+func (m *Messenger) handle(ctx context.Context, msg *Message) <-chan struct{} {
 	h := m.handler(msg.Type)
 	if h == nil {
 		m.log.Debug("no handler", "type", msg.Type)
 		m.markHandled(msg)
-		return
+		return nil
 	}
 	hctx, cancel := context.WithTimeout(ctx, m.handlerTimeout)
-	defer cancel()
-	done := make(chan bool, 1)
+	finished := make(chan struct{})
 	go func() {
-		completed := false
+		defer close(finished)
+		defer cancel()
 		defer func() {
 			if r := recover(); r != nil {
 				m.log.Error("handler panicked", "type", msg.Type, "order", msg.OrderID, "from", short(msg.From), "panic", r, "stack", string(debug.Stack()))
-				completed = true // running it again would panic again
+				m.markHandled(msg) // running it again would panic again
 			}
-			done <- completed
 		}()
 		h(hctx, msg)
-		completed = true
-	}()
-	select {
-	case completed := <-done:
-		if completed {
+		if hctx.Err() == nil {
 			m.markHandled(msg)
 		}
+		// else it ran into its deadline or we are shutting down: handled again at the next start
+	}()
+	select {
+	case <-finished:
+		return nil
 	case <-hctx.Done():
-		if ctx.Err() != nil {
-			return // shutting down: handled again at the next start
+		select {
+		case <-finished:
+			return nil
+		default:
 		}
-		// the handler ignores its context; free the worker, the message is handled again at the next start
-		m.log.Error("handler timed out", "type", msg.Type, "order", msg.OrderID, "after", m.handlerTimeout)
+		if ctx.Err() == nil {
+			m.log.Error("handler timed out; its order waits until it returns", "type", msg.Type, "order", msg.OrderID, "after", m.handlerTimeout)
+		}
+		return finished
 	}
 }
 

@@ -48,6 +48,21 @@ type Outpoint struct {
 	Amount int64
 }
 
+// DustLimit is the smallest output created (sats). Outputs below it make a transaction non-standard.
+const DustLimit = 546
+
+// MinRelayFeeRate is the minimum relay fee of Bitcoin Core (sats per vbyte).
+const MinRelayFeeRate = 1
+
+// MultisigVSize estimates the virtual size of a finalized 2-of-3 spend of the escrow output with the outputs of
+// tx (DER signatures of at most 73 bytes).
+func MultisigVSize(tx *wire.MsgTx, script []byte) int64 {
+	base := int64(tx.SerializeSizeStripped())
+	// marker and flag, then the witness: item count, the empty element, two signatures, the branch byte, the script
+	witness := int64(2 + 1 + 1 + 2*(1+73) + 2 + wire.VarIntSerializeSize(uint64(len(script))) + len(script))
+	return base + (witness+3)/4
+}
+
 // NewSpend creates the unsigned PSBT that spends the escrow output along a path.
 func (e Escrow) NewSpend(prev Outpoint, outs []Output, path Path) (*psbt.Packet, error) {
 	script, err := e.Script()
@@ -77,6 +92,9 @@ func (e Escrow) NewSpend(prev Outpoint, outs []Output, path Path) (*psbt.Packet,
 	for _, o := range outs {
 		if o.Amount <= 0 {
 			continue // zero outputs are never created (§5.2)
+		}
+		if o.Amount < DustLimit {
+			return nil, fmt.Errorf("output of %d sats to %s is dust (below %d): the transaction would not relay", o.Amount, o.Address, DustLimit)
 		}
 		pk, err := PkScript(o.Address)
 		if err != nil {

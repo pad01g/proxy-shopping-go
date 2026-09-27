@@ -423,3 +423,25 @@ func TestReorgDuringSync(t *testing.T) {
 		t.Fatalf("outspend after reorg %+v (want the mempool spend)", os)
 	}
 }
+
+// TestBlockSummary serves the tip's timestamp, which browsers compare with their own clock (spec §4.5.1).
+func TestBlockSummary(t *testing.T) {
+	f := newFixture(t)
+	ix := NewIndex(f.chain, keys.BTCParams, nil)
+	if err := ix.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(ix, nil)
+	_, hash := ix.Tip()
+	var b struct {
+		ID        string `json:"id"`
+		Height    int64  `json:"height"`
+		Timestamp int64  `json:"timestamp"`
+	}
+	if code := get(t, srv, "/block/"+hash, &b); code != http.StatusOK || b.ID != hash || b.Height != 2 || b.Timestamp <= 0 {
+		t.Fatalf("block summary: %d %+v", code, b)
+	}
+	if code := get(t, srv, "/block/"+strings.Repeat("00", 32), nil); code != http.StatusNotFound {
+		t.Fatalf("unknown block: %d", code)
+	}
+}

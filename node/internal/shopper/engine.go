@@ -72,6 +72,8 @@ type Engine struct {
 	busy  sync.Map // "<job>:<order id>" → struct{}, background jobs in progress (at most one per job and order)
 	jobs  sync.WaitGroup
 	base  atomic.Pointer[context.Context] // the context of Start, for background jobs
+	// inbox returns the stored received messages of an order (the messenger's), for messages that came early
+	inbox func(orderID string) []*nostr.Event
 }
 
 // Wait waits for the background jobs that are running.
@@ -108,6 +110,7 @@ func New(d Deps) *Engine {
 		d.Shops.AllowPrivate = d.Config.AllowPrivateShops
 	}
 	m := d.Messenger
+	e.inbox = m.Inbox
 	m.Handle(proto.TypeOrderRequest, e.onRequest)
 	m.Handle(proto.TypeOrderEscrowKey, e.onEscrowKey)
 	m.Handle(proto.TypeOrderAccept, e.onAccept)

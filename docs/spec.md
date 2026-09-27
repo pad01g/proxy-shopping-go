@@ -74,7 +74,7 @@ coordinator 鍵（利用者が設定。複数可、先頭ほど優先）
 | `["v", "<整数>"]` | バージョン。**created_at ではなくこれで新旧を決める** |
 | `["network", <名前>]` | 網の名前。例 `ps-lab`（e2e）, `ps-main` |
 
-同じ `(kind, pubkey, d)` のイベントは `v` の最大のものを採る。同じ `v` が複数あれば `id` の辞書順で小さいもの。
+同じ `(kind, pubkey, d)` のイベントは `v` の最大のものを採る（`v` は通常、署名した時刻の UNIX 秒。前の版より大きくする）。リレーも置き換えを `v` で判断する（created_at では判断しない）。同じ `v` が複数あれば `id` の辞書順で小さいもの。
 
 ### 2.2 委任書 kind 30500
 
@@ -291,7 +291,7 @@ Nostr の身元（inner の署名者）と、多重署名に入れるチェー�
 ```json
 {
   "accept": true,
-  "reject_reason": "risk|region|payment|limit|unavailable|…（accept=false のとき）",
+  "reject_reason": "risk|region|payment|limit|unavailable|trust|invalid|…（accept=false のとき。trust: 組み合わせが実効の一覧に無い、invalid: 依頼の形・key_proof・住所が不正）",
   "detail": "人が読む説明",
   "expires_at": 1790000900,
   "price": {"items": {"amount": "12000", "currency": "JPY"}, "shipping": {"amount": "800", "currency": "JPY"}, "shopper_fee": {"amount": "640", "currency": "JPY"}},
@@ -369,7 +369,8 @@ shopper は 1 承認（既定）を確認してから購入する。加えて、
     "messages": [<署名付き inner> …],
     "tracking": [TrackingStatus …],
     "purchase_evidence": [Evidence …],
-    "delivery_key_for_escrow": "<order.escrow_key の key_for_escrow>"
+    "delivery_key_for_escrow": "<order.escrow_key の key_for_escrow>",
+    "text": "…（任意。dispute.evidence で補足を書くとき）"
   }
 }
 ```
@@ -385,6 +386,14 @@ escrow は **すべての証拠**（店の注文番号・配送状況・双方�
 - funded の出力（BTC の scriptPubKey）と Safe のアドレスが、request と quote から計算し直した P2WSH / Safe と一致すること。
   - Safe は、所有者・しきい値・モジュールの設定もチェーン上で確かめる。
 - 前払い手数料が §4.6 を満たすこと（使い回しは不可）。
+- **escrow が裁定の義務を負うのは**、次の 3 つを満たす注文だけ。
+  - 見積の `escrow_upfront_fee` が 0 より大きい。
+  - その値が、escrow のプロフィールの `max(bps × lock_amount, min)` 以上である。
+  - その額が §4.6 のとおり支払われている。
+- **紛争の組み立ての鍵は request の id**:
+  - 紛争（または notice）が名指す request と quote から多重署名を計算し直し、funded が名指すチェーン上の出力（Safe）と一致しないものは受けない。
+  - 捨て鍵の身元が自分の鍵で作った request は、本物の入金と一致しないので、ここで弾かれる。
+  - 一致する request が決まった後に、別の request を名指すものが届いたら、無視して記録する。
 
 ### 4.8 dispute.ruling
 
@@ -398,9 +407,19 @@ escrow は **すべての証拠**（店の注文番号・配送状況・双方�
 }
 ```
 
-- `split` の合計 = 多重署名の残高 − payout_fee_reserve。
+- `split` の合計:
+  - BTC は、多重署名の出力の額 − payout_fee_reserve。
+  - USDC は、**裁定を署名した時点の Safe の残高**。誰でも Safe に少額を送り付けられるので、lock_amount には固定しない。
+  - 連署する側は、`lock_amount ≤ 合計 ≤ いまの Safe の残高` であれば受け入れる（合計を超えて後から届いた分は Safe に残る）。
+  - release（USDC）は `lock_amount` を shopper へ transfer する。
+  - 決着の確認は「Safe の残高が lock_amount 未満になり、その tx の receipt に Safe からの Transfer がある」こと（残高 0 は求めない）。
 - `escrow_fee` ≤ `dispute_fee_bps` × （残高 − payout_fee_reserve）。
+  - BTC で `escrow_fee` が 546 sats（ダスト）未満になるときは 0 にする。
+  - user / shopper の取り分も、0 か 546 sats 以上にする（それより小さい出力はネットワークが中継しない）。
 - **escrow は 1 件の紛争に 1 回だけ裁定する**（署名済みの tx は取り消せないので、2 回目は両立しない配分を生む）。
+  - escrow は `escrow_fee` の上限を自分でも守る（上限を超える裁定は署名しない）。
+- 裁定の後に届いた `dispute.open` は、状態を裁定前に戻さない（連署の操作を隠さない）。
+- 紛争を開いたことを知る前に届いた裁定は、捨てずに保留し、紛争を知った時点（`dispute.open` の写しか、escrow からの `dispute.evidence_request`）で評価する。
 - どちらか一方の当事者が連署して放送する（2-of-3）。
 - 当事者は、開いている紛争の無い注文への裁定と、`escrow_fee` が上限を超える裁定を連署しない。
 - `dispute.countersigned` と `order.completed` を受けても、**チェーン上で多重署名の出力が使われたこと**（BTC は outspend、USDC は Safe の残高 0 と tx の receipt）を確かめるまで、状態を終わりにしない。
@@ -408,7 +427,8 @@ escrow は **すべての証拠**（店の注文番号・配送状況・双方�
 ### 4.9 大きさの上限と添付
 
 NIP-44 が暗号化できるのは 64 KiB までで、wrap の中の seal の中に inner が base64 で入るので、
-**inner（署名付きの JSON 全体）は 30000 byte 以下**にする。超えるものは送る前に拒否する。
+**inner（署名付きの JSON 全体）は 28000 byte 以下**にする。超えるものは送る前に拒否する。
+  （28700 byte を超えると、NIP-44 の埋め草で wrap の content が 65535 byte を超え、多くのリレーが保存しない。）
 
 - `Evidence.data_b64` は、元のデータが 8 KiB 以下のときだけメッセージに入れる。それより大きいものは `sha256` と `mime` だけを載せる。
 - 大きい証拠の本体（スクリーンショットなど）は、紛争のとき shopper が escrow へ `attachment` で分けて送る。
@@ -420,9 +440,29 @@ NIP-44 が暗号化できるのは 64 KiB までで、wrap の中の seal の中
 |---|---|---|
 | `attachment` | 当事者 → escrow | 上記 |
 
+§4.3 の表に加える:
+
+| type | 送り手 → 受け手 | body |
+|---|---|---|
+| `order.escrow_key` | user → shopper | `{"key_for_escrow"}`（§4.4） |
+| `attachment` | 当事者 → escrow | §4.9 |
+
 ### 4.10 受け取ったメッセージの扱い
 
 - body はスキーマで検証する（型・桁・文字列の長さ）。合わないものは捨てる。
+- inner の `o` タグは ack 以外で必須（注文の無いメッセージ、例えば report は、`o` に空でない識別子を入れる）。
+- 上限（既定値）:
+
+| 項目 | 値 |
+|---|---|
+| inner の大きさ | 28000 byte（§4.9） |
+| 送り手ごとの受信（EOSE の後） | Go 30 / 分、ブラウザ 120 / 分 |
+| 取引の相手でない送り手の全体（EOSE の後） | 60 / 分 |
+| 購読の開始時に読む保存済みの wrap | 1000 件 |
+| request の items / qty / sku | 20 件 / 1〜99 / 64 byte |
+| 受信箱のリレー | 先頭 8 個 |
+
+- 取引の相手でない送り手からの、どの役割も受け付けないメッセージは、保存も ack もしない。
 - 相手が主張しただけの状態（完了・決着・取り消し）で、T2 の返金や紛争の操作を隠さない。
 - 連署して自動で実行してよいのは、**決まった形の取引だけ**。
   - BTC:

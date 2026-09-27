@@ -1,13 +1,47 @@
 package main
 
 import (
+	"bytes"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/nbd-wtf/go-nostr"
 
 	"github.com/nbd-wtf/go-nostr/nip19"
 
 	"github.com/pad01g/proxy-shopping-go/node/internal/keys"
+	"github.com/pad01g/proxy-shopping-go/node/internal/trust"
 )
+
+// The version of a new event is above the published one, and an explicit version that is not is warned about
+// (the relays and nodes would keep the published one, §2.1).
+func TestVersionAboveThePublished(t *testing.T) {
+	var warn bytes.Buffer
+	if v := pickVersion(0, 0, 1000, &warn); v != 1000 {
+		t.Fatalf("no published version: %d", v)
+	}
+	if v := pickVersion(0, 5000, 1000, &warn); v != 5001 {
+		t.Fatalf("published version ahead of the clock: %d", v)
+	}
+	if v := pickVersion(7, 0, 1000, &warn); v != 7 || warn.Len() != 0 {
+		t.Fatalf("explicit version: %d %q", v, warn.String())
+	}
+	if v := pickVersion(3, 5000, 1000, &warn); v != 3 || !strings.Contains(warn.String(), "not above the published version 5000") {
+		t.Fatalf("stale explicit version: %d %q", v, warn.String())
+	}
+	sk := nostr.GeneratePrivateKey()
+	pk, _ := nostr.GetPublicKey(sk)
+	other := nostr.GeneratePrivateKey()
+	d1, _ := trust.NewDelegation(sk, pk, "ps-lab", 42, false, "")
+	d2, _ := trust.NewDelegation(sk, pk, "ps-lab", 99, false, "")
+	forged := *d2
+	forged.Tags = nostr.Tags{{"d", pk}, {"v", "999999"}, {"network", "ps-lab"}}
+	stranger, _ := trust.NewDelegation(other, pk, "ps-lab", 5000, false, "")
+	if v := maxVersion([]*nostr.Event{d1, d2, &forged, stranger}, trust.KindDelegation, pk, pk); v != 99 {
+		t.Fatalf("known version %d", v)
+	}
+}
 
 func TestKeysOutputAndPubkey(t *testing.T) {
 	s, err := keys.LoadMnemonicFile(filepath.Join("..", "..", "..", "lab", "keys", "relay-p2p.mnemonic"))

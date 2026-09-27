@@ -202,6 +202,13 @@ func (c *Client) sender(from common.Address) *sync.Mutex {
 
 // Send signs and sends a contract call from key; it returns the hash without waiting.
 func (c *Client) Send(ctx context.Context, key *btcec.PrivateKey, to common.Address, data []byte, value *big.Int) (common.Hash, error) {
+	return c.SendReplacing(ctx, key, to, data, value, common.Hash{})
+}
+
+// SendReplacing is Send for a transaction that takes the place of prev, sent earlier and not mined: while prev is
+// pending, the new one uses its nonce and pays at least 1/8 more tip and fee cap (nodes replace a pending
+// transaction only for a higher fee); otherwise it is sent with the next nonce.
+func (c *Client) SendReplacing(ctx context.Context, key *btcec.PrivateKey, to common.Address, data []byte, value *big.Int, prev common.Hash) (common.Hash, error) {
 	chainID, err := c.chainID(ctx)
 	if err != nil {
 		return common.Hash{}, err
@@ -213,6 +220,16 @@ func (c *Client) Send(ctx context.Context, key *btcec.PrivateKey, to common.Addr
 	nonce, err := c.Eth.PendingNonceAt(ctx, from)
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("nonce of %s: %w", from, err)
+	}
+	var minTip, minCap *big.Int
+	if prev != (common.Hash{}) {
+		if old, pending, err := c.Eth.TransactionByHash(ctx, prev); err == nil && pending {
+			if sender, err := types.Sender(types.LatestSignerForChainID(chainID), old); err == nil && sender == from {
+				nonce = old.Nonce()
+				minTip = bump(old.GasTipCap())
+				minCap = bump(old.GasFeeCap())
+			}
+		}
 	}
 	if value == nil {
 		value = new(big.Int)
@@ -229,7 +246,13 @@ func (c *Client) Send(ctx context.Context, key *btcec.PrivateKey, to common.Addr
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("latest header: %w", err)
 	}
+	if minTip != nil && tip.Cmp(minTip) < 0 {
+		tip = minTip
+	}
 	feeCap := new(big.Int).Add(tip, new(big.Int).Mul(orZero(head.BaseFee), big.NewInt(2)))
+	if minCap != nil && feeCap.Cmp(minCap) < 0 {
+		feeCap = minCap
+	}
 	tx := types.NewTx(&types.DynamicFeeTx{
 		ChainID: chainID, Nonce: nonce, GasTipCap: tip, GasFeeCap: feeCap,
 		Gas: gas + gas/5, To: &to, Value: value, Data: data,
@@ -246,6 +269,12 @@ func (c *Client) Send(ctx context.Context, key *btcec.PrivateKey, to common.Addr
 		return common.Hash{}, fmt.Errorf("send tx: %w", err)
 	}
 	return signed.Hash(), nil
+}
+
+// bump raises a fee by 1/8 (and at least 1 wei).
+func bump(v *big.Int) *big.Int {
+	out := new(big.Int).Add(v, new(big.Int).Div(v, big.NewInt(8)))
+	return out.Add(out, big.NewInt(1))
 }
 
 // Receipt returns the receipt of a mined transaction; the error wraps ethereum.NotFound while it is pending.
@@ -371,6 +400,25 @@ func (c *Client) TokenTransfers(ctx context.Context, txHash common.Hash, token c
 		return nil, fmt.Errorf("transaction %s reverted", txHash)
 	}
 	return TransfersOf(r, token), nil
+}
+
+// LastTransferFrom returns the latest successful transaction with a Transfer of token out of from (the zero
+// hash when there is none).
+func (c *Client) LastTransferFrom(ctx context.Context, token, from common.Address) (common.Hash, error) {
+	topic := ERC20ABI.Events["Transfer"].ID
+	logs, err := c.Eth.FilterLogs(ctx, ethereum.FilterQuery{
+		FromBlock: big.NewInt(0), Addresses: []common.Address{token},
+		Topics: [][]common.Hash{{topic}, {common.BytesToHash(from.Bytes())}},
+	})
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("transfer logs of %s: %w", from, err)
+	}
+	for i := len(logs) - 1; i >= 0; i-- {
+		if !logs[i].Removed {
+			return logs[i].TxHash, nil // a log exists only for a successful transaction
+		}
+	}
+	return common.Hash{}, nil
 }
 
 // TransfersOf returns the ERC-20 Transfer events of token in a receipt.

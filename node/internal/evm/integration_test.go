@@ -6,6 +6,7 @@ import (
 	"context"
 	"math/big"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/pad01g/proxy-shopping-go/node/internal/contract"
 	"github.com/pad01g/proxy-shopping-go/node/internal/evm"
 	"github.com/pad01g/proxy-shopping-go/node/internal/keys"
+	"github.com/pad01g/proxy-shopping-go/node/internal/proto"
 	"github.com/pad01g/proxy-shopping-go/node/internal/testutil"
 )
 
@@ -166,5 +168,116 @@ func TestSafeFlowsOnAnvil(t *testing.T) {
 	}
 	if got := balance(safe4); got.Sign() != 0 {
 		t.Fatalf("safe keeps %s after refund", got)
+	}
+}
+
+// TestFundingSettlementAndReplacementOnAnvil: the fund_tx of a USDC order must itself carry the lock; a Safe
+// paid out with dust left in it counts as settled by the transfer out; a stuck transaction is replaced with
+// the same nonce (second review).
+func TestFundingSettlementAndReplacementOnAnvil(t *testing.T) {
+	url := testutil.StartAnvil(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	c, err := evm.Dial(ctx, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := testutil.DeployLab(t, ctx, c)
+	user, shopper, escrow := labKey(t, "user-1"), labKey(t, "shopper-1"), labKey(t, "escrow-1")
+	for _, s := range []*keys.Set{user, shopper, escrow} {
+		testutil.Fund(t, ctx, c, d, s.EVMAddress(), 0)
+	}
+	testutil.Fund(t, ctx, c, d, user.EVMAddress(), 1_000_000_000)
+	now, _ := c.LatestTime(ctx)
+	const orderID = "404142434445464748494a4b4c4d4e4f"
+	const lock = 20_000_000
+	os := evm.NewOrderSafe(d, user.EVMAddress(), shopper.EVMAddress(), escrow.EVMAddress(), now+3600, now+7200)
+	safe, err := c.PredictSafe(ctx, d, os, orderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.DeploySafe(ctx, user.EVM, d, os, orderID); err != nil {
+		t.Fatal(err)
+	}
+	early, err := c.TransferToken(ctx, user.EVM, d.USDC, safe, big.NewInt(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, err := c.TransferToken(ctx, user.EVM, d.USDC, safe, big.NewInt(lock))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := &proto.OrderRequest{Payment: proto.AssetUSDC, UserEVMAddress: user.EVMAddress().Hex()}
+	q := &proto.OrderQuote{Accept: true, Asset: proto.AssetUSDC, LockAmount: big.NewInt(lock).String(), EscrowUpfrontFee: "0",
+		Timelock: &proto.Timelock{T1: int64(now + 3600), T2: int64(now + 7200)}, ShopperEVMAddress: shopper.EVMAddress().Hex(),
+		EscrowEVMAddress: escrow.EVMAddress().Hex(), EscrowAddress: safe.Hex()}
+	f := &proto.OrderFunded{Asset: proto.AssetUSDC, Safe: safe.Hex(), FundTx: early.TxHash.Hex()}
+	// a tiny early transfer named as the funding (the rest came later) does not date the funding
+	if _, err := contract.VerifySafeFunding(ctx, c, d, os, orderID, req, q, f, 1); !contract.IsDefinite(err) {
+		t.Fatalf("small fund_tx accepted: %v", err)
+	}
+	f.FundTx = full.TxHash.Hex()
+	if _, err := contract.VerifySafeFunding(ctx, c, d, os, orderID, req, q, f, 1); err != nil {
+		t.Fatalf("fund_tx with the lock: %v", err)
+	}
+
+	// not settled while the lock is there
+	if by, err := contract.SafeSettlement(ctx, c, d, safe, big.NewInt(lock), ""); err != nil || by != "" {
+		t.Fatalf("settled early: %s %v", by, err)
+	}
+	// a ruling pays out the balance at signing (lock + 1); one more unit arrives before it is carried out
+	nonce, _ := c.SafeNonce(ctx, safe)
+	split, _ := evm.SplitTx(d.Safe.MultiSendCallOnly, d.USDC, []evm.Transfer{
+		{To: user.EVMAddress(), Amount: big.NewInt(lock/2 + 1)}, {To: shopper.EVMAddress(), Amount: big.NewInt(lock / 2)}}, nonce)
+	h := split.Hash(d.ChainID, safe)
+	es, _ := evm.Sign(h, escrow.EVM)
+	us, _ := evm.Sign(h, user.EVM)
+	testutil.Fund(t, ctx, c, d, escrow.EVMAddress(), 1)
+	if _, err := c.TransferToken(ctx, escrow.EVM, d.USDC, safe, big.NewInt(1)); err != nil {
+		t.Fatal(err)
+	}
+	r, err := c.ExecTransaction(ctx, user.EVM, safe, split, map[common.Address][]byte{escrow.EVMAddress(): es, user.EVMAddress(): us})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bal, _ := c.BalanceOf(ctx, d.USDC, safe); bal.Int64() != 1 {
+		t.Fatalf("safe keeps %s", bal)
+	}
+	// settled: found from the logs, and from a named transaction
+	want := strings.ToLower(r.TxHash.Hex())
+	if by, err := contract.SafeSettlement(ctx, c, d, safe, big.NewInt(lock), ""); err != nil || by != want {
+		t.Fatalf("settlement from the logs: %s %v", by, err)
+	}
+	if by, err := contract.SafeSettlement(ctx, c, d, safe, big.NewInt(lock), r.TxHash.Hex()); err != nil || by != want {
+		t.Fatalf("settlement from the named tx: %s %v", by, err)
+	}
+
+	// a transaction that is not mined is replaced: same nonce, higher fee
+	if err := c.RPC.CallContext(ctx, nil, "evm_setAutomine", false); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := evm.ERC20ABI.Pack("transfer", shopper.EVMAddress(), big.NewInt(5))
+	first, err := c.Send(ctx, user.EVM, d.USDC, data, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := c.SendReplacing(ctx, user.EVM, d.USDC, data, nil, first)
+	if err != nil {
+		t.Fatalf("replacement refused: %v", err)
+	}
+	t1, _, err1 := c.Eth.TransactionByHash(ctx, first)
+	t2, _, err2 := c.Eth.TransactionByHash(ctx, second)
+	if err2 != nil || (err1 == nil && t1.Nonce() != t2.Nonce()) || second == first {
+		t.Fatalf("replacement: %v %v", err1, err2)
+	}
+	if err := c.RPC.CallContext(ctx, nil, "evm_mine"); err != nil {
+		t.Fatal(err)
+	}
+	_ = c.RPC.CallContext(ctx, nil, "evm_setAutomine", true)
+	if rr, err := c.Receipt(ctx, second); err != nil || rr.Status != 1 {
+		t.Fatalf("replacement not mined: %v", err)
+	}
+	if _, err := c.Receipt(ctx, first); err == nil {
+		t.Fatal("both transactions mined")
 	}
 }

@@ -70,6 +70,31 @@ func TestInspectAndScore(t *testing.T) {
 	if pr, ok := c.Product("A-100"); !ok || pr.Price.Amount != "3200" || c.Shipping.Amount != "800" {
 		t.Fatalf("catalog %+v", c)
 	}
+	// an HTTPS page that redirects to plain HTTP scores no TLS points, and a redirect to another host loses the
+	// allowlist points of the shop's host
+	redir := http.NewServeMux()
+	redir.HandleFunc("/down", func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, plain.URL+"/", http.StatusFound) })
+	redir.HandleFunc("/away", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, strings.Replace(plain.URL, "127.0.0.1", "localhost", 1)+"/", http.StatusFound)
+	})
+	rsrv := httptest.NewUnstartedServer(redir)
+	rsrv.TLS = tlsSrv.TLS
+	rsrv.StartTLS()
+	defer rsrv.Close()
+	info, err = trusting.Inspect(ctx, rsrv.URL+"/down")
+	if err != nil || info.CertOK {
+		t.Fatalf("https → http redirect: %+v %v", info, err)
+	}
+	if s, _ := p.Score(info); s != 80 {
+		t.Fatalf("score after a downgrade %d", s)
+	}
+	info, err = trusting.Inspect(ctx, rsrv.URL+"/away")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s, _ := p.Score(info); s != 30 || info.FinalHost != "localhost" {
+		t.Fatalf("redirect to another host: %d %+v", s, info)
+	}
 	if _, err := ParseURL("ftp://x"); err == nil || !strings.Contains(err.Error(), "bad shop url") {
 		t.Fatal("ftp accepted")
 	}
@@ -96,6 +121,8 @@ func TestPrivateShopsRefused(t *testing.T) {
 		"127.0.0.1:80": false, "10.1.2.3:80": false, "172.20.0.2:443": false, "192.168.1.1:80": false,
 		"169.254.169.254:80": false, "100.64.0.1:80": false, "0.0.0.0:80": false, "[::1]:80": false,
 		"[fe80::1]:80": false, "[fd00::1]:80": false, "[::ffff:127.0.0.1]:80": false,
+		// IPv6 prefixes that reach any IPv4 address: NAT64 and 6to4
+		"[64:ff9b::7f00:1]:80": false, "[64:ff9b:1::a00:1]:80": false, "[2002:7f00:1::1]:80": false,
 	} {
 		if err := checkPublic(addr); (err == nil) != ok {
 			t.Errorf("%s: %v", addr, err)

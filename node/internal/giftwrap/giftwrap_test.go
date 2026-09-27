@@ -70,3 +70,23 @@ func TestSealAuthorMustMatch(t *testing.T) {
 		t.Fatal("tampered inner accepted")
 	}
 }
+
+// The o tag is required on every message but an ack; NewInner gives messages without an order a random one
+// (§4.10, review 2 item 9).
+func TestOrderTagRequired(t *testing.T) {
+	aliceSK, _ := pair()
+	_, bobPK := pair()
+	inner, err := NewInner(aliceSK, bobPK, "", "report", map[string]string{}, nostr.Now())
+	if err != nil || len(OrderID(inner)) != 32 || VerifyInner(inner) != nil {
+		t.Fatalf("order-less message: o %q, err %v", OrderID(inner), err)
+	}
+	ack, _ := NewInner(aliceSK, bobPK, "", TypeAck, map[string][]string{"ids": {}}, nostr.Now())
+	if OrderID(ack) != "" || VerifyInner(ack) != nil {
+		t.Fatal("an ack needs no o tag")
+	}
+	bare := &nostr.Event{Kind: KindInner, CreatedAt: nostr.Now(), Tags: nostr.Tags{{"p", bobPK}, {"t", "chat"}}, Content: "{}"}
+	_ = bare.Sign(aliceSK)
+	if VerifyInner(bare) == nil {
+		t.Fatal("a chat without o accepted")
+	}
+}

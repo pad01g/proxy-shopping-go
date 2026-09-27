@@ -1,6 +1,7 @@
 package orders
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -34,5 +35,13 @@ func TestUnpaidOrderDoesNotShip(t *testing.T) {
 	}
 	if _, err := s.Advance(o.ID, Shipped); err != ErrNotPaid {
 		t.Fatalf("advance unpaid: %v", err)
+	}
+}
+
+func TestSoldOutFailsBeforePayment(t *testing.T) {
+	s := NewStore(time.Now)
+	_, err := s.Create(catalog.Shops()[0], []Line{{"SOLDOUT-100", 1}}, Address{"a", "b", "c", "d"}, PayCard)
+	if !errors.Is(err, ErrSoldOut) {
+		t.Fatalf("sold-out item: %v", err)
 	}
 }

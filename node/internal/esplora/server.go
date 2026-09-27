@@ -42,6 +42,7 @@ func NewServer(ix *Index, log *slog.Logger) *Server {
 	s.mux.HandleFunc("GET /blocks/tip/height", s.tipHeight)
 	s.mux.HandleFunc("GET /blocks/tip/hash", s.tipHash)
 	s.mux.HandleFunc("GET /block-height/{h}", s.blockHeight)
+	s.mux.HandleFunc("GET /block/{hash}", s.block)
 	s.mux.HandleFunc("GET /address/{a}", s.address)
 	s.mux.HandleFunc("GET /address/{a}/utxo", s.addressUTXO)
 	s.mux.HandleFunc("GET /address/{a}/txs", s.addressTxs)
@@ -110,6 +111,16 @@ func (s *Server) blockHeight(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeText(w, http.StatusOK, hash)
+}
+
+// block answers the Esplora block summary; clients read `timestamp` to compare the chain's clock with theirs.
+func (s *Server) block(w http.ResponseWriter, r *http.Request) {
+	b, ok := s.ix.Block(strings.ToLower(r.PathValue("hash")))
+	if !ok {
+		writeText(w, http.StatusNotFound, "Block not found")
+		return
+	}
+	writeJSON(w, map[string]any{"id": b.Hash, "height": b.Height, "timestamp": b.Time})
 }
 
 // addr normalizes an address of the index network or answers 400.

@@ -3,6 +3,8 @@
 package giftwrap
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,11 +20,29 @@ const (
 	KindWrap  = 1059
 )
 
-// NewInner builds and signs the inner event. body is marshaled to JSON as the content.
+// TypeAck is the one message type without an o tag (§4.10). (proto.TypeAck; giftwrap does not import proto.)
+const TypeAck = "ack"
+
+// MaxWrapContent is the largest wrap content most relays store (§4.9).
+const MaxWrapContent = 65535
+
+// NewOrderlessID returns a random identifier for the o tag of a message without an order (§4.10: the o tag is
+// required except on acks).
+func NewOrderlessID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+// NewInner builds and signs the inner event. body is marshaled to JSON as the content. A message without an order
+// (empty orderID, other than an ack) gets a random o tag (§4.10).
 func NewInner(senderSecret, recipient, orderID, typ string, body any, createdAt nostr.Timestamp) (*nostr.Event, error) {
 	content, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("marshal %s body: %w", typ, err)
+	}
+	if orderID == "" && typ != TypeAck {
+		orderID = NewOrderlessID()
 	}
 	tags := nostr.Tags{{"p", recipient}}
 	if orderID != "" {
@@ -173,6 +193,9 @@ func VerifyInner(inner *nostr.Event) error {
 	}
 	if Type(inner) == "" {
 		return errors.New("inner event has no t tag")
+	}
+	if Type(inner) != TypeAck && OrderID(inner) == "" {
+		return errors.New("inner event has no o tag (required except on acks, §4.10)")
 	}
 	return nil
 }

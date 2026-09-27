@@ -100,9 +100,65 @@ func FromEvents(evs []*nostr.Event) (*Order, error) {
 		if err := json.Unmarshal([]byte(f.Content), o.Funded); err != nil {
 			return nil, fmt.Errorf("funded: %w", err)
 		}
+		if err := CheckFundedIDs(o.Funded); err != nil {
+			return nil, fmt.Errorf("funded: %w", err)
+		}
 	}
 	return o, nil
 }
+
+// CheckFundedIDs checks the transaction ids of an order.funded: BTC txids are 64 lowercase hex, EVM hashes 0x
+// and 64 lowercase hex. One chain object has one spelling, so the one-order-per-funding records (keyed by
+// these ids) cannot be dodged by writing an id in capitals.
+func CheckFundedIDs(f *proto.OrderFunded) error {
+	if f == nil {
+		return nil
+	}
+	switch f.Asset {
+	case proto.AssetBTC:
+		for name, id := range map[string]string{"txid": f.TxID, "fee_txid": f.FeeTxID} {
+			if id != "" && !IsTxID(id) {
+				return Mismatchf("%s %.80q is not 64 lowercase hex", name, id)
+			}
+		}
+	case proto.AssetUSDC:
+		for name, id := range map[string]string{"deploy_tx": f.DeployTx, "fund_tx": f.FundTx, "fee_tx": f.FeeTx} {
+			if id != "" && !IsTxHash(id) {
+				return Mismatchf("%s %.80q is not 0x and 64 lowercase hex", name, id)
+			}
+		}
+		if f.Safe != "" && !common.IsHexAddress(f.Safe) {
+			return Mismatchf("safe %.80q is not an address", f.Safe)
+		}
+	default:
+		return Mismatchf("unknown asset %.40q", f.Asset)
+	}
+	return nil
+}
+
+// IsTxID tells whether s is a BTC txid: 64 lowercase hex.
+func IsTxID(s string) bool { return len(s) == 64 && isLowerHex(s) }
+
+// IsTxHash tells whether s is an EVM transaction hash: 0x and 64 lowercase hex.
+func IsTxHash(s string) bool { return len(s) == 66 && strings.HasPrefix(s, "0x") && isLowerHex(s[2:]) }
+
+func isLowerHex(s string) bool {
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// ReserveCap is the largest payout_fee_reserve a user client accepts for a BTC lock (§4.5):
+// min(20000 sats, max(2000 sats, 5% of the lock)).
+func ReserveCap(lock int64) int64 {
+	return min(20000, max(2000, lock/20))
+}
+
+// DustLimit is the smallest BTC output this implementation creates or accepts (sats).
+const DustLimit = btc.DustLimit
 
 // VerifyKeyProof checks the key_proof of a request (§4.4.1): the signer of the request holds the chain key it
 // puts into the multisig.
@@ -298,51 +354,71 @@ type Funding struct {
 // transaction pays the escrow fee address its upfront fee, with enough confirmations.
 func VerifyBTCFunding(ctx context.Context, chain BTCChain, esc btc.Escrow, q *proto.OrderQuote, f *proto.OrderFunded, minConf int64) (Funding, error) {
 	var out Funding
-	if f == nil || f.Asset != proto.AssetBTC || f.TxID == "" || f.Vout == nil {
-		return out, Mismatchf("funded needs txid and vout")
-	}
-	if f.FeeTxID != "" && f.FeeTxID != f.TxID {
+	if f != nil && f.FeeTxID != "" && f.FeeTxID != f.TxID {
 		return out, Mismatchf("the upfront fee must be paid in the funding transaction (fee_txid %s, txid %s)", f.FeeTxID, f.TxID)
 	}
-	addr, err := esc.Address()
-	if err != nil {
-		return out, Definite(err)
-	}
-	if q.EscrowAddress != "" && q.EscrowAddress != addr {
-		return out, Mismatchf("quoted escrow address %s differs from the script address %s", q.EscrowAddress, addr)
-	}
-	lock, err := amount.ParseInt(q.LockAmount)
-	if err != nil {
-		return out, Definite(err)
-	}
-	tx, err := chain.Tx(ctx, f.TxID)
-	if btc.IsNotFound(err) {
-		return out, ErrNotYet
-	}
+	tx, o, err := BTCEscrowOutput(ctx, chain, esc, q, f, minConf)
 	if err != nil {
 		return out, err
 	}
-	o, err := EscrowOutput(tx, *f.Vout, addr)
-	if err != nil {
+	if err := BTCFeePaid(tx, q); err != nil {
 		return out, err
-	}
-	if big.NewInt(o.Value).Cmp(lock) < 0 {
-		return out, Mismatchf("output %d locks %d sats, quote wants %s", *f.Vout, o.Value, q.LockAmount)
-	}
-	if err := btcFeePaid(tx, q); err != nil {
-		return out, err
-	}
-	conf, err := chain.Confirmations(ctx, f.TxID)
-	if err != nil {
-		return out, err
-	}
-	if conf < minConf || !tx.Status.Confirmed {
-		return out, ErrNotYet
 	}
 	return Funding{
 		Outpoint: btc.Outpoint{TxID: f.TxID, Vout: *f.Vout, Amount: o.Value}, ConfirmedAt: tx.Status.BlockTime,
 		Uses: []string{fmt.Sprintf("btc:%s:%d", f.TxID, *f.Vout), "btc-fee:" + f.TxID},
 	}, nil
+}
+
+// BTCEscrowOutput checks the escrow output an order.funded names: output vout of txid pays the P2WSH rebuilt from
+// the request and quote at least the lock amount, with minConf confirmations. It returns the funding
+// transaction (the upfront fee must be paid in it, §4.6) and the output.
+func BTCEscrowOutput(ctx context.Context, chain BTCChain, esc btc.Escrow, q *proto.OrderQuote, f *proto.OrderFunded, minConf int64) (*btc.Tx, btc.TxOut, error) {
+	if f == nil || f.Asset != proto.AssetBTC || f.TxID == "" || f.Vout == nil {
+		return nil, btc.TxOut{}, Mismatchf("funded needs txid and vout")
+	}
+	if err := CheckFundedIDs(f); err != nil {
+		return nil, btc.TxOut{}, err
+	}
+	addr, err := esc.Address()
+	if err != nil {
+		return nil, btc.TxOut{}, Definite(err)
+	}
+	if q.EscrowAddress != "" && q.EscrowAddress != addr {
+		return nil, btc.TxOut{}, Mismatchf("quoted escrow address %s differs from the script address %s", q.EscrowAddress, addr)
+	}
+	lock, err := amount.ParseInt(q.LockAmount)
+	if err != nil {
+		return nil, btc.TxOut{}, Definite(err)
+	}
+	tx, err := chain.Tx(ctx, f.TxID)
+	if btc.IsNotFound(err) {
+		return nil, btc.TxOut{}, ErrNotYet
+	}
+	if err != nil {
+		return nil, btc.TxOut{}, err
+	}
+	o, err := EscrowOutput(tx, *f.Vout, addr)
+	if err != nil {
+		return nil, btc.TxOut{}, err
+	}
+	if big.NewInt(o.Value).Cmp(lock) < 0 {
+		return nil, btc.TxOut{}, Mismatchf("output %d locks %d sats, quote wants %s", *f.Vout, o.Value, q.LockAmount)
+	}
+	if minConf < 1 {
+		minConf = 1
+	}
+	if !tx.Status.Confirmed {
+		return nil, btc.TxOut{}, ErrNotYet
+	}
+	conf, err := chain.Confirmations(ctx, f.TxID)
+	if err != nil {
+		return nil, btc.TxOut{}, err
+	}
+	if conf < minConf {
+		return nil, btc.TxOut{}, ErrNotYet
+	}
+	return tx, o, nil
 }
 
 // EscrowOutput returns output vout of tx after checking that it pays the P2WSH address of the order.
@@ -361,7 +437,8 @@ func EscrowOutput(tx *btc.Tx, vout uint32, addr string) (btc.TxOut, error) {
 	return o, nil
 }
 
-func btcFeePaid(tx *btc.Tx, q *proto.OrderQuote) error {
+// BTCFeePaid checks that tx pays escrow_btc_fee_address at least escrow_upfront_fee (§4.6). A fee of 0 passes.
+func BTCFeePaid(tx *btc.Tx, q *proto.OrderQuote) error {
 	fee, err := amount.ParseInt(q.EscrowUpfrontFee)
 	if err != nil {
 		return Mismatchf("escrow_upfront_fee: %v", err)
@@ -383,31 +460,6 @@ func btcFeePaid(tx *btc.Tx, q *proto.OrderQuote) error {
 		return Mismatchf("escrow upfront fee: %d sats paid to %s, %s due", paid, q.EscrowBTCFeeAddress, q.EscrowUpfrontFee)
 	}
 	return nil
-}
-
-// VerifyBTCFee checks the upfront fee of a BTC order the way the escrow does before it takes a case: paid in
-// the confirmed funding transaction itself. It returns the key of the fee for the one-order-per-fee check.
-func VerifyBTCFee(ctx context.Context, chain BTCChain, q *proto.OrderQuote, f *proto.OrderFunded) (string, error) {
-	if f == nil || f.TxID == "" {
-		return "", Mismatchf("no funding transaction")
-	}
-	if f.FeeTxID != "" && f.FeeTxID != f.TxID {
-		return "", Mismatchf("the upfront fee was not paid in the funding transaction")
-	}
-	tx, err := chain.Tx(ctx, f.TxID)
-	if btc.IsNotFound(err) {
-		return "", ErrNotYet
-	}
-	if err != nil {
-		return "", fmt.Errorf("fee tx: %w", err)
-	}
-	if err := btcFeePaid(tx, q); err != nil {
-		return "", err
-	}
-	if !tx.Status.Confirmed {
-		return "", ErrNotYet
-	}
-	return "btc-fee:" + f.TxID, nil
 }
 
 // CheckSafe checks that safe is the predicted Safe of the order with the owners, threshold and module
@@ -461,12 +513,19 @@ func VerifySafeFunding(ctx context.Context, c *evm.Client, d *evm.Deployments, o
 	if err != nil {
 		return out, err
 	}
-	var into bool
+	// the named transaction itself must carry the lock: a small early transfer topped up after the quote
+	// expired would otherwise date the funding before the deadline
+	into := new(big.Int)
 	for _, t := range fund.transfers {
-		into = into || t.To == safe
+		if t.To == safe {
+			into.Add(into, t.Amount)
+		}
 	}
-	if !into {
+	if into.Sign() == 0 {
 		return out, Mismatchf("fund_tx %s does not transfer USDC to the safe", f.FundTx)
+	}
+	if into.Cmp(lock) < 0 {
+		return out, Mismatchf("fund_tx %s transfers %s to the safe, the lock is %s", f.FundTx, into, lock)
 	}
 	bal, err := c.BalanceOf(ctx, d.USDC, safe)
 	if err != nil {
@@ -523,10 +582,7 @@ func confirmedTransfers(ctx context.Context, c *evm.Client, token common.Address
 	return &minedTransfers{transfers: evm.TransfersOf(r, token), blockTime: int64(h.Time)}, nil
 }
 
-func isHash(s string) bool {
-	b, err := hex.DecodeString(strings.TrimPrefix(s, "0x"))
-	return err == nil && len(b) == 32 && strings.HasPrefix(s, "0x")
-}
+func isHash(s string) bool { return IsTxHash(s) }
 
 // VerifyUSDCFee checks that fee_tx is a confirmed USDC transfer of the upfront fee from user_evm_address to the
 // escrow. It returns the key of the fee for the one-order-per-fee check ("" when no fee is due).
@@ -575,4 +631,34 @@ func sameOwners(a, b []common.Address) bool {
 		}
 	}
 	return true
+}
+
+// SafeSettlement tells whether the Safe of an order was paid out (§4.8): its USDC balance is below the lock and
+// a successful transaction moved USDC out of it. hint is a transaction a party named (may be ""); without it
+// the Transfer logs of the Safe are searched. It returns the paying transaction ("" when not settled).
+func SafeSettlement(ctx context.Context, c *evm.Client, d *evm.Deployments, safe common.Address, lock *big.Int, hint string) (string, error) {
+	bal, err := c.BalanceOf(ctx, d.USDC, safe)
+	if err != nil {
+		return "", err
+	}
+	if bal.Cmp(lock) >= 0 {
+		return "", nil
+	}
+	if IsTxHash(strings.ToLower(hint)) {
+		if r, err := c.Receipt(ctx, common.HexToHash(hint)); err == nil && r.Status == types.ReceiptStatusSuccessful {
+			for _, t := range evm.TransfersOf(r, d.USDC) {
+				if t.From == safe {
+					return strings.ToLower(hint), nil
+				}
+			}
+		}
+	}
+	hash, err := c.LastTransferFrom(ctx, d.USDC, safe)
+	if err != nil {
+		return "", err
+	}
+	if hash == (common.Hash{}) {
+		return "", nil
+	}
+	return strings.ToLower(hash.Hex()), nil
 }

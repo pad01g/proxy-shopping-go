@@ -38,7 +38,12 @@ type Config struct {
 
 type Admin struct {
 	Listen string `yaml:"listen"`
-	Token  string `yaml:"token"`
+	// Token is the bearer token of the API. Without one (possible only on a loopback listen address) the node
+	// generates one at the first start and keeps it in data_dir/admin.token.
+	Token string `yaml:"token"`
+	// Hosts are the names the API may be reached by (the Host header), besides localhost and IP addresses; any
+	// other name is refused, against DNS rebinding (e.g. the compose service name in the lab).
+	Hosts []string `yaml:"hosts"`
 }
 
 type TLS struct {
@@ -118,26 +123,32 @@ type Timelock struct {
 
 // Shopper is the policy of a shopper node.
 type Shopper struct {
-	BotURL              string   `yaml:"bot_url"`
-	Payments            []string `yaml:"payments"`
-	Currencies          []string `yaml:"currencies"`
-	CashRegions         []string `yaml:"cash_regions"`
-	Fee                 Fee      `yaml:"fee"`
-	MaxOrder            Money    `yaml:"max_order"`
-	DeliveryDays        int64    `yaml:"delivery_days"`
-	Risk                Risk     `yaml:"risk"`
-	Timelock            Timelock `yaml:"timelock"`
-	Confirmations       int64    `yaml:"confirmations"`
-	TrackingPollSeconds int      `yaml:"tracking_poll_seconds"`
-	AcceptRulings       string   `yaml:"accept_rulings"` // always | favorable
-	QuoteTTLSeconds     int64    `yaml:"quote_ttl_seconds"`
-	PayoutFeeReserve    int64    `yaml:"payout_fee_reserve_sats"`
+	BotURL        string   `yaml:"bot_url"`
+	Payments      []string `yaml:"payments"`
+	Currencies    []string `yaml:"currencies"`
+	CashRegions   []string `yaml:"cash_regions"`
+	Fee           Fee      `yaml:"fee"`
+	MaxOrder      Money    `yaml:"max_order"`
+	DeliveryDays  int64    `yaml:"delivery_days"`
+	Risk          Risk     `yaml:"risk"`
+	Timelock      Timelock `yaml:"timelock"`
+	Confirmations int64    `yaml:"confirmations"`
+	// PayoutConfirmations is how many confirmations a BTC payout of ours needs before it is final; until then
+	// it is watched and broadcast again if it drops out of the mempool. Default 3.
+	PayoutConfirmations int64  `yaml:"payout_confirmations"`
+	TrackingPollSeconds int    `yaml:"tracking_poll_seconds"`
+	AcceptRulings       string `yaml:"accept_rulings"` // always | favorable
+	QuoteTTLSeconds     int64  `yaml:"quote_ttl_seconds"`
+	PayoutFeeReserve    int64  `yaml:"payout_fee_reserve_sats"`
 	// MinT1RemainingSeconds is how long before T1 a purchase may still start (spec §4.6); with less time left
 	// the shopper offers a cooperative refund instead of buying. Default (delivery_days + 7) days.
 	MinT1RemainingSeconds int64 `yaml:"min_t1_remaining_seconds"`
 	// AllowPrivateShops lets shop_url point at loopback / private addresses (lab only, spec §4.10).
 	AllowPrivateShops bool `yaml:"allow_private_shops"`
 }
+
+// MaxDeliveryDays keeps the default T2 (delivery_days + 21 + 14 days) within the max_t2 of 120 days (§4.5.1).
+const MaxDeliveryDays = 85
 
 // MaxPayoutFeeReserve is the upper bound of payout_fee_reserve that user clients accept (spec §4.5).
 const MaxPayoutFeeReserve = 20000
@@ -200,6 +211,9 @@ func (c *Config) defaults() {
 		if s.Confirmations <= 0 {
 			s.Confirmations = 1
 		}
+		if s.PayoutConfirmations <= 0 {
+			s.PayoutConfirmations = 3
+		}
 		if s.TrackingPollSeconds <= 0 {
 			s.TrackingPollSeconds = 60
 		}
@@ -247,6 +261,16 @@ func (c *Config) validate() error {
 	if c.Admin.Listen != "" && c.Admin.Token == "" && !loopbackListen(c.Admin.Listen) {
 		return fmt.Errorf("config: admin.token is required when admin.listen %q is not a loopback address", c.Admin.Listen)
 	}
+	// §2.4: an empty coordinator list trusts nothing, so such a node could never find a shopper, escrow or
+	// operator (nor gossip anything). Only a p2p relay, which forwards every valid event, runs without one.
+	if c.Role != RoleRelay && len(c.Trust.Coordinators) == 0 {
+		return fmt.Errorf("config: trust.coordinators is required for role %s (an empty list trusts nothing, spec §2.4)", c.Role)
+	}
+	for _, pk := range c.Trust.Coordinators {
+		if !isPubKey(pk) {
+			return fmt.Errorf("config: trust.coordinators: %q is not a hex public key", pk)
+		}
+	}
 	switch c.P2P.Reachability {
 	case "auto", "public", "private":
 	default:
@@ -265,6 +289,10 @@ func (c *Config) validate() error {
 			return fmt.Errorf("config: shopper.accept_rulings must be always or favorable, not %q", c.Shopper.AcceptRulings)
 		}
 		s := c.Shopper
+		// the default T2 is delivery_days + 35 days away, and user clients refuse a T2 beyond 120 days (§4.5.1)
+		if s.DeliveryDays > MaxDeliveryDays {
+			return fmt.Errorf("config: shopper.delivery_days %d exceeds %d (the timelocks would exceed the 120 days users accept)", s.DeliveryDays, MaxDeliveryDays)
+		}
 		if s.Timelock.BTCT1Blocks >= s.Timelock.BTCT2Blocks || s.Timelock.EVMT1Seconds >= s.Timelock.EVMT2Seconds {
 			return errors.New("config: shopper timelocks need t1 < t2")
 		}
@@ -281,6 +309,19 @@ func (c *Config) validate() error {
 		return errors.New("config: role escrow needs an escrow section")
 	}
 	return nil
+}
+
+// isPubKey tells whether s is a Nostr public key: 64 lowercase hex characters.
+func isPubKey(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // loopbackListen tells whether a listen address only accepts local connections.

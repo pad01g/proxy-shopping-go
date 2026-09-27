@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import type { PurchaseRequest, PurchaseResult } from "./types.js";
 
@@ -25,6 +25,9 @@ export interface PurchaseRecord {
 /**
  * One JSON file per request_id under <dir>/purchases, written atomically
  * (temp file + rename), so a crash leaves either the old or the new record.
+ * The file is synced before the rename and the directory after it: a record
+ * that says "payment_submitted" must survive a power loss, or a retry after
+ * the restart would buy again.
  */
 export class PurchaseStore {
   private readonly dir: string;
@@ -53,8 +56,29 @@ export class PurchaseStore {
   put(rec: PurchaseRecord): void {
     const path = this.path(rec.request_id);
     const tmp = `${path}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify(rec), { mode: 0o600 });
+    const fd = openSync(tmp, "w", 0o600);
+    try {
+      writeSync(fd, JSON.stringify(rec));
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
     renameSync(tmp, path);
+    syncDir(this.dir);
+  }
+}
+
+/** fsync of a directory, so that a rename in it is durable (not supported on every platform). */
+function syncDir(dir: string): void {
+  let fd: number | undefined;
+  try {
+    fd = openSync(dir, "r");
+    fsyncSync(fd);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "EISDIR" && code !== "EPERM" && code !== "EINVAL" && code !== "EBADF") throw err;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
 }
 

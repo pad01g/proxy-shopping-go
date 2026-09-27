@@ -82,6 +82,14 @@ type Order struct {
 	// ClaimedPayout is a payout transaction the user told us about (dispute.countersigned). It is only believed
 	// once the chain shows the escrow spent by it.
 	ClaimedPayout string `json:"claimed_payout,omitempty"`
+	// Donation is the donation of the list the order was quoted under (§2.3), fixed at quote time.
+	Donation *Donation `json:"donation,omitempty"`
+	// RulingDecided: the stored ruling was looked at with the dispute known (countersign pending, or declined).
+	RulingDecided bool `json:"ruling_decided,omitempty"`
+	// FundingExpired: the funding did not confirm in time; a funding that still confirms is given back.
+	FundingExpired bool `json:"funding_expired,omitempty"`
+	// NextFundingCheck paces the checks of a funding that did not confirm in time.
+	NextFundingCheck int64 `json:"next_funding_check,omitempty"`
 
 	PayoutTx string  `json:"payout_tx,omitempty"`
 	PayoutBy string  `json:"payout_by,omitempty"` // release | ruling | timelock | other
@@ -101,10 +109,20 @@ const (
 type Action struct {
 	Event    *nostr.Event `json:"event,omitempty"` // the message that asked for it (order.release, dispute.ruling)
 	Tx       string       `json:"tx,omitempty"`    // the transaction sent for it, while not known to be final
+	Raw      string       `json:"raw,omitempty"`   // BTC: the signed transaction, to broadcast again if it drops out
+	Stuck    string       `json:"stuck,omitempty"` // EVM: a sent transaction not mined in time, to be replaced
 	Sent     int64        `json:"sent,omitempty"`
 	Since    int64        `json:"since"`
 	Attempts int          `json:"attempts,omitempty"`
+	Next     int64        `json:"next,omitempty"` // not tried again before this time
 	Error    string       `json:"error,omitempty"`
+}
+
+// Donation is the donation of a list (§2.3), with bps capped at 1%.
+type Donation struct {
+	BTCAddress string `json:"btc_address,omitempty"`
+	EVMAddress string `json:"evm_address,omitempty"`
+	BPS        int64  `json:"bps"`
 }
 
 func (o *Order) addPending(kind string, a *Action) {
@@ -136,6 +154,8 @@ const (
 	bucketUses = "funding_uses"
 	// bucketEvidence keeps the full purchase evidence (screenshots) out of the order document.
 	bucketEvidence = "purchase_evidence"
+	// bucketTrackingEvidence keeps the full evidence of the tracking updates (by order id).
+	bucketTrackingEvidence = "tracking_evidence"
 )
 
 func (o *Order) set(state, detail string) {

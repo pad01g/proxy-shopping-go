@@ -106,11 +106,18 @@ func Validate(ev *nostr.Event) error {
 			return fmt.Errorf("bad revoked tag %q", r)
 		}
 	case KindList:
-		if Tag(ev, "d") == "" {
+		d := Tag(ev, "d")
+		if d == "" {
 			return errors.New("list without d")
 		}
-		if _, err := ParseList(ev); err != nil {
+		l, err := ParseList(ev)
+		if err != nil {
 			return err
+		}
+		// §2.3: d is the network; the network tag and the content must name the same one, or a list could count
+		// in one network while it says another
+		if Tag(ev, "network") != d || l.Network != d {
+			return fmt.Errorf("list network differs: d %q, network tag %q, content %q", d, Tag(ev, "network"), l.Network)
 		}
 	case KindShopperProfile, KindEscrowProfile:
 		if Tag(ev, "d") == "" {

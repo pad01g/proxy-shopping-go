@@ -2,11 +2,20 @@ package node
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
+	"mime"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -14,6 +23,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/nbd-wtf/go-nostr"
 
+	"github.com/pad01g/proxy-shopping-go/node/internal/config"
 	"github.com/pad01g/proxy-shopping-go/node/internal/escrow"
 	"github.com/pad01g/proxy-shopping-go/node/internal/shopper"
 )
@@ -30,22 +40,125 @@ func writeError(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, map[string]string{"error": err.Error()})
 }
 
-func (n *Node) auth(next http.Handler) http.Handler {
-	token := n.cfg.Admin.Token
+// AdminTokenFile is the file in data_dir holding the generated admin token.
+const AdminTokenFile = "admin.token"
+
+// adminToken returns the configured token, or the one generated at the first start into data_dir/admin.token.
+func adminToken(cfg *config.Config, log *slog.Logger) (string, error) {
+	if cfg.Admin.Token != "" || cfg.Admin.Listen == "" {
+		return cfg.Admin.Token, nil
+	}
+	path := filepath.Join(cfg.DataDir, AdminTokenFile)
+	if data, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(data))) >= 32 {
+		return strings.TrimSpace(string(data)), nil
+	}
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	token := hex.EncodeToString(b[:])
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
+		return "", fmt.Errorf("admin token: %w", err)
+	}
+	if err := os.WriteFile(path, []byte(token+"\n"), 0o600); err != nil {
+		return "", fmt.Errorf("admin token: %w", err)
+	}
+	log.Warn("admin.token is not configured: generated one; send it as Authorization: Bearer <token>", "file", path)
+	return token, nil
+}
+
+// guard protects the admin API against other web pages in the operator's browser (CSRF, DNS rebinding): the Host
+// must be localhost, an IP address or one of admin.hosts; a cross-origin Origin is refused; POST bodies must be
+// JSON; and every request but GET /healthz needs the bearer token.
+func (n *Node) guard(next http.Handler) http.Handler {
+	token := n.adminToken
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if token != "" {
-			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
-				writeError(w, http.StatusUnauthorized, errors.New("bearer token required"))
+		if r.URL.Path == "/healthz" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !n.allowedHost(r.Host) {
+			writeError(w, http.StatusForbidden, errors.New("host not allowed (admin.hosts)"))
+			return
+		}
+		if o := r.Header.Get("Origin"); o != "" && !sameOrigin(o, r.Host) {
+			writeError(w, http.StatusForbidden, errors.New("cross-origin requests are not allowed"))
+			return
+		}
+		if r.Method == http.MethodPost {
+			if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
+				writeError(w, http.StatusUnsupportedMediaType, errors.New("Content-Type must be application/json"))
 				return
 			}
+		}
+		got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if token == "" || !ok || subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+			writeError(w, http.StatusUnauthorized, errors.New("bearer token required"))
+			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
+func (n *Node) allowedHost(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.TrimSuffix(strings.Trim(host, "[]"), "."))
+	if host == "localhost" || net.ParseIP(host) != nil {
+		return true // an IP address cannot be rebound to another server
+	}
+	for _, h := range n.cfg.Admin.Hosts {
+		if strings.EqualFold(strings.TrimSuffix(h, "."), host) {
+			return true
+		}
+	}
+	return false
+}
+
+// sameOrigin tells whether an Origin header names the host the request was sent to.
+func sameOrigin(origin, host string) bool {
+	u, err := url.Parse(origin)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && strings.EqualFold(u.Host, host)
+}
+
+func (n *Node) handleHealthz(w http.ResponseWriter, _ *http.Request) {
+	if !n.started.Load() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "role": n.cfg.Role})
+}
+
+// handlePause is POST /admin/pause {"seconds": n}: the node stops its message traffic and tick loops for n seconds
+// (Node.Pause). POST /admin/resume ends the pause.
+func (n *Node) handlePause(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Seconds int64 `json:"seconds"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<12)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	until, err := n.Pause(time.Duration(req.Seconds) * time.Second)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"paused": true, "paused_until": until.Unix()})
+}
+
+func (n *Node) handleResume(w http.ResponseWriter, _ *http.Request) {
+	was := n.Resume()
+	writeJSON(w, http.StatusOK, map[string]any{"paused": false, "was_paused": was})
+}
+
 func (n *Node) adminHandler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", n.handleHealthz)
+	mux.HandleFunc("POST /admin/pause", n.handlePause)
+	mux.HandleFunc("POST /admin/resume", n.handleResume)
 	mux.HandleFunc("GET /status", n.handleStatus)
 	mux.HandleFunc("GET /trust", n.handleTrust)
 	mux.HandleFunc("POST /events", n.handleEvents)
@@ -62,7 +175,7 @@ func (n *Node) adminHandler() http.Handler {
 	case n.operator != nil:
 		mux.HandleFunc("GET /reports", n.handleReports)
 	}
-	return n.auth(mux)
+	return n.guard(mux)
 }
 
 // Status is GET /status.
@@ -79,6 +192,7 @@ type Status struct {
 	P2PRelays    []string         `json:"p2p_relays"`
 	Peers        []string         `json:"peers"`
 	Pending      int              `json:"pending_messages"`
+	PausedUntil  int64            `json:"paused_until,omitempty"` // POST /admin/pause
 }
 
 func (n *Node) status() Status {
@@ -90,6 +204,9 @@ func (n *Node) status() Status {
 	}
 	if n.msgr != nil {
 		st.Pending = len(n.msgr.Pending())
+	}
+	if t := n.PausedUntil(); !t.IsZero() {
+		st.PausedUntil = t.Unix()
 	}
 	return st
 }

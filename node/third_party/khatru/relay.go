@@ -76,6 +76,10 @@ type Relay struct {
 	OverwriteResponseEvent    []func(ctx context.Context, event *nostr.Event)
 	PreventBroadcast          []func(ws *WebSocket, event *nostr.Event) bool
 
+	// RejectMessage is asked for every frame a client sends, before it is parsed and before any signature is
+	// verified (proxy-shopping: a per-connection frame rate limit). A rejected frame is answered with a NOTICE.
+	RejectMessage []func(ctx context.Context) bool
+
 	// these are used when this relays acts as a router
 	routes                []Route
 	getSubRelayFromEvent  func(*nostr.Event) *Relay // used for handling EVENTs

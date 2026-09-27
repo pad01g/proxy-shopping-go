@@ -88,7 +88,9 @@ export const scenarios: Scenario[] = [
         Object.values((await admin('escrow-1').case(o.id)).attachments ?? {}).find((a) => a.mime === 'image/png' && a.data_b64));
       log(`screenshot attachment assembled: ${Math.round((shot.data_b64!.length * 3) / 4 / 1024)} KiB`);
       const lock = BigInt(o.quote!.lock_amount!) - BigInt(o.quote!.payout_fee_reserve ?? '0');
-      const fee = (lock * 200n) / 10_000n;
+      // 紛争手数料は 2%。BTC ではダスト（546 sats 未満）になるなら 0（§4.8）
+      const pct = (lock * 200n) / 10_000n;
+      const fee = pct < 546n ? 0n : pct;
       await admin('escrow-1').rule(o.id, { user: String(lock - fee), shopper: '0', reason: '配送失敗のため全額返金' });
       await waitOrder(user, o.id, 'ruled');
       const problems = await user.reviewRuling(o.id);
@@ -163,7 +165,7 @@ export const scenarios: Scenario[] = [
   },
   {
     id: 'e',
-    title: 'NAT: NAT の内側のブラウザが公開の Web 画面から注文し、NAT の内側の escrow には libp2p の relay 経由で届く',
+    title: 'NAT: NAT の内側のブラウザが公開の Web 画面から注文する（1 対 1 のメッセージは Nostr）。NAT の内側の escrow ノードへは libp2p の circuit relay で問い合わせが届く',
     async run({ log }) {
       const nat = await admin('escrow-nat').status();
       assert(nat.reachability === 'private', `escrow-nat reachability ${nat.reachability}`);
@@ -222,7 +224,7 @@ export const scenarios: Scenario[] = [
     async run({ users, log }) {
       const user = users['user-2'];
       const o = await requestQuote(user, { shopUrl: SAFE_SHOP, region: SHINJUKU, sku: 'A-200', payment: 'usdc-evm', shopper: 'shopper-2', escrow: 'escrow-1' });
-      await stopService('shopper-2');
+      await pauseService('shopper-2', 600);
       try {
         await user.acceptQuote(o.id);
         await user.fund(o.id);
@@ -234,30 +236,95 @@ export const scenarios: Scenario[] = [
         assert(back === BigInt(o.quote!.lock_amount!), `refund ${back} vs lock ${o.quote!.lock_amount}`);
         log(`T2=${o.quote!.timelock!.t2}: user-2 refunded ${back} alone, tx ${r.refundTxid}`);
       } finally {
-        await startService('shopper-2');
+        await resumeService('shopper-2');
+      }
+    },
+  },
+  {
+    id: 'i',
+    title: '誠実な escrow による USDC の紛争: 配達失敗 → 裁定で返金 → 利用者が連署。裁定の前に誰かが Safe に 1 単位送り付けても執行できる',
+    async run({ users, log }) {
+      const user = users['user-1'];
+      const o = await placeFunded(user, { shopUrl: SAFE_SHOP, region: SHINJUKU, sku: 'FAIL-100', payment: 'usdc-evm', shopper: 'shopper-1', escrow: 'escrow-1' }, 'delivery_failed');
+      await user.openDispute(o.id, { claim: 'not_delivered', text: '配送に失敗しました' });
+      await until('escrow-1 case open', 60_000, async () => (await admin('escrow-1').case(o.id)).state === 'open');
+      // 攻撃: Safe のアドレスは誰でも計算できるので、1 単位送り付けて合計を狂わせようとする
+      const safe = (o.funded as { safe: `0x${string}` }).safe;
+      const griefer = (await startUser('faucet')).s;
+      await faucet.evm(griefer.keys.evmAddress, '1');
+      await griefer.evm!.transferUsdc(safe, 1n);
+      griefer.stop();
+      const lock = BigInt(o.quote!.lock_amount!);
+      const total = lock + 1n; // 裁定は署名した時点の残高を分ける（§4.8）
+      const fee = (total * 200n) / 10_000n;
+      await admin('escrow-1').rule(o.id, { user: String(total - fee), shopper: '0', reason: '配送失敗のため返金' });
+      await waitOrder(user, o.id, 'ruled');
+      const problems = await user.reviewRuling(o.id);
+      assert(problems.length === 0, `ruling review: ${problems.join('; ')}`);
+      const before = await usdcOf('user-1');
+      await user.countersignRuling(o.id);
+      const back = (await usdcOf('user-1')) - before;
+      assert(back === total - fee, `refund ${back}, want ${total - fee}`);
+      await waitOrder(user, o.id, 'settled');
+      log(`USDC dispute ${o.id.slice(0, 8)}: refunded ${back} (escrow fee ${fee}) despite 1 unit of dust`);
+    },
+  },
+  {
+    id: 'j',
+    title: '買えなかった注文: 店が在庫切れ → shopper が協力的な払い戻しを申し出る → 利用者が確かめて受け入れる（BTC）',
+    async run({ users, log }) {
+      const user = users['user-2'];
+      const o = await placeFunded(user, { shopUrl: SAFE_SHOP, region: SHINJUKU, sku: 'SOLDOUT-100', payment: 'btc-signet', shopper: 'shopper-1', escrow: 'escrow-1' }, 'funded');
+      const so = await waitShopper('shopper-1', o.id, ['purchase_failed', 'needs_human', 'cancelled'], 120_000);
+      if (so.state === 'needs_human') await admin('shopper-1').resolve(o.id, { action: 'refund' });
+      const offered = await until('refund offer reaches the user', 90_000, async () => {
+        const x = await user.getOrder(o.id);
+        return x?.refundOffer ? x : undefined;
+      });
+      const problems = await user.reviewRefundOffer(o.id);
+      assert(problems.length === 0, `refund offer: ${problems.join('; ')}`);
+      const done = await user.acceptRefundOffer(o.id);
+      const txid = done.refundTxid ?? done.settledTxid;
+      assert(txid, 'refund txid');
+      const got = await paidTo(txid, o.request.user_btc_address!);
+      const want = BigInt(o.quote!.lock_amount!) - BigInt(o.quote!.payout_fee_reserve ?? '0');
+      assert(got >= want - 1000n, `refunded ${got}, want about ${want}`);
+      log(`sold out ${offered.id.slice(0, 8)}: shopper ${so.state}, cooperative refund ${got} sats`);
+    },
+  },
+  {
+    id: 'k',
+    title: 'タイムロック T2（BTC）: shopper が消えたら、T2 を過ぎた後に利用者が単独で取り戻す',
+    async run({ users, log }) {
+      const user = users['user-2'];
+      const q = await requestQuote(user, { shopUrl: SAFE_SHOP, region: SHINJUKU, sku: 'A-100', payment: 'btc-signet', shopper: 'shopper-2', escrow: 'escrow-1' });
+      await pauseService('shopper-2', 600);
+      try {
+        await acceptAndFund(user, q, 'funded');
+        const t2 = q.quote!.timelock!.t2;
+        let failedEarly = false;
+        try {
+          await user.refundAfterTimelock(q.id);
+        } catch {
+          failedEarly = true;
+        }
+        assert(failedEarly, 'refund before T2 must fail');
+        const { btc } = await faucet.height();
+        await faucet.mine(t2 - btc + 1);
+        const r = await user.refundAfterTimelock(q.id);
+        const got = await paidTo(r.refundTxid!, q.request.user_btc_address!);
+        log(`T2=${t2}: user-2 refunded ${got} sats alone, tx ${r.refundTxid}`);
+      } finally {
+        await resumeService('shopper-2');
       }
     },
   },
 ];
 
-// shopper-2 を「消す」: compose の外から止められないので、docker の API を使う（runner に socket を渡している）
-async function docker(path: string, method = 'POST'): Promise<void> {
-  const { request } = await import('node:http');
-  await new Promise<void>((resolve, reject) => {
-    const req = request({ socketPath: '/var/run/docker.sock', path, method }, (res) => {
-      res.resume();
-      res.on('end', () => ((res.statusCode ?? 500) < 400 ? resolve() : reject(new Error(`docker ${path}: ${res.statusCode}`))));
-    });
-    req.on('error', reject);
-    req.end();
-  });
+// shopper を「消す」: 管理 API で、ノードのメッセージの送受信と定期処理を止める（libp2p は動いたまま）
+async function pauseService(service: string, seconds: number) {
+  await admin(service).pause(seconds);
 }
-const container = (service: string) => `${process.env.COMPOSE_PROJECT ?? 'pslab'}-${service}-1`;
-async function stopService(service: string) {
-  await docker(`/containers/${container(service)}/stop`);
+async function resumeService(service: string) {
+  await admin(service).resume();
 }
-async function startService(service: string) {
-  await docker(`/containers/${container(service)}/start`);
-  await until(`${service} back`, 60_000, async () => !!(await admin(service).status()).pubkey);
-}
-

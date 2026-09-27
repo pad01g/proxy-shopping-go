@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -23,8 +24,17 @@ import (
 const (
 	DefaultIdleTimeout    = 5 * time.Minute
 	DefaultPublishTimeout = 15 * time.Second
-	connectTimeout        = 10 * time.Second
+	// DefaultMaxConns caps the open relay connections of a pool (relays named by peers included).
+	DefaultMaxConns = 64
+	connectTimeout  = 10 * time.Second
+	// MaxQueryEvents caps the events one relay may return to a query (the filter's limit when smaller).
+	MaxQueryEvents = 5000
+	// stableSubscription: a subscription that lasted this long resets the reconnect backoff.
+	stableSubscription = time.Minute
 )
+
+// ErrTooManyConns is returned when the pool holds its maximum of connections and none is idle.
+var ErrTooManyConns = errors.New("too many relay connections")
 
 // ErrPrivateAddress is returned for relays on loopback, link-local or private addresses when they are not allowed.
 var ErrPrivateAddress = errors.New("relay address is loopback, link-local or private")
@@ -40,6 +50,9 @@ type Options struct {
 	IdleTimeout time.Duration
 	// PublishTimeout bounds the wait for one relay's OK (default 15 seconds); the caller's context may end it sooner.
 	PublishTimeout time.Duration
+	// MaxConns caps the open connections (default DefaultMaxConns). At the cap, idle connections are closed to
+	// make room; without an idle one a new relay is refused with ErrTooManyConns.
+	MaxConns int
 }
 
 // Pool is a set of relay connections sharing one TLS configuration.
@@ -71,6 +84,9 @@ func NewPoolWith(o Options) *Pool {
 	}
 	if o.PublishTimeout <= 0 {
 		o.PublishTimeout = DefaultPublishTimeout
+	}
+	if o.MaxConns <= 0 {
+		o.MaxConns = DefaultMaxConns
 	}
 	d := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
 	if !o.AllowPrivate {
@@ -107,6 +123,28 @@ func IsPrivateAddr(a netip.Addr) bool {
 
 var cgnat = netip.MustParsePrefix("100.64.0.0/10")
 
+// Allowed tells whether the pool would connect to a relay URL as far as the URL shows: a ws / wss URL with a host,
+// and — unless private addresses are allowed — not localhost or a literal private address. Names are checked
+// again when the socket connects. Callers filter relay lists with it before taking the first few (§4.10), so that
+// unusable entries do not use up the places.
+func (p *Pool) Allowed(rawURL string) bool {
+	pu, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || (pu.Scheme != "ws" && pu.Scheme != "wss") || pu.Hostname() == "" {
+		return false
+	}
+	if p.opts.AllowPrivate {
+		return true
+	}
+	host := strings.ToLower(strings.TrimSuffix(pu.Hostname(), "."))
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return false
+	}
+	if a, err := netip.ParseAddr(host); err == nil && IsPrivateAddr(a) {
+		return false
+	}
+	return true
+}
+
 // relay returns a live connection, dialing it if needed. Concurrent callers for one URL share one dial, so a
 // connection is never closed while it is still being set up.
 func (p *Pool) relay(ctx context.Context, rawURL string) (*conn, error) {
@@ -133,6 +171,18 @@ func (p *Pool) relay(ctx context.Context, rawURL string) (*conn, error) {
 				return nil, ctx.Err()
 			}
 		}
+		if len(p.conns)+len(p.dials) >= p.opts.MaxConns {
+			idle := p.makeRoomLocked()
+			full := len(p.conns)+len(p.dials) >= p.opts.MaxConns
+			p.mu.Unlock()
+			if idle != nil {
+				idle.close(errors.New("closed to make room"))
+			}
+			if full {
+				return nil, fmt.Errorf("connect %s: %w (%d)", u, ErrTooManyConns, p.opts.MaxConns)
+			}
+			continue
+		}
 		done := make(chan struct{})
 		p.dials[u] = done
 		p.mu.Unlock()
@@ -158,6 +208,29 @@ func (p *Pool) relay(ctx context.Context, rawURL string) (*conn, error) {
 		}
 		return c, nil
 	}
+}
+
+// makeRoomLocked drops a dead connection, or the connection idle for the longest time, from the map and returns
+// it for closing (nil when every connection is in use). p.mu is held.
+func (p *Pool) makeRoomLocked() *conn {
+	var victim string
+	var oldest time.Time
+	for u, c := range p.conns {
+		if !c.alive() {
+			victim = u
+			break
+		}
+		since := c.idleSince()
+		if !since.IsZero() && (victim == "" || since.Before(oldest)) {
+			victim, oldest = u, since
+		}
+	}
+	if victim == "" {
+		return nil
+	}
+	c := p.conns[victim]
+	delete(p.conns, victim)
+	return c
 }
 
 // Close closes all connections.
@@ -307,8 +380,8 @@ func (p *Pool) keepSubscribed(ctx context.Context, url string, filters nostr.Fil
 			backoff = min(backoff*2, 30*time.Second)
 			continue
 		}
-		backoff = time.Second
 		p.log.Debug("subscribed", "relay", url)
+		started := time.Now()
 	loop:
 		for {
 			select {
@@ -321,8 +394,14 @@ func (p *Pool) keepSubscribed(ctx context.Context, url string, filters nostr.Fil
 				return
 			}
 		}
-		p.log.Debug("subscription ended, reconnecting", "relay", url, "err", sub.err)
+		// a relay closing the subscription at once (CLOSED: rate limited, refused filter) is retried with a growing
+		// delay; only a subscription that lasted resets it
+		if time.Since(started) >= stableSubscription {
+			backoff = time.Second
+		}
+		p.log.Debug("subscription ended, reconnecting", "relay", url, "err", sub.err, "in", backoff)
 		sleep(ctx, backoff)
+		backoff = min(backoff*2, 30*time.Second)
 	}
 }
 

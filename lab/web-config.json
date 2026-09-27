@@ -31,5 +31,6 @@
     "btc_max_t2_blocks": 1000,
     "evm_max_t2_seconds": 86400
   },
-  "allow_private_endpoints": true
+  "allow_private_endpoints": true,
+  "max_clock_skew_seconds": 315360000
 }

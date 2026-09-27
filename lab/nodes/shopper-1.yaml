@@ -3,7 +3,7 @@ name: shopper-1
 network: ps-lab
 mnemonic_file: /keys/shopper-1.mnemonic
 data_dir: /data
-admin: {listen: "0.0.0.0:8080", token: "lab"}
+admin: {listen: "0.0.0.0:8080", token: "lab", hosts: [shopper-1]}   # hosts: the compose service name the runner uses
 tls: {extra_ca: /caddy-data/caddy/pki/authorities/local/root.crt}
 nostr:
   relays: ["wss://relay-1.test", "wss://relay-2.test"]
@@ -34,6 +34,7 @@ shopper:
   risk: {allowlist: [safe-shop.test, us-shop.test, cash-store.test], known_gateways: [cardgw.test], threshold: 70}
   timelock: {btc_t1_blocks: 100, btc_t2_blocks: 150, evm_t1_seconds: 3600, evm_t2_seconds: 7200}
   confirmations: 1
+  payout_confirmations: 1   # lab: the faucet mines only when the mempool has transactions, so 3 would never come
   tracking_poll_seconds: 2
   accept_rulings: always
   # lab: T1 is an hour away and the shops are on the private lab network

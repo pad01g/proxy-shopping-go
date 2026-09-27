@@ -45,6 +45,7 @@ export const pk = (name: LabName) => keys(name).nostrPublicKey;
 /** 利用者のブラウザと同じ設定（lab/web-config.json を runner に焼き込んだもの） */
 export const LAB_WEB_CONFIG = JSON.parse(readFileSync(new URL('../../lab/web-config.json', import.meta.url), 'utf8')) as {
   timelock_policy: Record<string, number>;
+  max_clock_skew_seconds: number;
 };
 
 export function deployments(): Deployments {
@@ -69,6 +70,8 @@ export function session(name: LabName, opts: { rates?: RateSource[]; coordinator
       coordinators: opts.coordinators ?? [pk('coordinator-1'), pk('coordinator-2')],
       retryIntervalMs: 3000,
       timelockPolicy: LAB_WEB_CONFIG.timelock_policy,
+      maxClockSkewSeconds: LAB_WEB_CONFIG.max_clock_skew_seconds,
+      allowPrivateEndpoints: true,
     },
     chain: new EsploraClient(ESPLORA),
     evm: new EvmClient(d.chain_id, EVM_RPC, k.evmAccount, d),
@@ -123,6 +126,9 @@ export function admin(host: string) {
     case: (id: string) => request<EscrowCase>('GET', `${base}/cases/${id}`, undefined, auth),
     rule: (id: string, split: { user: string; shopper: string; reason: string }) => request<unknown>('POST', `${base}/cases/${id}/rule`, split, auth),
     reports: () => request<OperatorReport[]>('GET', `${base}/reports`, undefined, auth),
+    pause: (seconds: number) => request<unknown>('POST', `${base}/admin/pause`, { seconds }, auth),
+    resume: () => request<unknown>('POST', `${base}/admin/resume`, {}, auth),
+    resolve: (id: string, body: { action: 'refund' | 'purchased'; shop_order_id?: string }) => request<unknown>('POST', `${base}/orders/${id}/resolve`, body, auth),
   };
 }
 

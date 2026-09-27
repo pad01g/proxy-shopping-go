@@ -68,6 +68,7 @@ func main() {
 	name := flag.String("name", env("PSRELAY_NAME", "psrelay"), "NIP-11 name")
 	events := flag.Int("events-per-minute", envInt("PSRELAY_EVENTS_PER_MINUTE", relay.DefaultEventsPerMinute), "events per client address and minute (-1: no limit)")
 	connEvents := flag.Int("conn-events-per-minute", envInt("PSRELAY_CONN_EVENTS_PER_MINUTE", relay.DefaultConnEventsPerMinute), "events per connection and minute (-1: no limit)")
+	connMsgs := flag.Int("conn-messages-per-minute", envInt("PSRELAY_CONN_MESSAGES_PER_MINUTE", relay.DefaultConnMessagesPerMinute), "frames of any kind per connection and minute, counted before signatures are checked (-1: no limit)")
 	reqs := flag.Int("reqs-per-minute", envInt("PSRELAY_REQS_PER_MINUTE", relay.DefaultReqsPerMinute), "REQ filters per client address and minute (-1: no limit)")
 	conns := flag.Int("conns-per-minute", envInt("PSRELAY_CONNS_PER_MINUTE", relay.DefaultConnsPerMinute), "new connections per client address and minute (-1: no limit)")
 	maxSubs := flag.Int("max-subscriptions", envInt("PSRELAY_MAX_SUBSCRIPTIONS", relay.DefaultMaxSubscriptions), "open subscriptions per connection (-1: no limit)")
@@ -83,7 +84,7 @@ func main() {
 	}
 	srv, err := relay.New(relay.Options{
 		DataDir: *data, Kinds: ks, RetentionDays: *retention, MaxEventSize: *maxSize, Name: *name, Log: log,
-		EventsPerMinute: *events, ConnEventsPerMinute: *connEvents, ReqsPerMinute: *reqs, ConnsPerMinute: *conns,
+		EventsPerMinute: *events, ConnEventsPerMinute: *connEvents, ConnMessagesPerMinute: *connMsgs, ReqsPerMinute: *reqs, ConnsPerMinute: *conns,
 		MaxSubscriptions: *maxSubs, MaxLimit: *maxLimit, TrustedProxies: strings.Split(*proxies, ","),
 	})
 	if err != nil {

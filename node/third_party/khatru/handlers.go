@@ -142,6 +142,18 @@ func (rl *Relay) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
+			rejected := false
+			for _, reject := range rl.RejectMessage {
+				if reject(ctx) {
+					rejected = true
+					break
+				}
+			}
+			if rejected {
+				ws.WriteJSON(nostr.NoticeEnvelope("rate-limited: too many messages on this connection, slow down"))
+				continue
+			}
+
 			// this is safe because ReadMessage() will always create a new slice
 			message := unsafe.String(unsafe.SliceData(msgb), len(msgb))
 

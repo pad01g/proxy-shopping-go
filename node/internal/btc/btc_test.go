@@ -108,6 +108,12 @@ func TestSpendPaths(t *testing.T) {
 				if tx.LockTime != 0 || tx.TxIn[0].Sequence != 0xffffffff {
 					t.Fatal("multisig locktime/sequence")
 				}
+				// the size estimate used for the relay fee check is not below the real size
+				script, _ := p.esc.Script()
+				real := (int64(tx.SerializeSizeStripped())*3 + int64(tx.SerializeSize()) + 3) / 4
+				if est := MultisigVSize(tx, script); est < real || est > real+2 {
+					t.Fatalf("vsize estimate %d, real %d", est, real)
+				}
 			}
 		})
 	}
@@ -143,7 +149,7 @@ func TestSpendRejections(t *testing.T) {
 		t.Fatal("outputs above the input accepted")
 	}
 	outsider, _ := btcec.NewPrivateKey()
-	pk, _ = p.esc.NewSpend(prev, []Output{{Address: keys.P2WPKHAddress(p.s.PubKey()), Amount: 1}}, PathMultisig)
+	pk, _ = p.esc.NewSpend(prev, []Output{{Address: keys.P2WPKHAddress(p.s.PubKey()), Amount: 1000}}, PathMultisig)
 	if err := Sign(pk, outsider); err == nil {
 		t.Fatal("outsider key signed")
 	}
@@ -163,9 +169,20 @@ func TestScriptChecksAndOutputs(t *testing.T) {
 	if _, err := PkScript("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"); err == nil {
 		t.Fatal("mainnet address accepted")
 	}
-	pk, _ := p.esc.NewSpend(prev, []Output{{Address: addr, Amount: 5}, {Address: keys.P2WPKHAddress(p.u.PubKey()), Amount: 0}}, PathMultisig)
+	pk, _ := p.esc.NewSpend(prev, []Output{{Address: addr, Amount: 5000}, {Address: keys.P2WPKHAddress(p.u.PubKey()), Amount: 0}}, PathMultisig)
 	outs, err := Outputs(pk)
-	if err != nil || len(outs) != 1 || outs[0].Address != addr || outs[0].Amount != 5 {
+	if err != nil || len(outs) != 1 || outs[0].Address != addr || outs[0].Amount != 5000 {
 		t.Fatalf("outputs %+v %v", outs, err)
+	}
+	// dust outputs are refused, not created (the transaction would not relay)
+	if _, err := p.esc.NewSpend(prev, []Output{{Address: addr, Amount: DustLimit - 1}}, PathMultisig); err == nil {
+		t.Fatal("dust output created")
+	}
+	// the size estimate of a 2-of-3 payout with three outputs: about 230 vbytes
+	pk, _ = p.esc.NewSpend(prev, []Output{{Address: addr, Amount: 5000}, {Address: keys.P2WPKHAddress(p.u.PubKey()), Amount: 5000},
+		{Address: keys.P2WPKHAddress(p.s.PubKey()), Amount: 5000}}, PathMultisig)
+	script, _ := p.esc.Script()
+	if n := MultisigVSize(pk.UnsignedTx, script); n < 200 || n > 280 {
+		t.Fatalf("vsize %d", n)
 	}
 }

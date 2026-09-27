@@ -3,7 +3,7 @@ name: escrow-nat
 network: ps-lab
 mnemonic_file: /keys/escrow-nat.mnemonic
 data_dir: /data
-admin: {listen: "0.0.0.0:8080", token: "lab"}
+admin: {listen: "0.0.0.0:8080", token: "lab", hosts: [escrow-nat]}   # hosts: the compose service name the runner uses
 tls: {extra_ca: /caddy-data/caddy/pki/authorities/local/root.crt}
 nostr:
   relays: ["wss://relay-1.test", "wss://relay-2.test"]

@@ -29,6 +29,10 @@ func (e *Engine) Resolve(ctx context.Context, id string, r ResolveRequest) (*Ord
 		if r.ShopOrderID == "" || len(r.ShopOrderID) > 128 {
 			return nil, errors.New("shop_order_id is required")
 		}
+		// order.purchased names what was paid (§4.3)
+		if err := validTotal(r.Total); err != nil {
+			return nil, err
+		}
 		o, err := e.update(id, func(o *Order) error {
 			if o.State != StateNeedsHuman {
 				return ErrNotResolvable
@@ -44,10 +48,7 @@ func (e *Engine) Resolve(ctx context.Context, id string, r ResolveRequest) (*Ord
 		if err != nil {
 			return nil, err
 		}
-		body := proto.OrderPurchased{ShopOrderID: r.ShopOrderID, Evidence: proto.InlineOnly(e.PurchaseEvidence(id))}
-		if r.Total != nil {
-			body.Total = *r.Total
-		}
+		body := proto.OrderPurchased{ShopOrderID: r.ShopOrderID, Total: *r.Total, Evidence: proto.InlineOnly(e.PurchaseEvidence(id))}
 		ev, err := e.send(ctx, o, o.User, proto.TypeOrderPurchased, body)
 		if err != nil {
 			e.fail(id, "purchased not sent", err)

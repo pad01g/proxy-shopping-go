@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/nbd-wtf/go-nostr"
 
@@ -52,7 +53,36 @@ func testEngine(t *testing.T) *Engine {
 	e := New(Deps{Keys: k, Messenger: m, DB: db, Config: &config.Escrow{
 		UpfrontFee: config.UpfrontFee{BPS: 50, MinSats: "1000", MinUSDC: "0.50"}, DisputeFeeBPS: 200}, Name: "escrow-1"})
 	t.Cleanup(e.Wait)
+	// the messages the tests hand to the handlers are what the messenger would have stored
+	testInbox = &inboxRec{}
+	e.inbox = testInbox.get
 	return e
+}
+
+// inboxRec stands in for the messenger's store of received messages.
+type inboxRec struct {
+	mu  sync.Mutex
+	evs []*nostr.Event
+}
+
+var testInbox = &inboxRec{}
+
+func (r *inboxRec) add(ev *nostr.Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.evs = append(r.evs, ev)
+}
+
+func (r *inboxRec) get(orderID string) []*nostr.Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []*nostr.Event
+	for _, ev := range r.evs {
+		if giftwrap.OrderID(ev) == orderID {
+			out = append(out, ev)
+		}
+	}
+	return out
 }
 
 // chain is an Esplora stand-in.
@@ -104,6 +134,12 @@ type order struct {
 
 func newOrder(t *testing.T, e *Engine, c *chain, id string, fundTxID string) *order {
 	t.Helper()
+	return newOrderQ(t, e, c, id, fundTxID, nil)
+}
+
+// newOrderQ is newOrder with a quote changed by edit (before the escrow address is computed).
+func newOrderQ(t *testing.T, e *Engine, c *chain, id string, fundTxID string, edit func(q *proto.OrderQuote)) *order {
+	t.Helper()
 	o := &order{id: id, user: labKeys(t, "user-1"), shopper: labKeys(t, "shopper-1"), txid: fundTxID}
 	k, _ := delivery.NewKey()
 	ct, _ := delivery.Seal(k, nil, id, delivery.Address{Name: "山田 太郎", PostalCode: "160-0022", Address: "東京都新宿区", Phone: "03"})
@@ -119,6 +155,9 @@ func newOrder(t *testing.T, e *Engine, c *chain, id string, fundTxID string) *or
 		Timelock: &proto.Timelock{T1: 1000, T2: 1100}, ShopperBTCPubkey: hex.EncodeToString(sk.PubKey().SerializeCompressed()),
 		ShopperBTCAddress: o.shopper.WalletAddress(), EscrowBTCPubkey: hex.EncodeToString(ek.PubKey().SerializeCompressed()),
 		EscrowBTCFeeAddress: e.Keys.WalletAddress()}
+	if edit != nil {
+		edit(&q)
+	}
 	esc, err := contract.BTCEscrow(&req, &q)
 	if err != nil {
 		t.Fatal(err)
@@ -159,6 +198,7 @@ func message(t *testing.T, fromSK, to, id, typ string, body any) *messenger.Mess
 	if err != nil {
 		t.Fatal(err)
 	}
+	testInbox.add(ev)
 	return &messenger.Message{Inner: ev, From: ev.PubKey, Type: typ, OrderID: id}
 }
 
@@ -195,12 +235,19 @@ func mustCase(t *testing.T, e *Engine, id string) *Case {
 
 func TestSplit(t *testing.T) {
 	e := testEngine(t)
-	fee, err := e.split(big.NewInt(89600), big.NewInt(40000), big.NewInt(47808))
+	fee, err := e.split(big.NewInt(89600), big.NewInt(40000), big.NewInt(47808), btc.DustLimit)
 	if err != nil || fee.Int64() != 1792 {
 		t.Fatalf("fee %v %v", fee, err)
 	}
-	if _, err := e.split(big.NewInt(89600), big.NewInt(40000), big.NewInt(49600)); err == nil {
+	if _, err := e.split(big.NewInt(89600), big.NewInt(40000), big.NewInt(49600), btc.DustLimit); err == nil {
 		t.Fatal("split ignoring the dispute fee accepted")
+	}
+	// a fee below dust is not taken (2% of 20000 = 400 sats would be an output that does not relay)
+	if fee, err := e.split(big.NewInt(20000), big.NewInt(10000), big.NewInt(10000), btc.DustLimit); err != nil || fee.Sign() != 0 {
+		t.Fatalf("dust fee %v %v", fee, err)
+	}
+	if fee, err := e.split(big.NewInt(20000), big.NewInt(10000), big.NewInt(9600), 0); err != nil || fee.Int64() != 400 {
+		t.Fatalf("usdc fee %v %v", fee, err)
 	}
 }
 
@@ -255,14 +302,11 @@ func TestCaseCannotBeTakenOver(t *testing.T) {
 	// the user opens the case; mallory's differing messages in the evidence are ignored
 	o.open(t, e, proto.DisputeEvidence{Messages: []*nostr.Event{mreq, o.quote}})
 	cs := mustCase(t, e, oid)
-	if cs.User != o.user.NostrPubHex() || cs.State != CaseOpen || !cs.FeePaid || !strings.Contains(strings.Join(cs.History, "\n"), "differs from the escrow.notice") {
+	if cs.User != o.user.NostrPubHex() || cs.State != CaseOpen || !cs.FeePaid || !cs.Verified || !strings.Contains(strings.Join(cs.History, "\n"), "differs from the verified order") {
 		t.Fatalf("%+v", cs)
 	}
-	// a later notice with another request does not replace the recorded one
-	var n notice
-	_, _ = e.DB.Get(bucketNotices, oid, &n)
-	if n.Events[0].ID != o.request.ID {
-		t.Fatal("notice replaced")
+	if n := e.notices(oid); len(n) != 1 || n[0].requestID() != o.request.ID {
+		t.Fatalf("notices %+v", n)
 	}
 }
 
@@ -280,21 +324,43 @@ func TestFeeCheck(t *testing.T) {
 		t.Fatalf("rule while the fee is unchecked: %v", err)
 	}
 	c.set(func(c *chain) { c.err = nil })
+	// the next check is paced; once it is due the case opens
+	if cs := mustCase(t, e, oid); cs.NextCheck <= time.Now().Unix() {
+		t.Fatalf("no backoff: %d", cs.NextCheck)
+	}
+	_ = store.Modify(e.DB, bucketCases, oid, func(c *Case, _ bool) error { c.NextCheck = 0; return nil })
 	e.watch(context.Background())
 	e.Wait()
 	if cs := mustCase(t, e, oid); cs.State != CaseOpen || !cs.FeePaid {
 		t.Fatalf("state %s", cs.State)
 	}
 
-	// a second order naming the same funding (and so the same fee) owes nothing
+	// a second order whose escrow output sits in the same transaction (so the same fee): the fee counts for the
+	// first order; the conflict is checked again (not final) until the case expires
 	other := "10000000000000000000000000000000"
-	o2 := newOrder(t, e, c, other, strings.Repeat("aa", 32))
+	o2 := newOrder(t, e, c, other, strings.Repeat("bb", 32))
+	c.set(func(c *chain) {
+		tx := c.txs[strings.Repeat("aa", 32)]
+		o2.funds = inner(t, o2.user, o2.shopper.NostrPubHex(), other, proto.TypeOrderFunded, proto.OrderFunded{Asset: proto.AssetBTC,
+			TxID: tx.TxID, Vout: ptr(uint32(2)), FeeTxID: tx.TxID, Amount: "100000"})
+		tx.Vout = append(tx.Vout, out(t, o2.lockAddr, 100000))
+	})
 	o2.notice(t, e)
 	o2.open(t, e, proto.DisputeEvidence{})
+	if cs := mustCase(t, e, other); cs.State != CaseFeePending || !strings.Contains(strings.Join(cs.History, "\n"), "already paid for order") || cs.NextCheck == 0 {
+		t.Fatalf("reused fee: %s %v", cs.State, cs.History)
+	}
+	PendingTTL = 0
+	t.Cleanup(func() { PendingTTL = 7 * 24 * time.Hour })
+	_ = store.Modify(e.DB, bucketCases, other, func(c *Case, _ bool) error { c.NextCheck = 0; return nil })
+	e.watch(context.Background())
+	e.Wait()
 	if cs := mustCase(t, e, other); cs.State != CaseNoObligation {
-		t.Fatalf("reused fee: %s", cs.State)
+		t.Fatalf("expired: %s", cs.State)
 	}
 }
+
+func ptr[T any](v T) *T { return &v }
 
 func TestRuleOnceAndOnlyTheRealEscrow(t *testing.T) {
 	e, c := setup(t)
@@ -423,5 +489,159 @@ func TestAttachments(t *testing.T) {
 	}
 	if n := len(mustCase(t, e, oid).Evidence[o.shopper.NostrPubHex()]); n != maxEvidencePerParty {
 		t.Fatalf("%d evidence entries", n)
+	}
+}
+
+// puppetOrder is an agreement for order id between a sock puppet (user-2) and shopper-1, naming the funding
+// transaction fundTx of the real order and quoting an upfront fee of fee (review PoC).
+func puppetOrder(t *testing.T, e *Engine, o *order, id, fundTx, fee string) (*keys.Set, []*nostr.Event) {
+	pu := labKeys(t, "user-2")
+	uk, _ := pu.OrderKey(id)
+	proof, _ := keys.SignKeyProofBTC(uk, id, pu.NostrPubHex())
+	req := proto.OrderRequest{Payment: proto.AssetBTC, Escrow: e.Keys.NostrPubHex(), KeyProof: proof,
+		Delivery:      proto.Delivery{Ciphertext: "x", KeyForShopper: "k", KeyForEscrowSHA256: "00"},
+		UserBTCPubkey: hex.EncodeToString(uk.PubKey().SerializeCompressed()), UserBTCAddress: pu.WalletAddress()}
+	sk, _ := o.shopper.OrderKey(id)
+	ek, _ := e.Keys.EscrowOrderKey(id)
+	q := proto.OrderQuote{Accept: true, Asset: proto.AssetBTC, LockAmount: "1", EscrowUpfrontFee: fee, PayoutFeeReserve: "0",
+		Timelock: &proto.Timelock{T1: 1000, T2: 1100}, ShopperBTCPubkey: hex.EncodeToString(sk.PubKey().SerializeCompressed()),
+		ShopperBTCAddress: o.shopper.WalletAddress(), EscrowBTCPubkey: hex.EncodeToString(ek.PubKey().SerializeCompressed()),
+		EscrowBTCFeeAddress: e.Keys.WalletAddress()}
+	esc, _ := contract.BTCEscrow(&req, &q)
+	q.EscrowAddress, _ = esc.Address()
+	r := inner(t, pu, o.shopper.NostrPubHex(), id, proto.TypeOrderRequest, req)
+	qq := inner(t, o.shopper, pu.NostrPubHex(), id, proto.TypeOrderQuote, q)
+	a := inner(t, pu, o.shopper.NostrPubHex(), id, proto.TypeOrderAccept, proto.OrderAccept{QuoteID: qq.ID})
+	vout := uint32(0)
+	f := inner(t, pu, o.shopper.NostrPubHex(), id, proto.TypeOrderFunded, proto.OrderFunded{Asset: proto.AssetBTC, TxID: fundTx, Vout: &vout, FeeTxID: fundTx, Amount: "1"})
+	return pu, []*nostr.Event{r, qq, a, f}
+}
+
+// Review PoC: a sock puppet of the shopper sends its escrow.notice for the order first. Only the agreement whose
+// funding the chain shows paying our key counts; the real user's case opens.
+func TestNoticeSquat(t *testing.T) {
+	e, c := setup(t)
+	o := newOrder(t, e, c, oid, strings.Repeat("aa", 32))
+	pu, evs := puppetOrder(t, e, o, oid, strings.Repeat("aa", 32), "1000")
+	e.onNotice(context.Background(), message(t, pu.NostrSecretHex(), e.Keys.NostrPubHex(), oid, proto.TypeEscrowNotice,
+		proto.EscrowNotice{Request: evs[0], Quote: evs[1], Accept: evs[2], Funded: evs[3]}))
+	o.notice(t, e) // the real user's notice is kept too
+	o.open(t, e, proto.DisputeEvidence{Messages: o.events()})
+	cs := mustCase(t, e, oid)
+	if cs.User != o.user.NostrPubHex() || cs.State != CaseOpen || !cs.Verified || cs.requestID() != o.request.ID {
+		t.Fatalf("case user=%s state=%s verified=%v history=%v", cs.User, cs.State, cs.Verified, cs.History)
+	}
+	if h := strings.Join(cs.History, "\n"); !strings.Contains(h, "conflicting request "+evs[0].ID) {
+		t.Fatalf("the puppet's request is not recorded: %s", h)
+	}
+	// the puppet's dispute changes nothing now
+	e.onDisputeOpen(context.Background(), message(t, pu.NostrSecretHex(), e.Keys.NostrPubHex(), oid, proto.TypeDisputeOpen,
+		proto.DisputeOpen{Claim: proto.ClaimOther, Evidence: proto.DisputeEvidence{Messages: evs}}))
+	e.Wait()
+	if cs := mustCase(t, e, oid); cs.User != o.user.NostrPubHex() || cs.State != CaseOpen {
+		t.Fatalf("taken over: %s %s", cs.User, cs.State)
+	}
+}
+
+// Review PoC: the shopper opens a dispute on a made-up order (quoting no fee) that names the real funding, to
+// take the fee of the real order. The made-up order's funding does not verify, so it claims nothing.
+func TestFeeSquatZeroFee(t *testing.T) {
+	e, c := setup(t)
+	o := newOrder(t, e, c, oid, strings.Repeat("aa", 32))
+	o.notice(t, e)
+	other := "20000000000000000000000000000000"
+	_, evs := puppetOrder(t, e, o, other, strings.Repeat("aa", 32), "0")
+	e.onDisputeOpen(context.Background(), message(t, o.shopper.NostrSecretHex(), e.Keys.NostrPubHex(), other, proto.TypeDisputeOpen,
+		proto.DisputeOpen{Claim: proto.ClaimOther, Evidence: proto.DisputeEvidence{Messages: evs}}))
+	e.Wait()
+	if cs := mustCase(t, e, other); cs.State != CaseNoObligation || cs.Verified || cs.FeePaid {
+		t.Fatalf("fake case %s verified=%v", cs.State, cs.Verified)
+	}
+	o.open(t, e, proto.DisputeEvidence{})
+	if cs := mustCase(t, e, oid); cs.State != CaseOpen || !cs.FeePaid {
+		t.Fatalf("real case %s %v", cs.State, cs.History)
+	}
+}
+
+// A stranger who opens first leaves an unverified stub; the real order replaces it.
+func TestVerifiedAgreementReplacesStub(t *testing.T) {
+	e, c := setup(t)
+	o := newOrder(t, e, c, oid, strings.Repeat("aa", 32))
+	pu, evs := puppetOrder(t, e, o, oid, strings.Repeat("aa", 32), "1000")
+	e.onDisputeOpen(context.Background(), message(t, pu.NostrSecretHex(), e.Keys.NostrPubHex(), oid, proto.TypeDisputeOpen,
+		proto.DisputeOpen{Claim: proto.ClaimOther, Evidence: proto.DisputeEvidence{Messages: evs}}))
+	e.Wait()
+	if cs := mustCase(t, e, oid); cs.State != CaseNoObligation || cs.Verified || len(cs.Evidence) != 0 {
+		t.Fatalf("stub %+v", cs)
+	}
+	// evidence for a stub is not stored (it stays in the inbox)
+	early := message(t, o.user.NostrSecretHex(), e.Keys.NostrPubHex(), oid, proto.TypeDisputeEvidence, proto.DisputeEvidence{Text: "early"})
+	e.onEvidence(context.Background(), early)
+	o.open(t, e, proto.DisputeEvidence{Messages: o.events(), Text: "opened"})
+	cs := mustCase(t, e, oid)
+	if cs.State != CaseOpen || cs.User != o.user.NostrPubHex() || cs.OpenedBy != o.user.NostrPubHex() {
+		t.Fatalf("%s %s %v", cs.State, cs.User, cs.History)
+	}
+	// the opener's evidence and the early evidence were taken from the inbox, once each
+	if got := cs.Evidence[o.user.NostrPubHex()]; len(got) != 2 {
+		t.Fatalf("evidence %+v", got)
+	}
+	e.onEvidence(context.Background(), early) // resent: counted once
+	if got := mustCase(t, e, oid).Evidence[o.user.NostrPubHex()]; len(got) != 2 {
+		t.Fatalf("resent evidence counted again: %d", len(got))
+	}
+}
+
+func TestNoObligationWithoutOurFee(t *testing.T) {
+	for name, fee := range map[string]string{"no fee": "0", "below our minimum": "999"} {
+		t.Run(name, func(t *testing.T) {
+			e, c := setup(t)
+			o := newOrderQ(t, e, c, oid, strings.Repeat("aa", 32), func(q *proto.OrderQuote) { q.EscrowUpfrontFee = fee })
+			o.notice(t, e)
+			o.open(t, e, proto.DisputeEvidence{})
+			if cs := mustCase(t, e, oid); cs.State != CaseNoObligation || !cs.Verified {
+				t.Fatalf("%s %v", cs.State, cs.History)
+			}
+			var owner string
+			if ok, _ := e.DB.Get(bucketFeeUses, "btc-fee:"+o.txid, &owner); ok {
+				t.Fatalf("fee claimed by %s", owner)
+			}
+		})
+	}
+}
+
+func TestRulingIsBroadcastable(t *testing.T) {
+	e, c := setup(t)
+	// a dust share is refused before anything is recorded
+	o := newOrder(t, e, c, oid, strings.Repeat("aa", 32))
+	o.notice(t, e)
+	o.open(t, e, proto.DisputeEvidence{})
+	if _, err := e.Rule(context.Background(), oid, RuleRequest{User: "500", Shopper: "96520"}); err == nil || !strings.Contains(err.Error(), "dust") {
+		t.Fatalf("dust share: %v", err)
+	}
+	if cs := mustCase(t, e, oid); cs.State != CaseOpen || cs.Ruling != nil {
+		t.Fatalf("%s", cs.State)
+	}
+	// a reserve below the minimum relay fee of the payout is refused
+	other := "10000000000000000000000000000000"
+	o2 := newOrderQ(t, e, c, other, strings.Repeat("bb", 32), func(q *proto.OrderQuote) { q.PayoutFeeReserve = "100" })
+	o2.notice(t, e)
+	o2.open(t, e, proto.DisputeEvidence{})
+	if _, err := e.Rule(context.Background(), other, RuleRequest{User: "49000", Shopper: "48902"}); err == nil || !strings.Contains(err.Error(), "relay fee") {
+		t.Fatalf("low reserve: %v", err)
+	}
+	// a reserve above what users accept is capped (5% of the lock, at least 2000): 30000 → 5000
+	third := "30000000000000000000000000000000"
+	o3 := newOrderQ(t, e, c, third, strings.Repeat("cc", 32), func(q *proto.OrderQuote) { q.PayoutFeeReserve = "30000" })
+	o3.notice(t, e)
+	o3.open(t, e, proto.DisputeEvidence{})
+	// 100000 − 5000 = 95000; 2% = 1900
+	r, err := e.Rule(context.Background(), third, RuleRequest{User: "46550", Shopper: "46550"})
+	if err != nil || r.Split.EscrowFee != "1900" {
+		t.Fatalf("%+v %v", r, err)
+	}
+	// both parties got the ruling
+	if cs := mustCase(t, e, third); len(cs.RulingSent) != 2 {
+		t.Fatalf("ruling sent to %v", cs.RulingSent)
 	}
 }

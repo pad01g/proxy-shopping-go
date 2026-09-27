@@ -15,13 +15,14 @@ type dispatcher struct {
 	mu      sync.Mutex
 	queues  map[string][]*Message // waiting messages per key
 	ready   []string              // keys with waiting messages and no running handler, in order
-	running map[string]bool
+	running map[string]bool       // keys whose handler runs (possibly past its timeout)
+	ids     map[string]bool       // inner ids queued or running, so that one message is never in twice
 	wake    chan struct{}
-	started bool
+	ctx     context.Context // of the running workers; nil before the first start
 }
 
 func newDispatcher(m *Messenger) *dispatcher {
-	return &dispatcher{m: m, queues: map[string][]*Message{}, running: map[string]bool{}, wake: make(chan struct{}, 1)}
+	return &dispatcher{m: m, queues: map[string][]*Message{}, running: map[string]bool{}, ids: map[string]bool{}, wake: make(chan struct{}, 1)}
 }
 
 func dispatchKey(msg *Message) string {
@@ -31,13 +32,24 @@ func dispatchKey(msg *Message) string {
 	return "p:" + msg.From
 }
 
+// start runs the workers until ctx ends. Once the workers of an earlier start stopped, start runs new ones: the
+// messages still queued then are forgotten (they are pending in the store and queued again by redispatch), while
+// handlers still running keep their keys busy.
 func (d *dispatcher) start(ctx context.Context) {
 	d.mu.Lock()
-	if d.started {
+	if d.ctx != nil && d.ctx.Err() == nil {
 		d.mu.Unlock()
 		return
 	}
-	d.started = true
+	if d.ctx != nil {
+		for _, q := range d.queues {
+			for _, msg := range q {
+				delete(d.ids, msg.Inner.ID)
+			}
+		}
+		d.queues, d.ready = map[string][]*Message{}, nil
+	}
+	d.ctx = ctx
 	d.mu.Unlock()
 	for i := 0; i < max(Workers, 1); i++ {
 		go d.work(ctx)
@@ -47,6 +59,11 @@ func (d *dispatcher) start(ctx context.Context) {
 func (d *dispatcher) enqueue(msg *Message) {
 	k := dispatchKey(msg)
 	d.mu.Lock()
+	if d.ids[msg.Inner.ID] {
+		d.mu.Unlock()
+		return
+	}
+	d.ids[msg.Inner.ID] = true
 	if len(d.queues[k]) == 0 && !d.running[k] {
 		d.ready = append(d.ready, k)
 	}
@@ -85,9 +102,10 @@ func (d *dispatcher) next() (string, *Message) {
 	return k, msg
 }
 
-func (d *dispatcher) done(k string) {
+func (d *dispatcher) done(k string, msg *Message) {
 	d.mu.Lock()
 	delete(d.running, k)
+	delete(d.ids, msg.Inner.ID)
 	if len(d.queues[k]) > 0 {
 		d.ready = append(d.ready, k)
 	}
@@ -113,10 +131,18 @@ func (d *dispatcher) work(ctx context.Context) {
 			}
 		}
 		if ctx.Err() != nil {
-			return // left pending in the store, handled at the next start
+			d.done(k, msg) // left pending in the store, handled at the next start
+			return
 		}
-		d.m.handle(ctx, msg)
-		d.done(k)
+		if wait := d.m.handle(ctx, msg); wait != nil {
+			// the handler overran its timeout: its order stays busy until it returns, this worker goes on
+			go func(k string, msg *Message) {
+				<-wait
+				d.done(k, msg)
+			}(k, msg)
+			continue
+		}
+		d.done(k, msg)
 	}
 }
 
@@ -133,7 +159,7 @@ type bucket struct {
 	last   time.Time
 }
 
-const maxBuckets = 10000
+var maxBuckets = 10000
 
 func newRateLimiter(perMin, burst int) *rateLimiter {
 	return &rateLimiter{perMin: float64(perMin), burst: float64(burst), buckets: map[string]*bucket{}}
@@ -150,6 +176,9 @@ func (r *rateLimiter) allow(key string, now time.Time) bool {
 		if len(r.buckets) >= maxBuckets {
 			r.sweep(now)
 		}
+		if len(r.buckets) >= maxBuckets {
+			r.evictOldest()
+		}
 		b = &bucket{tokens: r.burst, last: now}
 		r.buckets[key] = b
 	}
@@ -160,6 +189,25 @@ func (r *rateLimiter) allow(key string, now time.Time) bool {
 	}
 	b.tokens--
 	return true
+}
+
+// evictOldest forgets the bucket used longest ago, so that the map never exceeds maxBuckets.
+func (r *rateLimiter) evictOldest() {
+	var oldest string
+	var at time.Time
+	found := false
+	for k, b := range r.buckets {
+		if !found || b.last.Before(at) {
+			oldest, at, found = k, b.last, true
+		}
+	}
+	delete(r.buckets, oldest)
+}
+
+func (r *rateLimiter) size() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.buckets)
 }
 
 // sweep forgets buckets that are full again (their senders were quiet long enough).

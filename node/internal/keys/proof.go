@@ -57,7 +57,13 @@ func VerifyKeyProofBTC(userBTCPubHex, orderID, userNostrPubHex, proofHex string)
 
 // SignKeyProofEVM is the EIP-191 personal_sign of m by the EVM account (65 bytes, v = 27/28).
 func SignKeyProofEVM(key *btcec.PrivateKey, orderID, userNostrPubHex string) (string, error) {
-	sig, err := crypto.Sign(accounts.TextHash([]byte(KeyProofMessage(orderID, userNostrPubHex))), key.ToECDSA())
+	// go-ethereum signs with its own curve: btcec's ToECDSA carries btcec's, which the pure-Go (CGO_ENABLED=0)
+	// signer rejects, so the key is converted the way evm does it
+	k, err := crypto.ToECDSA(key.Serialize())
+	if err != nil {
+		return "", fmt.Errorf("key proof: convert key: %w", err)
+	}
+	sig, err := crypto.Sign(accounts.TextHash([]byte(KeyProofMessage(orderID, userNostrPubHex))), k)
 	if err != nil {
 		return "", fmt.Errorf("key proof: %w", err)
 	}

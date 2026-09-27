@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"path/filepath"
 	"reflect"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -38,6 +40,10 @@ import (
 
 // ProfileInterval is how often a node republishes its profile and inbox relays.
 var ProfileInterval = 10 * time.Minute
+
+// RelayStoreCapacity bounds the events a p2p relay keeps: it has no trust scope and passes on every valid event
+// (§10), within per-peer gossip quotas.
+var RelayStoreCapacity = 20000
 
 // Node is a running psnode.
 type Node struct {
@@ -66,6 +72,16 @@ type Node struct {
 
 	depMu sync.Mutex
 	deps  *evm.Deployments
+
+	adminToken string // configured, or generated into data_dir/admin.token
+	started    atomic.Bool
+
+	// pause (POST /admin/pause) ends the context of the messenger and the role engines, and resumes them later
+	pauseMu     sync.Mutex
+	runCtx      context.Context
+	stopActive  context.CancelFunc
+	pausedUntil time.Time
+	resumeTimer *time.Timer
 }
 
 // New builds a node from its configuration; Run starts it.
@@ -93,8 +109,11 @@ func New(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Node, erro
 	if n.trust, err = trust.NewStore(n.db); err != nil {
 		return nil, err
 	}
-	// §10: keep only what the coordinators reach, and our own profile and inbox relays
-	if dropped := n.trust.SetScope(cfg.Trust.Coordinators, cfg.Network, n.keys.NostrPubHex()); dropped > 0 {
+	if cfg.Role == config.RoleRelay {
+		// a p2p relay passes on every valid event whatever the coordinators (§10), bounded
+		n.trust.SetCapacity(RelayStoreCapacity)
+	} else if dropped := n.trust.SetScope(cfg.Trust.Coordinators, cfg.Network, n.keys.NostrPubHex()); dropped > 0 {
+		// §10: keep only what the coordinators reach, and our own profile and inbox relays
 		n.log.Info("dropped stored events outside the trust scope", "count", dropped)
 	}
 	n.pool = nostrnet.NewPoolWith(nostrnet.Options{TLS: n.tls, Log: n.log, AllowPrivate: cfg.Nostr.AllowPrivateRelays})
@@ -129,13 +148,16 @@ func New(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Node, erro
 	if cfg.Role != config.RoleRelay {
 		n.msgr, err = messenger.New(messenger.Config{
 			Secret: n.keys.NostrSecretHex(), Pool: n.pool, DB: n.db, Inbox: cfg.Nostr.Relays, K: cfg.Nostr.K,
-			Resolve: n.inboxes.resolve, Retry: n.hasOrderWith, Log: n.log,
+			Resolve: n.inboxes.resolve, Retry: n.hasOrderWith, Accepts: n.accepts, Hints: n.hints, Log: n.log,
 		})
 		if err != nil {
 			return nil, err
 		}
 	}
 	if err := n.buildRole(); err != nil {
+		return nil, err
+	}
+	if n.adminToken, err = adminToken(cfg, n.log); err != nil {
 		return nil, err
 	}
 	return n, nil
@@ -238,26 +260,27 @@ func (n *Node) Run(ctx context.Context) error {
 
 	n.host.Start(ctx)
 	n.bridge(ctx)
-	if n.msgr != nil {
-		n.msgr.Start(ctx)
-	}
-	if n.shopper != nil {
-		n.shopper.Start(ctx)
-	}
-	if n.escrow != nil {
-		n.escrow.Start(ctx)
-	}
+	n.pauseMu.Lock()
+	n.runCtx = ctx
+	n.startActiveLocked()
+	n.pauseMu.Unlock()
 	go n.publishOwnLoop(ctx)
 
 	id := n.host.ID().String()
 	n.log.Info("psnode running", "pubkey", n.keys.NostrPubHex(), "peer_id", id, "admin", n.cfg.Admin.Listen)
 	if n.cfg.Admin.Listen == "" {
+		n.started.Store(true)
 		<-ctx.Done()
 		return nil
 	}
-	srv := &http.Server{Addr: n.cfg.Admin.Listen, Handler: n.adminHandler(), ReadHeaderTimeout: 10 * time.Second}
+	ln, err := net.Listen("tcp", n.cfg.Admin.Listen)
+	if err != nil {
+		return fmt.Errorf("admin api: %w", err)
+	}
+	srv := &http.Server{Handler: n.adminHandler(), ReadHeaderTimeout: 10 * time.Second}
 	errc := make(chan error, 1)
-	go func() { errc <- srv.ListenAndServe() }()
+	go func() { errc <- srv.Serve(ln) }()
+	n.started.Store(true)
 	select {
 	case <-ctx.Done():
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -345,24 +368,6 @@ func (n *Node) bridgeEvent(ctx context.Context, ev *nostr.Event) {
 	if err := n.p2p.Publish(ctx, ev); err != nil {
 		n.log.Debug("gossip failed", "err", err)
 	}
-}
-
-// hasOrderWith tells the messenger whether unacknowledged messages about an order are resent: only to parties
-// of an order we keep (§4.10; a rejected request is answered once).
-func (n *Node) hasOrderWith(_, orderID string) bool {
-	if orderID == "" {
-		return false
-	}
-	switch {
-	case n.shopper != nil:
-		// a rejection is still a reply to a real requester, so it is resent until acked too
-		_, ok, err := n.shopper.Order(orderID)
-		return err == nil && ok
-	case n.escrow != nil:
-		_, ok, err := n.escrow.Case(orderID)
-		return err == nil && ok
-	}
-	return false
 }
 
 func (n *Node) publishNostr(ctx context.Context, ev *nostr.Event) {
