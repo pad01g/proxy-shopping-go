@@ -1,9 +1,16 @@
 // シナリオごとの結果の確認（画面に出ているものだけを見る）。
 import type { Page } from 'playwright';
+import { assertEnglishPage } from './i18n.js';
 
 export interface DemoScenario {
   id: string;
   title: string;
+  /** The page's scenario to follow (default: id). */
+  scenario?: string;
+  /** Query string of the page (e.g. "?lang=en"). */
+  query?: string;
+  /** English mode: the guide, header, tabs and panels must show no Japanese UI text at any step. */
+  english?: boolean;
   /** Checks on the finished scenario, from the all-roles page; returns a line for the report. */
   check(page: Page): Promise<string>;
 }
@@ -34,17 +41,19 @@ async function order(page: Page): Promise<{ id: string; status: string }> {
 const BTC_TXID = /^[0-9a-f]{64}$/;
 const EVM_TX = /^0x[0-9a-f]{64}$/;
 
+async function normalBtcCompleted(page: Page): Promise<string> {
+  const o = await order(page);
+  assert(o.status === 'completed', `status ${o.status}`);
+  const txid = await txt(page, 'order-completed-txid');
+  assert(BTC_TXID.test(txid), `payout txid ${txid}`);
+  return `order ${o.id.slice(0, 8)} completed, payout ${txid}`;
+}
+
 export const DEMO_SCENARIOS: DemoScenario[] = [
   {
     id: 'normal-btc',
     title: '正常系（BTC）: 購入 → 配達 → 利用者と shopper の署名でロック解除',
-    async check(page) {
-      const o = await order(page);
-      assert(o.status === 'completed', `status ${o.status}`);
-      const txid = await txt(page, 'order-completed-txid');
-      assert(BTC_TXID.test(txid), `payout txid ${txid}`);
-      return `order ${o.id.slice(0, 8)} completed, payout ${txid}`;
-    },
+    check: normalBtcCompleted,
   },
   {
     id: 'normal-usdc',
@@ -132,6 +141,18 @@ export const DEMO_SCENARIOS: DemoScenario[] = [
       await tab(page, 'lab');
       assert((await attr(page, 'lab-shopper-state', 'data-paused')) === 'false', 'shopper-1 resumed');
       return `order ${o.id.slice(0, 8)} refunded alone after T2, tx ${txid}; shopper-1 resumed`;
+    },
+  },
+  {
+    id: 'normal-btc-en',
+    title: '英語表示（?lang=en）で normal-btc: ガイド・ヘッダー・タブ・ボタン・ラベルに日本語が無い',
+    scenario: 'normal-btc',
+    query: '?lang=en',
+    english: true,
+    async check(page) {
+      const done = await normalBtcCompleted(page);
+      const english = await assertEnglishPage(page, ['user', 'shopper', 'escrow', 'operator', 'coordinator', 'lab']);
+      return `${done}; ${english}`;
     },
   },
 ];

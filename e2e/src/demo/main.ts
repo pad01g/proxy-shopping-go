@@ -4,7 +4,8 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
 import { followGuide, openDemo, resetDemo, startScenario, type DemoWindow } from './driver.js';
-import { DEMO_SCENARIOS } from './scenarios.js';
+import { assertNoJapanese, STEP_AREAS } from './i18n.js';
+import { DEMO_SCENARIOS, type DemoScenario } from './scenarios.js';
 
 const BASE = process.env.DEMO_URL ?? 'http://demo';
 const SEPARATE = 'separate';
@@ -41,16 +42,34 @@ async function shot(page: Page, file: string): Promise<void> {
   await page.screenshot({ path: `results/${file}`, fullPage: true }).catch(() => undefined);
 }
 
-async function runScenario(context: BrowserContext, id: string, check: (p: Page) => Promise<string>): Promise<void> {
-  const page = await newPage(context, id);
+async function runScenario(context: BrowserContext, s: DemoScenario): Promise<void> {
+  const page = await newPage(context, s.id);
+  let checked = 0;
+  // English mode: every step's guide, header, tabs and open panel, and every confirmation dialog.
+  const english = s.english
+    ? {
+        onStep: async (p: Page, cur: { step: string }) => {
+          await assertNoJapanese(p, `step ${cur.step}`, STEP_AREAS);
+          checked++;
+        },
+        onConfirm: async (p: Page, action: string) => {
+          await assertNoJapanese(p, `confirmation of ${action}`, ['[data-testid="confirm-dialog"]']);
+          checked++;
+        },
+      }
+    : {};
   try {
-    await openDemo(page, BASE);
-    await startScenario(page, id);
-    await followGuide([{ page, name: 'all' }], { log: (l) => say(`  - ${l}`, details) });
-    say(`  - ${await check(page)}`, details);
-    await shot(page, `demo-${id}.png`);
+    await openDemo(page, `${BASE}/${s.query ?? ''}`);
+    await startScenario(page, s.scenario ?? s.id);
+    await followGuide([{ page, name: 'all' }], { log: (l) => say(`  - ${l}`, details), ...english });
+    if (s.english) {
+      await assertNoJapanese(page, 'scenario complete', STEP_AREAS);
+      say(`  - no Japanese UI text at ${checked} steps and confirmation dialogs`, details);
+    }
+    say(`  - ${await s.check(page)}`, details);
+    await shot(page, `demo-${s.id}.png`);
   } catch (e) {
-    await shot(page, `demo-${id}-failure.png`);
+    await shot(page, `demo-${s.id}-failure.png`);
     throw e;
   } finally {
     await page.close();
@@ -120,7 +139,7 @@ async function main(): Promise<number> {
         rows.push(`| ${id} | **FAIL** | ${((Date.now() - t0) / 1000).toFixed(0)} | ${title} |`);
       }
     };
-    for (const s of selected) await run(s.id, s.title, () => runScenario(context, s.id, s.check));
+    for (const s of selected) await run(s.id, s.title, () => runScenario(context, s));
     if (runSeparate) await run(SEPARATE, '別々のウィンドウ（?role=user と ?role=escrow,operator,coordinator）で dispute-refund', () => runSeparateWindows(context));
   } finally {
     await browser?.close();

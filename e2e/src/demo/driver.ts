@@ -58,6 +58,10 @@ export interface FollowOptions {
   /** One step (waiting steps included: mining to T2 and the shop's delivery take a while). */
   stepTimeoutMs?: number;
   log: (line: string) => void;
+  /** Called on the main window whenever the guide shows a new current step (e.g. to check its texts). */
+  onStep?: (page: Page, step: CurrentStep) => Promise<void>;
+  /** Called on the acting window while a confirmation dialog is open, before its OK. */
+  onConfirm?: (page: Page, action: string) => Promise<void>;
 }
 
 /** Follow the guide of the selected scenario until it is complete. Returns the ids of the steps passed. */
@@ -83,6 +87,7 @@ export async function followGuide(windows: DemoWindow[], opts: FollowOptions): P
       last = cur.step;
       since = Date.now();
       attempts = 0;
+      await opts.onStep?.(main, cur);
     }
     if (Date.now() - since > stepTimeout) {
       throw new Error(`step ${cur.step} did not finish in ${stepTimeout / 1000}s: ${await text(main, 'guide-progress')}${await errorsOf(windows)}`);
@@ -111,6 +116,7 @@ export async function followGuide(windows: DemoWindow[], opts: FollowOptions): P
     await w.page.getByTestId(cur.action).click({ timeout: 120_000 });
     if (cur.confirm) {
       await w.page.locator(`[data-testid="confirm-dialog"][data-action="${cur.action}"]`).waitFor({ timeout: 30_000 });
+      await opts.onConfirm?.(w.page, cur.action);
       await w.page.getByTestId('confirm-ok').click();
     }
     await waitForStepChange(main, cur.step, 30_000);

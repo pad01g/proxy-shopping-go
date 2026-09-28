@@ -126,6 +126,13 @@ lab を動かしたまま、1 つの画面で全員の役割を演じて流れ�
 | `fraud` | FAIL-100 → 紛争 → escrow が全額を shopper へ（不正な裁定のデモ）→ shopper が自動で連署 → 利用者が通報 → operator が escrow を一覧から外す → 候補から消える |
 | `timelock-t2` | 見積の承諾後に lab 操作で shopper-1 を一時停止 → 入金 → T2 まで採掘 → 利用者が一人で取り戻す → shopper-1 を再開 |
 
+- 表示言語: ヘッダー右の「日本語 / English」（`lang-ja` / `lang-en`）で切り替える。画面の文言・ガイドの手順と説明・シナリオ名・確認ダイアログ・
+  入力済みの値（届け先の例 `Taro Yamada / 1-1-1 Shinjuku, Shinjuku-ku, Tokyo`、紛争の説明など）がその言語になる。選んだ言語は localStorage
+  （`ps-demo-lang`。「デモを初期化」でも消えない）に残り、URL の `?lang=en` / `?lang=ja` はそれより優先する（保存はしない）。既定は日本語で、`<html lang>` も合わせる。
+  core の経過（timeline）は種類（kind）から選んだ言語で表示する。相手が書いた文（紛争の説明・通報の本文・プロフィールの名前・委任書のメモ）や
+  ノード・core のエラーはデータなのでそのまま出す（`data-i18n-exempt` を付けている）。e2e の `normal-btc-en` は `?lang=en` で normal-btc を最後までたどり、
+  各手順・確認ダイアログ・最後に全タブで日本語の文字が無いことを確かめる。
+
 - 別々のウィンドウ: `?role=user`、`?role=escrow,operator,coordinator` のように役割を選ぶと、そのウィンドウではその役割だけが動く（同じブラウザなら鍵と
   ガイドの進み具合は localStorage で共有される）。ガイドはどのウィンドウにも出て、ほかのウィンドウの役割の手順は「別のウィンドウで … が操作」と表示する。
   同じ役割は 1 つのウィンドウでしか動かない（Web Locks）。`shopper（ノード）` と `lab 操作` のタブはどのウィンドウにもある。
@@ -160,12 +167,14 @@ Esplora・EVM RPC・faucet もページと同じ origin のパスを使う。
 ### デモの e2e
 
 ```sh
-docker compose run --rm runner demo                    # 7 シナリオ + 別々のウィンドウ（separate）
-docker compose run --rm runner demo dispute-refund     # 選ぶ（id は上の表と separate）
+docker compose run --rm runner demo                    # 7 シナリオ + normal-btc-en + 別々のウィンドウ（separate）
+docker compose run --rm runner demo dispute-refund     # 選ぶ（id は上の表と normal-btc-en・separate）
 ```
 
 runner（NAT の内側）の Chromium が `http://demo` を開き、最初に「デモを初期化」してから、シナリオごとにページを開き直してガイドの指示どおりに押す
 （「この操作へ」→ ボタン →（確認ダイアログなら）OK、待ちの手順は進むまで待つ）。最後に画面の表示（txid・状態・配分・候補の有無）を確かめる。
+`normal-btc-en` は `?lang=en` のページで normal-btc をたどり、手順が変わるたびにヘッダー・ガイド・タブ・開いているパネル、確認ダイアログ、
+最後に 6 つのタブすべてに日本語（ひらがな・カタカナ・漢字・和文の記号）が無いことを確かめる（`data-i18n-exempt` の要素は除く）。
 `separate` は `?role=user` と `?role=escrow,operator,coordinator` の 2 つのページで `dispute-refund` を進め、各手順をその役割のページで押す。
 `http://demo` は安全な文脈ではないので、Chromium は `--unsafely-treat-insecure-origin-as-secure=http://demo` で起動する。
 結果は `e2e/results/demo-latest.md`（と `demo-<時刻>.md`、各シナリオの画面 `demo-<id>.png`）。

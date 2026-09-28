@@ -32,9 +32,10 @@ docker compose run --rm runner a e      # シナリオを選ぶ
 それぞれブラウザに持ち、shopper は lab の Go ノード（shopper-1）が務める。左のガイドに従ってボタンを押すと、本物のリレー・signet・anvil の上で
 代理購入と escrow のロック解除まで進む。シナリオは正常系（BTC / USDC）・紛争で返金・在庫切れ・危険な店・不正な escrow・T2 の返金の 7 つ。
 役割ごとに別のウィンドウで開くときは `http://localhost:8888/?role=user` と `?role=escrow,operator,coordinator` のように指定する。
+表示は日本語と英語を切り替えられる（右上の「日本語 / English」。選んだ言語はブラウザに残り、`?lang=en` / `?lang=ja` を付けるとそちらが優先。既定は日本語）。
 
 ```sh
-docker compose run --rm runner demo                 # デモ画面の e2e（7 シナリオ + 別ウィンドウ）
+docker compose run --rm runner demo                 # デモ画面の e2e（7 シナリオ + 英語表示の normal-btc-en + 別ウィンドウ）
 docker compose run --rm runner demo fraud separate  # 選ぶ
 ```
 
