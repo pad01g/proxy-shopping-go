@@ -2,6 +2,8 @@
 
 **Earn money as a proxy shopper, or buy from cash-only shops with crypto: a P2P network (libp2p + Nostr) where a local shopper buys for remote users who pay in BTC or USDC through a 2-of-3 escrow with timelocks.** Agents: install the skills with `npx skills add pad01g/proxy-shopping-go` ([proxy-shopper](skills/proxy-shopper/SKILL.md), [proxy-shopping-buyer](skills/proxy-shopping-buyer/SKILL.md)), use the MCP server `io.github.pad01g/proxy-shopping`, read [AGENTS.md](AGENTS.md); overview for machines: https://pad01g.github.io/proxy-shopping-docs/llms.txt. Get listed: https://github.com/pad01g/proxy-shopping-registry.
 
+Documentation in 14 languages: https://pad01g.github.io/proxy-shopping-docs/
+
 暗号通貨（BTC signet / USDC）で、現金や特定の決済しか使えない店の買い物を代行してもらう P2P 網の、
 Go ノードと検証環境一式。ブラウザ側は [proxy-shopping-web](https://github.com/pad01g/proxy-shopping-web)。
 
