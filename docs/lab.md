@@ -254,6 +254,7 @@ p2p:
   announce: []           # 任意: 追加で広告するアドレス（multiaddr）
 trust:
   coordinators: ["<coordinator-1 pk>", "<coordinator-2 pk>"]
+  bundle_urls: []        # 任意: trust bundle（署名済みイベントの JSON, 例 https://pad01g.github.io/proxy-shopping-registry/events.json）
 chain:
   btc: {network: signet, esplora: "https://esplora.test"}
   evm: {chain_id: 31337, rpc: "https://evm.test", deployments: /deployments/31337.json}
@@ -287,6 +288,7 @@ escrow:
 - `admin.token` が空で `admin.listen` がループバック（`127.0.0.1`, `[::1]`, `localhost`）以外なら、設定の読み込みで失敗する。ループバックで `admin.token` が空なら、最初の起動で乱数の token を作って `data_dir/admin.token`（0600）に保存し、その場所をログに出す。管理 API は `GET /healthz` を除いて常に token を求める。
 - 管理 API はブラウザの他のページからの要求（CSRF, DNS rebinding）を断る: `Host` は `localhost`・IP アドレス・`admin.hosts` の名前だけ（それ以外は 403）、別の origin の `Origin` ヘッダは 403、POST は `Content-Type: application/json` だけ（それ以外は 415）。lab は compose のサービス名（`shopper-1` など）を `admin.hosts` に書く。
 - `trust.coordinators` は `relay` 以外の役割で必須（空は何も信頼しないので、設定の読み込みで失敗する。spec §2.4）。要素は hex の公開鍵。`role: relay` は coordinators を見ず、正しい署名のイベントをすべて保存・中継する（保存は最大 20000 件、gossip は相手ごとに 1 分 600 件まで）。
+- `trust.bundle_urls`（任意）: 登録簿の `events.json`（`{"events": [...]}` または配列）を起動時と 10 分ごとに取得し、リレーから届いたイベントと同じ検査（署名・版・網・受け入れる範囲）をして取り込み、新しいものは gossip する。bundle 自体は何も信頼を足さない。https のみ（`nostr.allow_private_relays` のときは http も可）。公開網 `ps-main` の例は `lab/examples/ps-main-shopper.yaml`。
 - `nostr.allow_private_relays` は接続する瞬間のアドレスで判定する（名前の解決先が後で変わっても回り込めない）。lab のノードはすべて `true`。
 - `shopper.allow_private_shops` も同じく接続ごと（リダイレクト先も含む）に判定する。店の証明書が検証できなければ読まない（検証を外して読み直すことはしない）。`http://` の店は TLS の点が付かないだけ（リダイレクトの途中に `http://` があっても同じ。別のホストへリダイレクトした店には許可リストの点も付かない）。NAT64（`64:ff9b::/96`, `64:ff9b:1::/48`）と 6to4（`2002::/16`）のアドレスにも接続しない。見積の拒否理由には接続の詳細を書かない（ログにだけ残す）。
 - shopper の設定の検査: `timelock` の T1（BTC は 600 秒 = 1 ブロックで換算）は `min_t1_remaining_seconds` より先、`payout_fee_reserve_sats` は 20000 以下（spec §4.5）、`delivery_days` は 85 以下。見積では予備が `min(20000, max(2000, lock_amount の 5%))` sats を超える注文を `limit` で断る（user のクライアントが受け付ける上限。少額でも 2000 sats までは認める）。

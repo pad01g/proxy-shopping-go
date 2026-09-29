@@ -265,6 +265,7 @@ func (n *Node) Run(ctx context.Context) error {
 	n.startActiveLocked()
 	n.pauseMu.Unlock()
 	go n.publishOwnLoop(ctx)
+	go n.bundleLoop(ctx)
 
 	id := n.host.ID().String()
 	n.log.Info("psnode running", "pubkey", n.keys.NostrPubHex(), "peer_id", id, "admin", n.cfg.Admin.Listen)

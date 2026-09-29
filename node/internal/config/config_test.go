@@ -92,3 +92,40 @@ func TestCoordinatorsRequired(t *testing.T) {
 		t.Error("a coordinator that is not a hex key accepted")
 	}
 }
+
+// trust.bundle_urls are https URLs (http only where private relays are allowed, as in the lab).
+func TestBundleURLs(t *testing.T) {
+	const c = "6eac25bc912ab49582890fa47837d574e6d7932620d5410fcffec31a8f87d520"
+	cfg, err := Parse([]byte("role: operator\nmnemonic_file: /k\ntrust: {coordinators: [" + c + "], bundle_urls: [\"https://pad01g.github.io/proxy-shopping-registry/events.json\"]}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Trust.BundleURLs) != 1 {
+		t.Fatalf("bundle_urls not read: %+v", cfg.Trust)
+	}
+	for _, bad := range []string{"http://example.org/events.json", "events.json", "ftp://x/y"} {
+		if _, err := Parse([]byte("role: operator\nmnemonic_file: /k\ntrust: {coordinators: [" + c + "], bundle_urls: [\"" + bad + "\"]}\n")); err == nil {
+			t.Errorf("accepted bundle url %q", bad)
+		}
+	}
+	if _, err := Parse([]byte("role: operator\nmnemonic_file: /k\nnostr: {allow_private_relays: true}\ntrust: {coordinators: [" + c + "], bundle_urls: [\"http://registry.test/events.json\"]}\n")); err != nil {
+		t.Errorf("http bundle in the lab: %v", err)
+	}
+}
+
+// The examples of lab/examples parse.
+func TestExampleConfigsParse(t *testing.T) {
+	files, _ := filepath.Glob(filepath.Join("..", "..", "..", "lab", "examples", "*.yaml"))
+	if len(files) == 0 {
+		t.Skip("no example configs")
+	}
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Parse(data); err != nil {
+			t.Errorf("%s: %v", f, err)
+		}
+	}
+}

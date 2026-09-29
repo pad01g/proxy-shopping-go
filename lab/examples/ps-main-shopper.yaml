@@ -1,0 +1,37 @@
+# A shopper node on the public ps-main network, trusting the registry pad01g/proxy-shopping-registry
+# (https://pad01g.github.io/proxy-shopping-registry/). To be listed there, open a pull request adding
+# shoppers/<name>.json with the nostr_pubkey of `psctl keys --mnemonic-file <mnemonic_file>`.
+role: shopper
+name: my-shopper
+network: ps-main
+mnemonic_file: /keys/shopper.mnemonic
+data_dir: /data
+admin: {listen: "127.0.0.1:8080"}   # the token is generated into data_dir/admin.token
+nostr:
+  relays: ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]
+  k: 2
+p2p:
+  listen: ["/ip4/0.0.0.0/tcp/4001", "/ip4/0.0.0.0/tcp/4002/ws"]
+  reachability: auto
+trust:
+  coordinators: ["7a0a27bb7092dc59b5bfe195d9f0e0cf81c69373b0d702a41490ed45cfccbe39"]
+  # the registry's signed events, fetched at start and every 10 minutes and verified like relay events
+  bundle_urls: ["https://pad01g.github.io/proxy-shopping-registry/events.json"]
+chain:
+  btc: {network: signet, esplora: "https://mempool.space/signet/api"}
+  # no evm: USDC is not offered on ps-main yet
+fx:
+  sources:
+    - {type: coingecko, base: "https://api.coingecko.com"}
+    - {type: frankfurter, base: "https://api.frankfurter.app"}
+shopper:
+  bot_url: "http://127.0.0.1:7000"   # your shopper-bot
+  payments: [btc-signet]
+  currencies: [JPY]
+  cash_regions: [JP-13]              # must match regions of your shoppers/<name>.json
+  fee: {bps: 500, min: {amount: "300", currency: JPY}}
+  max_order: {amount: "30000", currency: JPY}
+  delivery_days: 5
+  risk: {threshold: 70}
+  confirmations: 1
+  accept_rulings: always

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 
 	"gopkg.in/yaml.v3"
@@ -67,6 +68,10 @@ type P2P struct {
 
 type Trust struct {
 	Coordinators []string `yaml:"coordinators"`
+	// BundleURLs are trust bundles (the events.json of a registry such as pad01g/proxy-shopping-registry): files of
+	// signed events fetched at start and every 10 minutes and verified like relay events. They add no trust of
+	// their own; they only deliver the coordinators' events when relays do not.
+	BundleURLs []string `yaml:"bundle_urls"`
 }
 
 type Chain struct {
@@ -269,6 +274,13 @@ func (c *Config) validate() error {
 	for _, pk := range c.Trust.Coordinators {
 		if !isPubKey(pk) {
 			return fmt.Errorf("config: trust.coordinators: %q is not a hex public key", pk)
+		}
+	}
+	for _, u := range c.Trust.BundleURLs {
+		p, err := url.Parse(u)
+		// http only where private relays are allowed too (the lab)
+		if err != nil || p.Host == "" || !(p.Scheme == "https" || (p.Scheme == "http" && c.Nostr.AllowPrivateRelays)) {
+			return fmt.Errorf("config: trust.bundle_urls: %q is not an https URL", u)
 		}
 	}
 	switch c.P2P.Reachability {
