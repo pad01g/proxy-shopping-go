@@ -28,6 +28,15 @@
       "btc_escrow_xpub": "tpubDAReB6L4xAF8yzCStGrbRCZWLvFNE7qapy6AkjvGEXCRtPMB4YCzPQn8Q7CewF2AyG4yPs3jcZzLV7Jnk9ApN3gg2Zzz17rDxVciV8udkRU",
       "libp2p_peer_id": "16Uiu2HAm2xAdKYf3QgytpfL11y6Rojd93zmKsDPAwJxPGFmaEZdV"
     },
+    "coordinator-demo": {
+      "mnemonic": "message occur banana believe spring shadow deer manage ginger mistake mad process",
+      "nostr_pubkey": "07da142f98ad9ede9b07a73f6481feaf5a710e92b8581798241f02ac333f9084",
+      "npub": "npub1qldpgtuc4k0daxc85ulkfq074ad8zr5jhpvp0xpyrup2cveljzzq8ygmv8",
+      "evm_address": "0xC90f2C37123AdAA420725838D2D30bF046726aF7",
+      "btc_address": "tb1qg0w04vwtyctvmmm2jzsh4efn5n5w50u3mxmsf4",
+      "btc_escrow_xpub": "tpubDAddmPRsWHTiWdvTuvKMzM4175W3rqKx5TC3LaFFRkH5geMzUXyKPoPHdBZEe1D2hYANmrm5mvgSiZvPQ2cu7Ge83Xjc88aJHLUQzFsY716",
+      "libp2p_peer_id": "16Uiu2HAm1tv1iY6k5rgugSQUsAdXDKExystg6x23Bi1KtwbQwEDj"
+    },
     "escrow-1": {
       "mnemonic": "blue salt fault plastic fault bargain word lady icon actual speed reflect",
       "nostr_pubkey": "5733593b6fb3c911be92e6d5cfc10e22520b4df2f73e057732814393440f205e",
