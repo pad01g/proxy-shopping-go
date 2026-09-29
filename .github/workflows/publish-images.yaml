@@ -1,0 +1,87 @@
+name: Publish images
+
+# Images on ghcr.io so that shoppers, escrows and agents can run proxy-shopping without building it:
+#   ghcr.io/pad01g/proxy-shopping-node         psnode, psctl, psrelay, esplora-lite, labfaucet, ratefeed (node/)
+#   ghcr.io/pad01g/proxy-shopping-shopper-bot  the browser automation bot (shopper-bot/)
+#   ghcr.io/pad01g/proxy-shopping-fakeshop     the lab's fake shops, card gateway and rate mock (fakeshop/)
+#   ghcr.io/pad01g/proxy-shopping-contracts    the lab's contract deployer (contracts/)
+# A tag v<version> publishes that version as well as latest.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: node/go.mod
+          cache-dependency-path: node/go.sum
+      - name: Go unit tests
+        working-directory: node
+        run: go test -race ./...
+
+  images:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: proxy-shopping-node
+            context: node
+            description: "proxy-shopping Go node: shopper / escrow / operator / relay roles over libp2p and Nostr, psctl, Nostr relay"
+          - image: proxy-shopping-shopper-bot
+            context: shopper-bot
+            description: "proxy-shopping shopper-bot: buys at shops for a proxy shopper with Playwright drivers (idempotent by request_id)"
+          - image: proxy-shopping-fakeshop
+            context: fakeshop
+            description: "proxy-shopping lab: fake shops, a fake card gateway and a rate mock"
+          - image: proxy-shopping-contracts
+            context: contracts
+            description: "proxy-shopping lab: deploys Safe v1.4.1, the timelock module, mock USDC and feeds on anvil"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/pad01g/${{ matrix.image }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+            type=semver,pattern={{version}}
+          labels: |
+            org.opencontainers.image.source=https://github.com/pad01g/proxy-shopping-go
+            org.opencontainers.image.description=${{ matrix.description }}
+            org.opencontainers.image.licenses=MIT
+          annotations: |
+            org.opencontainers.image.source=https://github.com/pad01g/proxy-shopping-go
+            org.opencontainers.image.description=${{ matrix.description }}
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: false

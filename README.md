@@ -1,5 +1,7 @@
 # proxy-shopping-go
 
+**Earn money as a proxy shopper, or buy from cash-only shops with crypto: a P2P network (libp2p + Nostr) where a local shopper buys for remote users who pay in BTC or USDC through a 2-of-3 escrow with timelocks.** Agents: install the skills with `npx skills add pad01g/proxy-shopping-go` ([proxy-shopper](skills/proxy-shopper/SKILL.md), [proxy-shopping-buyer](skills/proxy-shopping-buyer/SKILL.md)), use the MCP server `io.github.pad01g/proxy-shopping`, read [AGENTS.md](AGENTS.md); overview for machines: https://pad01g.github.io/proxy-shopping-docs/llms.txt. Get listed: https://github.com/pad01g/proxy-shopping-registry.
+
 暗号通貨（BTC signet / USDC）で、現金や特定の決済しか使えない店の買い物を代行してもらう P2P 網の、
 Go ノードと検証環境一式。ブラウザ側は [proxy-shopping-web](https://github.com/pad01g/proxy-shopping-web)。
 
@@ -49,3 +51,8 @@ docker run --rm -v "$PWD":/src -w /src/contracts --entrypoint forge ghcr.io/foun
 ```
 
 `lab/keys/` の鍵はテスト専用。公開網では使わないこと。
+
+## ライセンス / License
+
+MIT（[LICENSE](LICENSE)）。同梱しているもの: Safe v1.4.1（`contracts/lib/safe-smart-account`、LGPL-3.0）、
+forge-std（MIT / Apache-2.0）、khatru の修正版（`node/third_party/khatru`、元のライセンスのまま）。
