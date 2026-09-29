@@ -52,6 +52,14 @@ docker run --rm -v "$PWD":/src -w /src/contracts --entrypoint forge ghcr.io/foun
 
 `lab/keys/` の鍵はテスト専用。公開網では使わないこと。
 
+## Contributing — pull requests welcome
+
+Pull requests are welcome: shop drivers for shopper-bot, new payment methods and chains, translations, protocol and
+security reviews, bug fixes. Want to earn in your own town? You need nobody's permission: make a coordinator key,
+delegate to your operator key and list yourself as a shopper for your region (guide:
+https://pad01g.github.io/proxy-shopping-docs/en/quickstart/, section 3); a home machine reached over Tailscale or any
+VPN is enough. To be found by everyone, open a pull request to https://github.com/pad01g/proxy-shopping-registry.
+
 ## ライセンス / License
 
 MIT（[LICENSE](LICENSE)）。同梱しているもの: Safe v1.4.1（`contracts/lib/safe-smart-account`、LGPL-3.0）、
