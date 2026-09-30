@@ -115,6 +115,42 @@ func (f *frankfurter) Rates(ctx context.Context) (map[string]*big.Rat, error) {
 	return out, nil
 }
 
+type mempool struct {
+	base string
+	hc   *http.Client
+}
+
+// Mempool reads BTC prices from mempool.space: GET {base}/api/v1/prices →
+// {"time":1790727905,"USD":83464,"JPY":13124019,…} gives BTC/USD, BTC/JPY, …
+// (mainnet prices, used as the reference rate for signet orders too).
+func Mempool(base string, hc *http.Client) Provider {
+	return &mempool{base: strings.TrimRight(base, "/"), hc: defaultClient(hc)}
+}
+
+func (m *mempool) Name() string { return "mempool" }
+
+func (m *mempool) Rates(ctx context.Context) (map[string]*big.Rat, error) {
+	var body map[string]json.Number
+	if err := getJSON(ctx, m.hc, m.base+"/api/v1/prices", &body); err != nil {
+		return nil, err
+	}
+	out := map[string]*big.Rat{}
+	for c, n := range body {
+		if c == "time" {
+			continue
+		}
+		r, err := ratOf(n)
+		if err != nil {
+			return nil, fmt.Errorf("mempool %s: %w", c, err)
+		}
+		out["BTC/"+strings.ToUpper(c)] = r
+	}
+	if len(out) == 0 {
+		return nil, errors.New("mempool: no prices")
+	}
+	return out, nil
+}
+
 type coinGecko struct {
 	base string
 	vs   []string
@@ -259,6 +295,11 @@ func FromConfig(sources []config.FXSource, currencies []string, hc *http.Client,
 				return nil, fmt.Errorf("fx source %d: frankfurter needs base", i)
 			}
 			out = append(out, Frankfurter(src.Base, currencies, hc))
+		case "mempool":
+			if src.Base == "" {
+				return nil, fmt.Errorf("fx source %d: mempool needs base (e.g. https://mempool.space)", i)
+			}
+			out = append(out, Mempool(src.Base, hc))
 		case "coingecko":
 			if src.Base == "" {
 				return nil, fmt.Errorf("fx source %d: coingecko needs base", i)

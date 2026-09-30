@@ -96,7 +96,7 @@ type FX struct {
 
 // FXSource configures one rate provider (§7).
 type FXSource struct {
-	Type  string            `yaml:"type"` // frankfurter | coingecko | chainlink | static
+	Type  string            `yaml:"type"` // frankfurter | coingecko | mempool | chainlink | static
 	Base  string            `yaml:"base"`
 	Feeds map[string]string `yaml:"feeds"` // chainlink: pair → aggregator address; empty: the deployments' feeds
 	Rates map[string]string `yaml:"rates"` // static: pair → rate

@@ -75,6 +75,33 @@ func TestLabProviders(t *testing.T) {
 	}
 }
 
+// TestMempool reads mempool.space /api/v1/prices: BTC in several fiat currencies, "time" is not a price.
+func TestMempool(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/prices", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"time":1790727905,"USD":83464,"EUR":73622,"JPY":13124019}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	ps, err := FromConfig([]config.FXSource{{Type: "mempool", Base: srv.URL}}, []string{"JPY"}, srv.Client(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(ps, nil)
+	for pair, want := range map[string]string{"BTC/USD": "83464", "BTC/JPY": "13124019", "BTC/EUR": "73622"} {
+		q, err := s.Quote(context.Background(), pair)
+		if err != nil {
+			t.Fatalf("%s: %v", pair, err)
+		}
+		if got := FormatRate(q.Rate); got != want || q.Sources[0].Name != "mempool" {
+			t.Errorf("%s = %s from %+v, want %s", pair, got, q.Sources, want)
+		}
+	}
+	if _, err := FromConfig([]config.FXSource{{Type: "mempool"}}, nil, nil, nil, nil); err == nil {
+		t.Fatal("mempool without base accepted")
+	}
+}
+
 func TestSynthesisAndInverse(t *testing.T) {
 	rates := map[string]*big.Rat{"BTC/USD": rat("100000"), "JPY/USD": rat("1/150"), "USDC/USD": rat("1")}
 	for _, c := range []struct{ base, quote, want string }{

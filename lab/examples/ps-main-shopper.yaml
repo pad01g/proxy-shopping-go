@@ -22,8 +22,10 @@ chain:
   # no evm: USDC is not offered on ps-main yet
 fx:
   sources:
-    - {type: coingecko, base: "https://api.coingecko.com"}
-    - {type: frankfurter, base: "https://api.frankfurter.app"}
+    # BTC prices (BTC/USD, BTC/JPY, …); no API key, CORS open, so browsers use the same source
+    - {type: mempool, base: "https://mempool.space"}
+    # USD/JPY and other fiat cross rates (api.frankfurter.app moved here)
+    - {type: frankfurter, base: "https://api.frankfurter.dev/v1"}
 shopper:
   bot_url: "http://127.0.0.1:7000"   # your shopper-bot
   payments: [btc-signet]

@@ -559,6 +559,7 @@ function config(address safe) external view returns (address token, address user
 - 取得元は差し替えられる（Go: `fx.Provider`、TS: `RateSource`）。
   - `frankfurter`: `GET {base}/latest?from=USD&to=JPY` → `{"rates":{"JPY":150.1}}`（法定通貨同士）
   - `coingecko`: `GET {base}/api/v3/simple/price?ids=bitcoin,usd-coin&vs_currencies=usd,jpy`
+  - `mempool`: `GET {base}/api/v1/prices` → `{"time":…,"USD":83464,"JPY":13124019,…}`（BTC の各通貨建ての価格。キー不要。公開網 ps-main の既定）
   - `chainlink`: AggregatorV3 の `latestRoundData()`（8 桁）。feed のアドレスは設定
   - `static`: 固定値（テスト用）
 - pair は `BTC/JPY`, `BTC/USD`, `USDC/JPY`, `USDC/USD`。直接の値が無ければ USD を介して合成する。
