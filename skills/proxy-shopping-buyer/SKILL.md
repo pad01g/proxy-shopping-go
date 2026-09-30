@@ -21,7 +21,7 @@ yet. The local lab (below) always has shoppers and fake shops to practise on.
 ## 1. Connect the MCP server
 
 ```sh
-claude mcp add proxy-shopping -- docker run -i --rm -v proxy-shopping-mcp:/data ghcr.io/pad01g/proxy-shopping-mcp:0.1.0
+claude mcp add proxy-shopping -- docker run -i --rm -v proxy-shopping-mcp:/data ghcr.io/pad01g/proxy-shopping-mcp:0.1.1
 ```
 
 Registry name `io.github.pad01g/proxy-shopping`. The server keeps its own key and order state in `/data` (mount a

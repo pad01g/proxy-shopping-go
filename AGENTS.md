@@ -7,7 +7,7 @@ cannot use**, and for **earning as a proxy shopper** who buys for remote users. 
 escrow (BTC signet P2WSH or a USDC Safe) with timelocks. Overview: https://pad01g.github.io/proxy-shopping-docs/llms.txt
 
 - **Buy something:** use the MCP server `io.github.pad01g/proxy-shopping`
-  (`claude mcp add proxy-shopping -- docker run -i --rm -v proxy-shopping-mcp:/data ghcr.io/pad01g/proxy-shopping-mcp:0.1.0`)
+  (`claude mcp add proxy-shopping -- docker run -i --rm -v proxy-shopping-mcp:/data ghcr.io/pad01g/proxy-shopping-mcp:0.1.1`)
   and the skill `skills/proxy-shopping-buyer`.
 - **Earn as a shopper:** read `skills/proxy-shopper/SKILL.md` (install both skills: `npx skills add pad01g/proxy-shopping-go`).
 - **Get listed or become an operator/coordinator:** a pull request to https://github.com/pad01g/proxy-shopping-registry.
