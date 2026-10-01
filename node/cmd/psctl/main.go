@@ -1,8 +1,8 @@
 // psctl signs the trust events of coordinators and operators and prints the keys of a mnemonic.
 //
 //	psctl keys --mnemonic-file m
-//	psctl delegate --mnemonic-file m --operator <pk> --version N [--revoke] [--note text]
-//	psctl list --mnemonic-file m --file list.json --version N
+//	psctl delegate --mnemonic-file m --operator <pk> --version N [--revoke] [--note text] [--list-url https://… …]
+//	psctl list --mnemonic-file m --file list.json --version N [--bundle-out bundle.json [--profiles-file f] [--profiles-relay wss://…]]
 //	psctl profile --mnemonic-file m --kind shopper|escrow --file content.json --version N
 //	psctl inbox --mnemonic-file m --relay wss://a --relay wss://b --version N
 //
@@ -13,6 +13,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -20,6 +21,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -232,6 +234,8 @@ func cmdDelegate(args []string) error {
 	op := fs.String("operator", "", "operator pubkey (hex or npub)")
 	revoke := fs.Bool("revoke", false, "revoke the delegation")
 	note := fs.String("note", "", "note")
+	var listURLs listFlag
+	fs.Var(&listURLs, "list-url", "https URL where the operator keeps its list bundle (spec §2.2, §2.6; repeat)")
 	_ = fs.Parse(args)
 	s, err := c.keys()
 	if err != nil {
@@ -241,7 +245,7 @@ func cmdDelegate(args []string) error {
 	if err != nil {
 		return err
 	}
-	ev, err := trust.NewDelegation(s.NostrSecretHex(), pk, c.network, c.v(trust.KindDelegation, s.NostrPubHex(), pk), *revoke, *note)
+	ev, err := trust.NewDelegationWithURLs(s.NostrSecretHex(), pk, c.network, c.v(trust.KindDelegation, s.NostrPubHex(), pk), *revoke, *note, listURLs)
 	if err != nil {
 		return err
 	}
@@ -253,6 +257,10 @@ func cmdList(args []string) error {
 	var c common
 	c.register(fs)
 	file := fs.String("file", "", "list content (JSON of spec §2.3)")
+	bundleOut := fs.String("bundle-out", "", "write the list bundle of spec §2.6 (the list and the latest profiles of its shoppers and escrows) to this file, for the list_url")
+	profilesFile := fs.String("profiles-file", "", "signed profiles (a bundle {\"events\": […]} or an array) to put into the bundle")
+	var profileRelays listFlag
+	fs.Var(&profileRelays, "profiles-relay", "Nostr relays to fetch the profiles for the bundle from (repeat)")
 	_ = fs.Parse(args)
 	s, err := c.keys()
 	if err != nil {
@@ -276,7 +284,171 @@ func cmdList(args []string) error {
 	if err != nil {
 		return err
 	}
-	return c.emit(ev)
+	if err := c.emit(ev); err != nil {
+		return err
+	}
+	if *bundleOut == "" {
+		return nil
+	}
+	var candidates []*nostr.Event
+	if *profilesFile != "" {
+		data, err := os.ReadFile(*profilesFile)
+		if err != nil {
+			return err
+		}
+		evs, err := trust.ParseBundle(data)
+		if err != nil {
+			return fmt.Errorf("%s: %w", *profilesFile, err)
+		}
+		candidates = append(candidates, evs...)
+	}
+	candidates = append(candidates, c.fetchProfiles(&l, profileRelays)...)
+	b, missing, err := listBundle(ev, &l, candidates)
+	if err != nil {
+		return err
+	}
+	for _, m := range missing {
+		fmt.Fprintf(os.Stderr, "psctl: warning: no %s in the bundle\n", m)
+	}
+	data, err = json.MarshalIndent(b, "", "  ")
+	if err != nil {
+		return err
+	}
+	if int64(len(data)) > trust.MaxBundleBytes || len(b.Events) > trust.MaxBundleEvents {
+		return fmt.Errorf("the bundle has %d events, %d bytes: over the %d events / %d bytes clients take (§2.6)", len(b.Events), len(data), trust.MaxBundleEvents, trust.MaxBundleBytes)
+	}
+	if err := os.WriteFile(*bundleOut, append(data, '\n'), 0o644); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "wrote %s: %d events\n", *bundleOut, len(b.Events))
+	return nil
+}
+
+// fetchProfiles gets the profiles and inbox relays of the shoppers and escrows of a list from the node of --node
+// (what it learnt over P2P) and from Nostr relays.
+func (c *common) fetchProfiles(l *trust.List, relays []string) []*nostr.Event {
+	authors := listParticipants(l)
+	if len(authors) == 0 || (c.node == "" && len(relays) == 0) {
+		return nil
+	}
+	tc, err := httpx.TLSConfig(c.extraCA)
+	if err != nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	var evs []*nostr.Event
+	if len(relays) > 0 {
+		pool := nostrnet.NewPool(tc, nil)
+		evs = append(evs, pool.Query(ctx, relays, nostr.Filter{
+			Kinds: []int{trust.KindShopperProfile, trust.KindEscrowProfile, trust.KindInboxRelays}, Authors: authors,
+		})...)
+		pool.Close()
+	}
+	if c.node != "" {
+		evs = append(evs, c.nodeEvents(ctx, tc)...)
+	}
+	return evs
+}
+
+// nodeEvents reads the events of GET /trust of the node of --node.
+func (c *common) nodeEvents(ctx context.Context, tc *tls.Config) []*nostr.Event {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(c.node, "/")+"/trust", nil)
+	if err != nil {
+		return nil
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	res, err := httpx.Client(tc, 15*time.Second).Do(req)
+	if err != nil {
+		return nil
+	}
+	defer res.Body.Close()
+	var body struct {
+		Events []*nostr.Event `json:"events"`
+	}
+	if res.StatusCode/100 == 2 {
+		_ = json.NewDecoder(io.LimitReader(res.Body, 8<<20)).Decode(&body)
+	}
+	return body.Events
+}
+
+// listParticipants are the shoppers and escrows of a list, sorted.
+func listParticipants(l *trust.List) []string {
+	var out []string
+	for _, e := range l.Entries {
+		for _, pk := range []string{e.Shopper, e.Escrow} {
+			if !slices.Contains(out, pk) {
+				out = append(out, pk)
+			}
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// listBundle builds the bundle of §2.6 for a list: the list, then the newest valid 30502 of each shopper, 30503 of
+// each escrow (of the list's network) and 10050 of both, taken unchanged from candidates. missing names what was
+// not found.
+func listBundle(list *nostr.Event, l *trust.List, candidates []*nostr.Event) (*trust.Bundle, []string, error) {
+	if err := trust.Validate(list); err != nil {
+		return nil, nil, err
+	}
+	shoppers, escrows := map[string]bool{}, map[string]bool{}
+	for _, e := range l.Entries {
+		shoppers[e.Shopper], escrows[e.Escrow] = true, true
+	}
+	best := map[trust.Key]*nostr.Event{}
+	for _, ev := range candidates {
+		if ev == nil || trust.Validate(ev) != nil {
+			continue
+		}
+		switch ev.Kind {
+		case trust.KindShopperProfile:
+			if !shoppers[ev.PubKey] || trust.Network(ev) != l.Network {
+				continue
+			}
+		case trust.KindEscrowProfile:
+			if !escrows[ev.PubKey] || trust.Network(ev) != l.Network {
+				continue
+			}
+		case trust.KindInboxRelays:
+			if !shoppers[ev.PubKey] && !escrows[ev.PubKey] {
+				continue
+			}
+		default:
+			continue
+		}
+		k := trust.KeyOf(ev)
+		if old := best[k]; old == nil || trust.Newer(ev, old) {
+			best[k] = ev
+		}
+	}
+	evs := []*nostr.Event{list}
+	var missing []string
+	for _, pk := range listParticipants(l) {
+		want := []int{trust.KindInboxRelays}
+		if shoppers[pk] {
+			want = append(want, trust.KindShopperProfile)
+		}
+		if escrows[pk] {
+			want = append(want, trust.KindEscrowProfile)
+		}
+		slices.Sort(want)
+		for _, kind := range want {
+			k := trust.Key{Kind: kind, PubKey: pk}
+			if kind != trust.KindInboxRelays {
+				k.D = l.Network
+			}
+			if ev := best[k]; ev != nil {
+				evs = append(evs, ev)
+			} else {
+				missing = append(missing, fmt.Sprintf("kind %d of %s", kind, pk))
+			}
+		}
+	}
+	return trust.MakeBundle(evs), missing, nil
 }
 
 func cmdProfile(args []string) error {

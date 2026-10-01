@@ -76,7 +76,8 @@ produce this plan and the exact file for your key.
 ### Or start your own local market, without anyone's permission
 
 A registry listing is not required. Make your own coordinator key, delegate to your own operator key and publish a list
-with yourself as the shopper for your region (`psctl delegate …`, `psctl list … --publish` to the public relays), then
+with yourself as the shopper for your region (`psctl delegate … --list-url https://you.example/bundle.json`,
+`psctl list … --bundle-out bundle.json`, then host `bundle.json` at that URL; `--publish` to relays is optional), then
 ask the people you serve to trust your coordinator key. Run it all from a home machine: the node only needs outbound
 connections; use Tailscale or another VPN to reach its admin API remotely. Guide:
 https://pad01g.github.io/proxy-shopping-docs/en/quickstart/ (section 3). Improvements are welcome as pull requests.
