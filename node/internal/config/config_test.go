@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestLabConfigsParse(t *testing.T) {
@@ -93,7 +95,7 @@ func TestCoordinatorsRequired(t *testing.T) {
 	}
 }
 
-// trust.bundle_urls are https URLs (http only where private relays are allowed, as in the lab).
+// trust.bundle_urls are https URLs (§2.6).
 func TestBundleURLs(t *testing.T) {
 	const c = "6eac25bc912ab49582890fa47837d574e6d7932620d5410fcffec31a8f87d520"
 	cfg, err := Parse([]byte("role: operator\nmnemonic_file: /k\ntrust: {coordinators: [" + c + "], bundle_urls: [\"https://pad01g.github.io/proxy-shopping-registry/events.json\"]}\n"))
@@ -108,8 +110,9 @@ func TestBundleURLs(t *testing.T) {
 			t.Errorf("accepted bundle url %q", bad)
 		}
 	}
-	if _, err := Parse([]byte("role: operator\nmnemonic_file: /k\nnostr: {allow_private_relays: true}\ntrust: {coordinators: [" + c + "], bundle_urls: [\"http://registry.test/events.json\"]}\n")); err != nil {
-		t.Errorf("http bundle in the lab: %v", err)
+	// §2.6: https only, also in the lab (it has its own CA)
+	if _, err := Parse([]byte("role: operator\nmnemonic_file: /k\nnostr: {allow_private_relays: true}\ntrust: {coordinators: [" + c + "], bundle_urls: [\"http://registry.test/events.json\"]}\n")); err == nil {
+		t.Errorf("http bundle accepted in the lab")
 	}
 }
 
@@ -127,5 +130,51 @@ func TestExampleConfigsParse(t *testing.T) {
 		if _, err := Parse(data); err != nil {
 			t.Errorf("%s: %v", f, err)
 		}
+	}
+}
+
+// trust.nostr is off unless set (§2.6: fetching trust and profiles from Nostr is optional).
+func TestTrustNostrDefaultsOff(t *testing.T) {
+	const c = "6eac25bc912ab49582890fa47837d574e6d7932620d5410fcffec31a8f87d520"
+	cfg, err := Parse([]byte("role: operator\nmnemonic_file: /k\ntrust: {coordinators: [" + c + "]}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Trust.Nostr {
+		t.Fatal("trust.nostr is on by default")
+	}
+	cfg, err = Parse([]byte("role: operator\nmnemonic_file: /k\ntrust: {coordinators: [" + c + "], nostr: true}\n"))
+	if err != nil || !cfg.Trust.Nostr {
+		t.Fatalf("trust.nostr: true not read: %v %+v", err, cfg)
+	}
+}
+
+// Every lab node keeps fetching trust from the lab relays (trust.nostr: true), as before §2.6 made it optional.
+func TestLabNodesFetchTrustFromNostr(t *testing.T) {
+	files, _ := filepath.Glob(filepath.Join("..", "..", "..", "lab", "nodes", "*.yaml"))
+	n := 0
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var probe struct {
+			Role string `yaml:"role"`
+		}
+		if yaml.Unmarshal(data, &probe) != nil || probe.Role == "" {
+			continue // not a psnode config (ratefeed)
+		}
+		cfg, err := Parse(data)
+		if err != nil {
+			t.Errorf("%s: %v", f, err)
+			continue
+		}
+		n++
+		if !cfg.Trust.Nostr {
+			t.Errorf("%s: trust.nostr is not true", f)
+		}
+	}
+	if n == 0 {
+		t.Skip("no lab node configs")
 	}
 }

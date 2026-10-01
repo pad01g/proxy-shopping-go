@@ -72,6 +72,11 @@ type Trust struct {
 	// signed events fetched at start and every 10 minutes and verified like relay events. They add no trust of
 	// their own; they only deliver the coordinators' events when relays do not.
 	BundleURLs []string `yaml:"bundle_urls"`
+	// Nostr makes the node fetch trust and profile events from nostr.relays as well (§2.6; default false): it then
+	// subscribes to the authors of its trust scope and passes what it learns between libp2p and the relays. Without
+	// it they come by P2P, bundle_urls and the list_url of the delegations only; the relays stay the mailbox of
+	// messages (§4.2), and the node still publishes its own profile and inbox relays to them.
+	Nostr bool `yaml:"nostr"`
 }
 
 type Chain struct {
@@ -278,8 +283,8 @@ func (c *Config) validate() error {
 	}
 	for _, u := range c.Trust.BundleURLs {
 		p, err := url.Parse(u)
-		// http only where private relays are allowed too (the lab)
-		if err != nil || p.Host == "" || !(p.Scheme == "https" || (p.Scheme == "http" && c.Nostr.AllowPrivateRelays)) {
+		// §2.6: https only (the lab has its own CA, tls.extra_ca)
+		if err != nil || p.Host == "" || p.Scheme != "https" {
 			return fmt.Errorf("config: trust.bundle_urls: %q is not an https URL", u)
 		}
 	}

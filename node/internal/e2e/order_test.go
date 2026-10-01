@@ -64,7 +64,7 @@ admin: {listen: "127.0.0.1:%d", token: "lab"}
 tls: {extra_ca: %q}
 nostr: {relays: [%s], k: 2, allow_private_relays: true}
 p2p: {listen: ["/ip4/127.0.0.1/tcp/%d"], bootstrap: %s, reachability: public}
-trust: {coordinators: [%q]}
+trust: {coordinators: [%q], nostr: true}
 %sfx:
   sources:
     - {type: static, rates: {"BTC/USD": "100000", "USD/JPY": "150", "USDC/USD": "1"}}

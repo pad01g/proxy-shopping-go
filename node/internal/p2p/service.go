@@ -460,3 +460,10 @@ func (s *Service) Peers() []string {
 	}
 	return out
 }
+
+// SyncAll runs trust-sync with every connected peer (the periodic fetch of §2.6).
+func (s *Service) SyncAll(ctx context.Context) {
+	for _, id := range s.h.Network().Peers() {
+		go s.syncNow(ctx, id)
+	}
+}

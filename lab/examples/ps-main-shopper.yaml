@@ -17,6 +17,9 @@ trust:
   coordinators: ["7a0a27bb7092dc59b5bfe195d9f0e0cf81c69373b0d702a41490ed45cfccbe39"]
   # the registry's signed events, fetched at start and every 10 minutes and verified like relay events
   bundle_urls: ["https://pad01g.github.io/proxy-shopping-registry/events.json"]
+  # profiles (the escrows' keys) also from the relays: the registry bundle carries only the delegations and lists
+  # (spec §2.6; the default is false, P2P and list_url bundles only)
+  nostr: true
 chain:
   btc: {network: signet, esplora: "https://mempool.space/signet/api"}
   # no evm: USDC is not offered on ps-main yet

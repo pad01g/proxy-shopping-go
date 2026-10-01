@@ -32,9 +32,23 @@ func sign(secret string, kind int, tags nostr.Tags, content any, createdAt nostr
 
 // NewDelegation signs a kind 30500 delegation of a coordinator to an operator.
 func NewDelegation(secret, operator, network string, version int64, revoked bool, note string) (*nostr.Event, error) {
+	return NewDelegationWithURLs(secret, operator, network, version, revoked, note, nil)
+}
+
+// NewDelegationWithURLs signs a delegation with list_url tags (§2.2): where the operator keeps its list bundle.
+func NewDelegationWithURLs(secret, operator, network string, version int64, revoked bool, note string, listURLs []string) (*nostr.Event, error) {
 	tags := nostr.Tags{
 		{"d", operator}, {"v", strconv.FormatInt(version, 10)}, {"network", network},
 		{"p", operator}, {"revoked", strconv.FormatBool(revoked)},
+	}
+	if len(listURLs) > MaxListURLs {
+		return nil, fmt.Errorf("at most %d list_url", MaxListURLs)
+	}
+	for _, u := range listURLs {
+		if !IsHTTPSURL(u) {
+			return nil, fmt.Errorf("list_url %q is not an https URL", u)
+		}
+		tags = append(tags, nostr.Tag{"list_url", u})
 	}
 	return sign(secret, KindDelegation, tags, map[string]string{"note": note}, 0)
 }

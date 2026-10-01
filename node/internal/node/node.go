@@ -294,8 +294,12 @@ func (n *Node) Run(ctx context.Context) error {
 }
 
 // bridge passes newer trust and profile events between libp2p and the Nostr relays. It subscribes only to the
-// authors of the trust scope (§10) and subscribes again when the scope changes.
+// authors of the trust scope (§10) and subscribes again when the scope changes. It runs only with trust.nostr
+// (§2.6: fetching trust and profiles from Nostr is optional); without it the relays get only our own events.
 func (n *Node) bridge(ctx context.Context) {
+	if !n.cfg.Trust.Nostr {
+		return
+	}
 	n.p2p.OnNewEvent(func(ev *nostr.Event, source string) {
 		if source == "nostr" || source == "local" {
 			return

@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -144,6 +146,30 @@ func Network(ev *nostr.Event) string {
 // Revoked tells whether a delegation is revoked.
 func Revoked(ev *nostr.Event) bool { return Tag(ev, "revoked") == "true" }
 
+// MaxListURLs bounds the list_url tags taken from one delegation.
+const MaxListURLs = 4
+
+// ListURLs returns the list_url tags of a delegation (§2.2, §2.6): the https URLs where the operator keeps the
+// bundle of its list. Other values are ignored (the delegation itself stays valid).
+func ListURLs(ev *nostr.Event) []string {
+	var out []string
+	for t := range ev.Tags.FindAll("list_url") {
+		if len(out) == MaxListURLs {
+			break
+		}
+		if u := t[1]; IsHTTPSURL(u) && !slices.Contains(out, u) {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// IsHTTPSURL tells whether s is an absolute https URL with a host and without user information.
+func IsHTTPSURL(s string) bool {
+	u, err := url.Parse(s)
+	return err == nil && u.Scheme == "https" && u.Host != "" && u.User == nil && len(s) <= 2048
+}
+
 // Relay is a mailbox relay of a list.
 type Relay struct {
 	URL           string `json:"url"`
@@ -163,14 +189,16 @@ type Entry struct {
 
 // List is the content of kind 30501.
 type List struct {
-	Network  string          `json:"network"`
-	Name     string          `json:"name"`
-	Regions  []string        `json:"regions"`
-	Relays   []Relay         `json:"relays"`
-	Chain    json.RawMessage `json:"chain,omitempty"`
-	Entries  []Entry         `json:"entries"`
-	Donation json.RawMessage `json:"donation,omitempty"`
-	ReportTo string          `json:"report_to,omitempty"`
+	Network string   `json:"network"`
+	Name    string   `json:"name"`
+	Regions []string `json:"regions"`
+	Relays  []Relay  `json:"relays"`
+	// P2PRelays are multiaddrs of the network's p2p relays (§2.3, §10), dialled and reserved like p2p.relays.
+	P2PRelays []string        `json:"p2p_relays,omitempty"`
+	Chain     json.RawMessage `json:"chain,omitempty"`
+	Entries   []Entry         `json:"entries"`
+	Donation  json.RawMessage `json:"donation,omitempty"`
+	ReportTo  string          `json:"report_to,omitempty"`
 }
 
 // ParseList decodes the content of a list event.

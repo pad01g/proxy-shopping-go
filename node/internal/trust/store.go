@@ -550,3 +550,64 @@ func Find(rows []Row, m Match, preferOperator string) []Row {
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Operator == preferOperator && out[j].Operator != preferOperator })
 	return out
 }
+
+// delegationsLocked returns the effective delegations of the coordinators in the network (not revoked), in the
+// order of the coordinators and then of the operators.
+func (s *Store) delegationsLocked(coordinators []string, network string) []*nostr.Event {
+	var out []*nostr.Event
+	for _, c := range coordinators {
+		var dels []*nostr.Event
+		for k, ev := range s.events {
+			if k.Kind == KindDelegation && k.PubKey == c && Network(ev) == network && !Revoked(ev) {
+				dels = append(dels, ev)
+			}
+		}
+		sort.Slice(dels, func(i, j int) bool { return Tag(dels[i], "d") < Tag(dels[j], "d") })
+		out = append(out, dels...)
+	}
+	return out
+}
+
+// ListURLs returns the list_url values (§2.2) of the effective delegations of the coordinators, without duplicates.
+func (s *Store) ListURLs(coordinators []string, network string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []string
+	for _, ev := range s.delegationsLocked(coordinators, network) {
+		for _, u := range ListURLs(ev) {
+			if !slices.Contains(out, u) {
+				out = append(out, u)
+			}
+		}
+	}
+	return out
+}
+
+// MaxP2PRelays bounds the p2p relays taken from the effective lists together.
+const MaxP2PRelays = 16
+
+// P2PRelays returns the p2p_relays (§2.3) of the lists of the effectively delegated operators, without duplicates.
+func (s *Store) P2PRelays(coordinators []string, network string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []string
+	for _, del := range s.delegationsLocked(coordinators, network) {
+		ev := s.events[Key{Kind: KindList, PubKey: Tag(del, "d"), D: network}]
+		if ev == nil {
+			continue
+		}
+		l, err := ParseList(ev)
+		if err != nil {
+			continue
+		}
+		for _, a := range l.P2PRelays {
+			if len(out) == MaxP2PRelays {
+				return out
+			}
+			if a != "" && !slices.Contains(out, a) {
+				out = append(out, a)
+			}
+		}
+	}
+	return out
+}

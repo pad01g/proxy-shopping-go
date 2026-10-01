@@ -21,7 +21,7 @@ func newTestNode(t *testing.T, ctx context.Context, relay, coordinators, extra s
 	if coordinators == "" {
 		coordinators = fmt.Sprintf("%q", newActor().pk)
 	}
-	yaml := fmt.Sprintf("role: operator\nmnemonic_file: %s\ndata_dir: %s\nnostr: {relays: [%q], allow_private_relays: true}\np2p: {listen: [\"/ip4/127.0.0.1/tcp/0\"]}\ntrust: {coordinators: [%s]}\n%s",
+	yaml := fmt.Sprintf("role: operator\nmnemonic_file: %s\ndata_dir: %s\nnostr: {relays: [%q], allow_private_relays: true}\np2p: {listen: [\"/ip4/127.0.0.1/tcp/0\"]}\ntrust: {coordinators: [%s], nostr: true}\n%s",
 		filepath.Join("..", "..", "..", "lab", "keys", "operator-2.mnemonic"), t.TempDir(), relay, coordinators, extra)
 	cfg, err := config.Parse([]byte(yaml))
 	if err != nil {
