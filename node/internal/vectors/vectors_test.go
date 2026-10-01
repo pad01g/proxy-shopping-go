@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,11 +12,15 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
+	p2pcrypto "github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/nbd-wtf/go-nostr"
 
 	"github.com/pad01g/proxy-shopping-go/node/internal/delivery"
 	"github.com/pad01g/proxy-shopping-go/node/internal/giftwrap"
 	"github.com/pad01g/proxy-shopping-go/node/internal/keys"
+	"github.com/pad01g/proxy-shopping-go/node/internal/p2p"
+	"github.com/pad01g/proxy-shopping-go/node/internal/trust"
 )
 
 var (
@@ -125,5 +130,42 @@ func TestLabProxyCreationCodeMatchesContracts(t *testing.T) {
 	}
 	if got := strings.TrimPrefix(strings.TrimSpace(string(data)), "0x"); got != LabProxyCreationCode {
 		t.Fatal("LabProxyCreationCode differs from contracts/abi/SafeProxy.creationCode.hex")
+	}
+}
+
+// The p2p vectors: the bundle verifies event by event and in bundle order, the peer id is that of the protobuf
+// public key, and the /ps/msg request line is the gift wrap for shopper-1.
+func TestP2PVectors(t *testing.T) {
+	f, err := Generate(keyDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := f.P2P["bundle"].(*trust.Bundle)
+	kinds := []int{}
+	for _, ev := range b.Events {
+		if err := trust.Validate(ev); err != nil {
+			t.Fatalf("bundle event kind %d: %v", ev.Kind, err)
+		}
+		kinds = append(kinds, ev.Kind)
+	}
+	if fmt.Sprint(kinds) != "[30500 30501 30502 10050]" {
+		t.Fatalf("bundle order %v", kinds)
+	}
+	if urls := trust.ListURLs(b.Events[0]); len(urls) != 1 || urls[0] != f.P2P["list_url"] {
+		t.Fatalf("list_url %v", urls)
+	}
+	raw, _ := hex.DecodeString(f.Libp2p["pubkey_protobuf"].(string))
+	pub, err := p2pcrypto.UnmarshalPublicKey(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := peer.IDFromPublicKey(pub)
+	if id.String() != f.Libp2p["peer_id"] || id.String() != f.Keys["abandon"].Libp2pPeerID {
+		t.Fatalf("peer id %s", id)
+	}
+	shopper, _ := keys.LoadMnemonicFile(filepath.Join(keyDir, "shopper-1.mnemonic"))
+	line := strings.TrimSuffix(f.P2P["msg"].(map[string]any)["request_line"].(string), "\n")
+	if _, err := p2p.CheckMsgLine([]byte(line), shopper.NostrPubHex()); err != nil {
+		t.Fatalf("request line: %v", err)
 	}
 }
