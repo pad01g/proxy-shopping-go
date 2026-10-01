@@ -11,12 +11,18 @@ Go 実装（`proxy-shopping-go`）と TypeScript 実装（`proxy-shopping-web`�
 ## 0. 構成
 
 ```
-ブラウザ（proxy-shopping-web）             Go ノード（proxy-shopping-go/node）
-  鍵はブラウザ内・署名もブラウザ       shopper / escrow / operator / coordinator / relay
-        │ WSS（外向きのみ）                       │ WSS            │ libp2p
-        ▼                                          ▼                ▼
-   Nostr リレー群（オペレータが一覧で指定） ◀──▶  Go ノード同士の網（gossipsub, circuit relay v2, DCUtR）
-   = 常時オンラインの口 + メールボックス
+アプリ（Android, proxy-shopping-web の core）   Go ノード（proxy-shopping-go/node）
+ブラウザ（proxy-shopping-web）                   shopper / escrow / operator / coordinator / relay
+  鍵は端末内・署名も端末
+   │ libp2p（WSS / circuit relay v2 / WebRTC）     │ libp2p（TCP / WS / WSS, DCUtR）
+   ▼                                               ▼
+   P2P の網（gossipsub: 信頼・プロフィール, stream: 1 対 1 のメッセージ）◀── p2p relay（公開の Go ノード）
+   │ HTTPS                                          │
+   ▼                                                ▼
+   operator / coordinator の URL（署名済みの一覧・委任書の束）
+   │ WSS（外向きのみ）
+   ▼
+   Nostr リレー群 = 相手がいないときのメールボックス（＋任意で信頼・プロフィールの取り寄せ先）
 ```
 
 | 役割 | 常時オンライン | 動かし方 | 責任 |
@@ -26,10 +32,12 @@ Go 実装（`proxy-shopping-go`）と TypeScript 実装（`proxy-shopping-web`�
 | escrow | いいえ | ブラウザ または Go ノード | 前払い手数料を受けた注文の紛争を T1 までに裁定 |
 | operator | いいえ | ブラウザ または Go ノード / `psctl` | 地域ごとに信頼できる shopper × escrow の組み合わせ一覧を署名 |
 | coordinator | いいえ | ブラウザ または `psctl` | オペレータへの委任書を署名 |
-| mailbox | はい | Nostr リレー（`psrelay`, khatru） | 暗号文の一時保管 |
-| p2p relay | はい | Go ノード（`-role relay`） | NAT の内側の Go ノードのための circuit relay v2 |
+| mailbox | はい | Nostr リレー（`psrelay`, khatru） | 相手が P2P で届かないときの暗号文の一時保管 |
+| p2p relay | はい | Go ノード（`-role relay`） | NAT の内側のノード・アプリのための circuit relay v2、gossipsub の中継 |
 
-ブラウザ（user / escrow / operator / coordinator）は Nostr だけを使う。libp2p を使うのは Go ノード同士だけ。
+- **アプリ**（Android, Capacitor）と Go ノードは libp2p の網に参加する（§10）。信頼とプロフィールは P2P と URL で受け取り、1 対 1 のメッセージは P2P を優先し、届かなければ Nostr のメールボックスに預ける（§4.2）。
+- **ブラウザ**は libp2p に参加してよい（WSS で p2p relay へ）が、しなくてもよい。しない場合は URL と Nostr だけを使う。
+- Nostr から信頼・プロフィールを取り寄せるのは **任意**（設定で有効にする）。1 対 1 のメッセージの預け先としては常に使う。
 
 ## 1. 鍵
 
@@ -38,7 +46,7 @@ BIP39 のニーモニック（12 または 24 語, パスフレーズ無し）�
 | 用途 | 導出パス | 備考 |
 |---|---|---|
 | 身元（Nostr 鍵） | `m/44'/1237'/0'/0/0` | NIP-06。一覧・プロフィール・メッセージの署名鍵。公開鍵は x-only |
-| libp2p の鍵 | `m/7333'/0'/0'` | Go ノードのみ。libp2p の secp256k1 鍵として使う |
+| libp2p の鍵 | `m/7333'/0'/0'` | Go ノードとアプリ。libp2p の secp256k1 鍵として使う（peer ID はこの鍵から決まる） |
 | BTC 注文鍵（user / shopper） | `m/7333'/1'/{idx}'` | idx は §1.1 |
 | BTC 注文鍵（escrow） | `m/7333'/2'/{idx}` | **非 hardened**。escrow はオフラインでもよいので、`m/7333'/2'` の xpub をプロフィールに載せ、相手が導出する |
 | BTC 財布（入金元・受取先） | `m/84'/1'/0'/0/0` | P2WPKH（`tb1q…`）。受取・返金・手数料の受け口もこのアドレス |
@@ -58,7 +66,7 @@ BIP39 のニーモニック（12 または 24 語, パスフレーズ無し）�
 ## 2. 信頼の委譲と一覧
 
 yacy の trust bundle と同じ考え方。委譲は 1 段、有効期限は持たず、バージョンで管理する。
-すべて Nostr のイベント（署名付き）で表し、Nostr リレーと libp2p gossipsub の両方で配る。
+すべて Nostr 形式の署名付きイベントで表す（イベントの形と署名は Nostr と同じだが、配り方は Nostr に限らない。§2.6）。
 
 ```
 coordinator 鍵（利用者が設定。複数可、先頭ほど優先）
@@ -85,6 +93,7 @@ coordinator 鍵（利用者が設定。複数可、先頭ほど優先）
 ```
 
 - `revoked` が `"true"` の版が最新なら、その operator の一覧は（この coordinator の下では）無効。
+- 任意のタグ `["list_url", "https://…"]`: その operator が一覧の束（§2.6）を置く URL。coordinator が署名するので、URL そのものも委任の一部として守られる。複数可。
 
 ### 2.3 一覧 kind 30501
 
@@ -96,6 +105,7 @@ coordinator 鍵（利用者が設定。複数可、先頭ほど優先）
   "name": "Kanto operator",
   "regions": ["JP-13", "JP-14"],
   "relays": [{"url": "wss://relay-1.test", "retention_days": 30}],
+  "p2p_relays": ["/dns4/relay.example/tcp/443/tls/ws/p2p/16Uiu2…"],
   "chain": {
     "btc": {"network": "signet", "esplora": ["https://esplora.test"]},
     "evm": {"chain_id": 31337, "rpc": ["https://evm.test"], "usdc": "0x…", "safe": {"singleton": "0x…", "factory": "0x…", "fallback_handler": "0x…", "multisend_call_only": "0x…", "module": "0x…", "setup": "0x…"}}
@@ -121,6 +131,8 @@ coordinator 鍵（利用者が設定。複数可、先頭ほど優先）
 - `escrow_sla_days`: escrow が紛争の申立から裁定までにかける日数の上限。**T1 より前に裁定する**ことが escrow の義務。
 - `donation`: 任意の寄付欄。user のクライアントは `bps > 0` のとき支払いのトランザクションに出力を足すことを **提案**する（既定オフ、利用者が選ぶ）。プロトコル上の義務ではない。
 - `chain`: 推奨の接続先。利用者は設定で上書きしてよい。
+- `relays`: 一覧に載った主体の受信箱（Nostr のメールボックス）の推奨。
+- `p2p_relays`（任意）: この網の p2p relay（§10）の multiaddr。アプリ・ブラウザが dial できるよう `/tls/ws`（WSS）の形を少なくとも 1 つ含める。
 - 掲載料・預かり金（bond）・没収は **プロトコルの外** の、operator と shopper / escrow の間の規約。参考実装を `contracts/examples/bond` に置く。
 
 ### 2.4 実効の組み合わせ
@@ -147,6 +159,22 @@ coordinator 鍵（利用者が設定。複数可、先頭ほど優先）
 
 - 一覧の `entries[].region` が店の地域をカバーしていること。
 - 現金のみの店は、shopper の `cash_regions` のどれかが店の地域をカバーしていること（§3.1）。
+
+### 2.6 配り方と取り寄せ
+
+署名で検証するので、**どこから届いても扱いは同じ**（§2.1 の `v` で新旧を決め、§2.4 で組み立てる）。経路は次のとおり。
+
+| 経路 | 何を | 誰が出す | 既定 |
+|---|---|---|---|
+| P2P（gossipsub §10, `/ps/trust-sync`） | 30500 / 30501 / 30502 / 30503 / 10050 | 署名した本人のノード・アプリ、受け取って検証したノードの再送 | 有効 |
+| 一覧の束の URL（`list_url`, §2.2） | その operator の 30501 と、一覧に載せた shopper / escrow の最新の 30502 / 30503 / 10050 | operator | 有効 |
+| 信頼の束の URL（`bundle_urls`, 設定） | coordinator の 30500（と任意で 30501 …） | coordinator | 有効（設定したとき） |
+| Nostr リレー | 同上 | 本人 | **任意（既定は無効）** |
+
+- **束（bundle）の形**: `application/json` で `{"events": [<署名付きイベント>, …]}`。順は委任書 → 一覧 → プロフィール。受け手は 1 つずつ検証し、通らないものは捨てる（束の中の 1 件の不正で全体を捨てない）。上限 2 MiB・1000 件。
+- operator は一覧を更新するたびに束を作り直して `list_url` に置き、同じイベントを P2P にも出す。束に入れる shopper / escrow のプロフィールは **本人が署名したものをそのまま** 入れる（operator は書き換えられない）。
+- **取り寄せの順**: 起動時と 10 分ごとに、`bundle_urls` → 委任書の `list_url` → P2P の `/ps/trust-sync`（接続した相手ごと）→（有効なら）Nostr。gossipsub で届いたものはその都度取り込む。
+- 束の取得は HTTPS のみ（lab は内部 CA）。リダイレクトは同じ origin のみ。
 
 ## 3. プロフィール
 
@@ -210,6 +238,14 @@ NIP-59 の 3 層に従う。ただし中身（rumor）は **署名付き** に�
 
 ### 4.2 届け方
 
+**P2P を優先し、届かなければ Nostr のメールボックスに預ける。** どちらでも中身は同じ wrap（kind 1059）で、受け手は inner の `id` で重複を除く。
+
+1. 受け手の libp2p の宛先を知っていれば（shopper / escrow はプロフィールの `p2p`、user は `order.request` の `reply_p2p` §4.4）、stream `/ps/msg/1.0.0` で wrap を送る（§10）。
+2. 受け手が 10 秒以内に stream で `{"ok": true}` を返せば、P2P で届いたとみなす（これは転送の受領で、署名付きの受領は従来どおり `ack`）。
+3. 届かなかった・宛先を知らない・P2P に参加していないときは、Nostr のメールボックスへ送る（以下）。`ack` が来るまでの再送は、P2P と Nostr の両方で行ってよい。
+
+Nostr のメールボックス:
+
 - 送り手は受け手の受信箱リレー（§3.3）のうち **k 個以上**（既定 k=2, 足りなければ全部）へ wrap を送る。
 - 受け手は `{"kinds":[1059], "#p":[自分]}` を購読する。
 - 受け手は受け取った inner の `id` を `ack` で返す（ack 自身には ack しない）。
@@ -262,11 +298,14 @@ NIP-59 の 3 層に従う。ただし中身（rumor）は **署名付き** に�
   "user_btc_pubkey": "<33 byte 圧縮公開鍵 hex>（btc のとき）",
   "user_btc_address": "tb1q…（返金先）",
   "user_evm_address": "0x…（usdc のとき）",
-  "relays": ["wss://…"]
+  "relays": ["wss://…"],
+  "reply_p2p": {"peer_id": "16Uiu2…", "addrs": ["/dns4/relay.example/tcp/443/tls/ws/p2p/16Uiu2…/p2p-circuit/p2p/16Uiu2…"]}
 }
 ```
 
 `Address = {"name","postal_code","address","phone"}`。
+
+- `reply_p2p`（任意）: user の libp2p の宛先（§10）。署名付きの inner に入るので、この peer ID が user のものであることは user の身元鍵が保証する。shopper はこれを使って user へ P2P で返信する。
 
 - K は 32 byte の乱数。
 - `key_for_escrow = NIP-44 v2(user→escrow, hex(K))` は **order.request に入れない**。
@@ -598,9 +637,13 @@ TrackingQuery   = {shop_url, shop_order_id}
 TrackingStatus  = {status: "processing" | "shipped" | "delivered" | "failed", carrier?, tracking_no?, updated_at, evidence: Evidence[]}
 ```
 
-## 10. libp2p（Go ノード同士）
+## 10. libp2p（Go ノードとアプリ）
 
-- 鍵は §1 の libp2p の鍵。transport は TCP と WebSocket。AutoNAT, circuit relay v2（client）, DCUtR を有効にする。`-role relay` のノードは relay service を動かす。
+- 鍵は §1 の libp2p の鍵。暗号化は Noise、多重化は yamux、identify を使う。
+- **Go ノード**: transport は TCP・WebSocket・WSS（`/tls/ws` の dial）。AutoNAT, circuit relay v2（client）, DCUtR を有効にする。`-role relay` のノードは relay service を動かし、`/tls/ws` で dial できる口を少なくとも 1 つ持つ（TLS は前段で終端してよい）。
+- **アプリ・ブラウザ**: transport は WSS（p2p relay への dial）、circuit relay v2（client: 予約して `/p2p-circuit` の宛先を持つ）、WebRTC（任意。使えない環境では relay 越しの stream だけで動く）。relay service は動かさない。
+- 接続先: 設定の `p2p.bootstrap` / `p2p.relays` と、実効の一覧の `p2p_relays`（§2.3）。
+- 自分の宛先（`addrs`）は、relay で予約した `/p2p-circuit` の multiaddr を含めて、プロフィール（§3）の `p2p` と `order.request` の `reply_p2p` に載せる。
 - gossipsub の topic:
   - `/ps/<network>/trust/1`: kind 30500 / 30501 のイベント（JSON）
   - `/ps/<network>/profiles/1`: kind 30502 / 30503 / 10050
@@ -611,6 +654,7 @@ TrackingStatus  = {status: "processing" | "shipped" | "delivered" | "failed", ca
   - 実効の一覧に載った shopper / escrow のプロフィールと 10050
   - それ以外の 10050（注文の相手の user など）は、必要なときに取りに行き、保存数に上限を設け、中継しない。
 - stream プロトコル:
+  - `/ps/msg/1.0.0`: 1 対 1 のメッセージ（§4.2）。送り手は wrap（kind 1059）の JSON を 1 つ送り（改行区切り、上限 64 KiB）、受け手は `{"ok": true}` か `{"ok": false, "error": "…"}` を 1 行返して閉じる。受け手は wrap の `p` タグが自分の身元でなければ `ok:false`。中身の検証と保存は Nostr で受けたときと同じ。
   - `/ps/status/1.0.0`: 要求なし → `{"pubkey","role","network","reachability","trust":{"<operator pk>": v, …},"at"}` を身元鍵で署名した kind 5401 のイベント
   - `/ps/trust-sync/1.0.0`: 自分が持つ trust / profiles のイベントを全部送る。委任書 → 一覧 → プロフィールの順に送る（受け手が件数の上限で打ち切っても、信頼の根から先に届くように）
 
@@ -642,6 +686,9 @@ user                     shopper                   escrow               operator
 ```
 
 ## 12. 既知の制約
+
+- P2P の宛先（`p2p.addrs`）は relay の予約が切れると変わる。プロフィールは予約の更新に合わせて出し直す。宛先が古くて届かなければ Nostr のメールボックスに落ちるだけで、メッセージは失われない。
+- アプリは画面を閉じると P2P から外れる。その間のメッセージは Nostr のメールボックスで受ける。
 
 - lab の `evm.test`（anvil の RPC をそのまま公開）と `faucet.test` は、誰でも時刻を進めたり残高を作ったりできる。lab 専用で、公開網で同じ構成にしてはならない。
 
