@@ -52,6 +52,8 @@ type Order struct {
 	Updated int64    `json:"updated"`
 	Error   string   `json:"error,omitempty"`
 	Relays  []string `json:"relays,omitempty"` // where the user reads
+	// ReplyP2P is the request's reply_p2p when it is valid (§4.4): where the user takes messages over libp2p.
+	ReplyP2P *proto.P2PContact `json:"reply_p2p,omitempty"`
 
 	Request proto.OrderRequest      `json:"request"`
 	Quote   *proto.OrderQuote       `json:"quote,omitempty"`

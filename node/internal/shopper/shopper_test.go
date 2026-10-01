@@ -808,3 +808,23 @@ func TestOrderHelpers(t *testing.T) {
 		t.Error("disputed is not terminal")
 	}
 }
+
+// reply_p2p (§4.4) is optional: a valid one is kept with the order (the node replies over libp2p), an invalid one
+// is ignored and noted, and the order goes on either way.
+func TestRequestReplyP2P(t *testing.T) {
+	v := newEnv(t)
+	ctx := context.Background()
+	const peerID = "16Uiu2HAmE2FwVbZbrdbXNM6UsSRZwM4tQJ696kUmfpCNXYuz5HSa"
+	good := v.request(t, "0123456789abcdef0123456789abcde1", address)
+	good.ReplyP2P = &proto.P2PContact{PeerID: peerID, Addrs: []string{"/dns4/relay.example/tcp/443/tls/ws/p2p/16Uiu2HAmFngaVFK4D5fix5qN2c6guh3LNyBkmuB42vTFW9aaeDZh/p2p-circuit/p2p/" + peerID}}
+	v.e.onRequest(ctx, v.msg(t, v.user.NostrSecretHex(), "0123456789abcdef0123456789abcde1", proto.TypeOrderRequest, good))
+	if o := v.order(t, "0123456789abcdef0123456789abcde1"); o.ReplyP2P == nil || o.ReplyP2P.PeerID != peerID {
+		t.Fatalf("reply_p2p not kept: %+v", o.ReplyP2P)
+	}
+	bad := v.request(t, "0123456789abcdef0123456789abcde2", address)
+	bad.ReplyP2P = &proto.P2PContact{PeerID: peerID, Addrs: []string{"/ip4/1.2.3.4/tcp/1/p2p/16Uiu2HAmFngaVFK4D5fix5qN2c6guh3LNyBkmuB42vTFW9aaeDZh"}}
+	v.e.onRequest(ctx, v.msg(t, v.user.NostrSecretHex(), "0123456789abcdef0123456789abcde2", proto.TypeOrderRequest, bad))
+	if o := v.order(t, "0123456789abcdef0123456789abcde2"); o.ReplyP2P != nil {
+		t.Fatalf("reply_p2p of another peer kept: %+v", o.ReplyP2P)
+	}
+}

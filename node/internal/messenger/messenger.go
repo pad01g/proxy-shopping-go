@@ -1,5 +1,6 @@
-// Package messenger delivers and receives the 1:1 messages of spec §4: it gift-wraps inner events, sends them to
-// k inbox relays of the recipient, resends every 30 seconds until an ack arrives (for at most 7 days), acks and
+// Package messenger delivers and receives the 1:1 messages of spec §4: it gift-wraps inner events, sends them over
+// libp2p (/ps/msg/1.0.0) when the recipient's address is known and to k inbox relays of the recipient otherwise
+// (§4.2), resends every 30 seconds until an ack arrives (for at most 7 days), acks and
 // de-duplicates what it receives, and keeps outbox and inbox in the store.
 //
 // A received message is stored (not yet handled) before it is acked and before its handler runs, and marked
@@ -10,6 +11,7 @@ package messenger
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
@@ -74,7 +76,22 @@ var (
 	OtherRetention   = 30 * 24 * time.Hour
 	// PruneInterval is how often old entries are removed.
 	PruneInterval = time.Hour
+
+	// DirectTimeout is the budget of one P2P delivery (§4.2: the recipient answers within 10 seconds, or the
+	// message goes to the mailbox).
+	DirectTimeout = 10 * time.Second
 )
+
+// ViaP2P is the Relay of messages received over libp2p and the path of messages delivered that way.
+const ViaP2P = "p2p"
+
+// DirectFunc delivers a wrap to the recipient over libp2p (§4.2, §10). It reports false without an error when
+// it knows no address of the recipient; false with an error when the recipient did not take the wrap.
+type DirectFunc func(ctx context.Context, to, orderID string, wrap *nostr.Event) (bool, error)
+
+// ObserveFunc sees every message when it is first stored, before its handler and its ack (e.g. to remember the
+// reply_p2p of an order.request, §4.4).
+type ObserveFunc func(msg *Message)
 
 // Message is a received, verified message.
 type Message struct {
@@ -121,6 +138,7 @@ type outboxEntry struct {
 	Created  int64        `json:"created"`
 	LastSent int64        `json:"last_sent"`
 	Sent     []string     `json:"sent,omitempty"` // relays that accepted the last sending
+	Via      string       `json:"via,omitempty"`  // ViaP2P when the last sending went over libp2p
 	Acked    bool         `json:"acked"`
 	AckedAt  int64        `json:"acked_at,omitempty"`
 }
@@ -128,7 +146,7 @@ type outboxEntry struct {
 type inboxEntry struct {
 	Inner    *nostr.Event `json:"inner"`
 	Received int64        `json:"received"`
-	Relay    string       `json:"relay"`
+	Relay    string       `json:"relay"` // or ViaP2P
 	// Pending is set until the handler returned. Entries written before this field existed read as handled.
 	Pending bool  `json:"pending,omitempty"`
 	Handled int64 `json:"handled,omitempty"`
@@ -155,7 +173,12 @@ type Messenger struct {
 	retry       RetryFunc
 	accepts     AcceptFunc
 	hints       HintsFunc
+	direct      DirectFunc
+	observe     ObserveFunc
 	log         *slog.Logger
+
+	runMu  sync.Mutex
+	runCtx context.Context // of the current Start (P2P receiving needs a running messenger)
 
 	mu       sync.Mutex
 	handlers map[string]Handler
@@ -165,9 +188,9 @@ type Messenger struct {
 	outbox map[string]*outMeta
 
 	// the package defaults at New
-	retryInterval, retryLimit, handlerTimeout time.Duration
-	subLimit, backlogPage                     int
-	backlogInterval                           time.Duration
+	retryInterval, retryLimit, handlerTimeout, directTimeout time.Duration
+	subLimit, backlogPage                                    int
+	backlogInterval                                          time.Duration
 
 	disp      *dispatcher
 	senders   *rateLimiter
@@ -207,6 +230,8 @@ type Config struct {
 	Retry    RetryFunc  // nil: resend everything, nobody is a known counterparty
 	Accepts  AcceptFunc // nil: accept every message
 	Hints    HintsFunc  // nil: no hints but the relay a message came from
+	Direct   DirectFunc // nil: Nostr only
+	Observe  ObserveFunc
 	Log      *slog.Logger
 }
 
@@ -227,13 +252,13 @@ func New(c Config) (*Messenger, error) {
 	}
 	m := &Messenger{
 		secret: c.Secret, Pub: pub, pool: c.Pool, db: c.DB, inbox: c.Inbox, defaults: c.Defaults, k: c.K,
-		resolve: c.Resolve, retry: c.Retry, accepts: c.Accepts, hints: c.Hints, log: c.Log.With("component", "messenger"),
+		resolve: c.Resolve, retry: c.Retry, accepts: c.Accepts, hints: c.Hints, direct: c.Direct, observe: c.Observe, log: c.Log.With("component", "messenger"),
 		handlers: map[string]Handler{}, outbox: map[string]*outMeta{},
 		senders: newRateLimiter(SenderRate, SenderBurst), strangers: newRateLimiter(StrangerRate, StrangerBurst),
 		parties: newRateLimiter(CounterpartyRate, CounterpartyBurst),
 		known:   map[string]time.Time{},
 		ackq:    map[ackKey]*ackBatch{}, ackWake: make(chan struct{}, 1), acked: map[string]time.Time{},
-		retryInterval: RetryInterval, retryLimit: RetryLimit, handlerTimeout: HandlerTimeout,
+		retryInterval: RetryInterval, retryLimit: RetryLimit, handlerTimeout: HandlerTimeout, directTimeout: DirectTimeout,
 		subLimit: SubscribeLimit, backlogPage: max(BacklogPage, 1), backlogInterval: BacklogInterval,
 	}
 	m.disp = newDispatcher(m)
@@ -270,11 +295,14 @@ func (m *Messenger) handler(typ string) Handler {
 // ctx ends. Register the handlers before. Start may be called again after the context of the previous call ended
 // (Pause / resume of the node); handlers still running from before keep their order busy until they return.
 func (m *Messenger) Start(ctx context.Context) {
+	m.runMu.Lock()
+	m.runCtx = ctx
+	m.runMu.Unlock()
 	m.disp.start(ctx)
 	m.redispatch()
 	filter := nostr.Filter{Kinds: []int{giftwrap.KindWrap}, Tags: nostr.TagMap{"p": {m.Pub}}, Limit: m.subLimit}
 	m.pool.Subscribe(ctx, m.inbox, nostr.Filters{filter}, func(relay string, ev *nostr.Event) {
-		m.receive(ctx, relay, ev)
+		_ = m.receive(ctx, relay, ev)
 	})
 	for i := 0; i < max(AckWorkers, 1); i++ {
 		go m.ackLoop(ctx)
@@ -316,7 +344,7 @@ func (m *Messenger) readBacklog(ctx context.Context, relay string) {
 		evs := m.pool.Query(ctx, []string{relay}, f)
 		oldest := until
 		for _, ev := range evs {
-			m.receive(ctx, relay, ev)
+			_ = m.receive(ctx, relay, ev)
 			oldest = min(oldest, ev.CreatedAt)
 		}
 		if len(evs) < m.backlogPage {
@@ -418,7 +446,23 @@ func (m *Messenger) deliver(ctx context.Context, e *outboxEntry) {
 		m.log.Debug("paused, not sending", "type", giftwrap.Type(e.Inner), "to", e.To)
 		return
 	}
+	// §4.2: libp2p first; the mailbox when it is not delivered (or no address is known)
+	via := ""
+	if m.direct != nil {
+		dctx, cancel := context.WithTimeout(ctx, m.directTimeout)
+		delivered, err := m.direct(dctx, e.To, giftwrap.OrderID(e.Inner), e.Wrap)
+		cancel()
+		switch {
+		case delivered:
+			via = ViaP2P
+		case err != nil:
+			m.log.Info("P2P delivery failed, using the mailbox", "type", giftwrap.Type(e.Inner), "to", short(e.To), "err", err)
+		}
+	}
 	need := min(m.k, len(e.Relays))
+	if via == ViaP2P {
+		need = 0
+	}
 	var ok []string
 	var errs []error
 	rest := e.Relays
@@ -433,6 +477,12 @@ func (m *Messenger) deliver(ctx context.Context, e *outboxEntry) {
 	if len(ok) < need {
 		m.log.Warn("message reached too few relays", "type", giftwrap.Type(e.Inner), "to", e.To, "ok", len(ok), "need", need, "errs", errs)
 	}
+	if via == "" && len(ok) > 0 {
+		via = "nostr"
+	}
+	if via != "" {
+		m.log.Info("delivered", "type", giftwrap.Type(e.Inner), "to", short(e.To), "order", giftwrap.OrderID(e.Inner), "via", via, "relays", len(ok))
+	}
 	now := time.Now().Unix()
 	if giftwrap.Type(e.Inner) == proto.TypeAck {
 		return
@@ -443,7 +493,7 @@ func (m *Messenger) deliver(ctx context.Context, e *outboxEntry) {
 			return store.ErrStop
 		}
 		stored = true
-		v.LastSent, v.Sent, v.Wrap, v.Relays, v.Resends = now, ok, e.Wrap, e.Relays, e.Resends
+		v.LastSent, v.Sent, v.Wrap, v.Relays, v.Resends, v.Via = now, ok, e.Wrap, e.Relays, e.Resends, via
 		return nil
 	})
 	if stored {
@@ -549,6 +599,18 @@ func (m *Messenger) Pending() []*nostr.Event {
 	return out
 }
 
+// DeliveredVia tells how the last sending of an inner event went: ViaP2P, "nostr", or "" (not sent, or failed).
+func (m *Messenger) DeliveredVia(innerID string) string {
+	var e outboxEntry
+	if ok, _ := m.db.Get(bucketOutbox, innerID, &e); !ok {
+		return ""
+	}
+	if e.Via == "" && len(e.Sent) > 0 {
+		return "nostr"
+	}
+	return e.Via
+}
+
 // Acked tells whether the recipient acknowledged an inner event.
 func (m *Messenger) Acked(innerID string) bool {
 	m.outMu.Lock()
@@ -557,57 +619,84 @@ func (m *Messenger) Acked(innerID string) bool {
 	return meta != nil && meta.acked
 }
 
-func (m *Messenger) receive(ctx context.Context, relay string, wrap *nostr.Event) {
-	if time.Since(wrap.CreatedAt.Time()) > WrapMaxAge || m.db.Has(bucketWraps, wrap.ID) {
-		return
+// Errors of receive: why a wrap was not taken (the answer of /ps/msg/1.0.0, §10).
+var (
+	ErrExpired     = errors.New("wrap too old")
+	ErrInvalidWrap = errors.New("not a valid wrap")
+	ErrUnwrap      = errors.New("cannot unwrap")
+	ErrNotAccepted = errors.New("not accepted")
+	ErrRateLimited = errors.New("rate limited")
+	ErrStore       = errors.New("cannot store")
+	ErrNotRunning  = errors.New("not receiving")
+)
+
+// ReceiveDirect takes a wrap that came over libp2p (/ps/msg/1.0.0, §4.2) through the same checks, de-duplication
+// and storage as one from a relay. nil means the wrap is taken (stored, or a copy of a message we have): the
+// sender may then consider it delivered.
+func (m *Messenger) ReceiveDirect(wrap *nostr.Event) error {
+	m.runMu.Lock()
+	ctx := m.runCtx
+	m.runMu.Unlock()
+	if ctx == nil || ctx.Err() != nil || m.paused.Load() {
+		return ErrNotRunning
+	}
+	return m.receive(ctx, ViaP2P, wrap)
+}
+
+func (m *Messenger) receive(ctx context.Context, relay string, wrap *nostr.Event) error {
+	if time.Since(wrap.CreatedAt.Time()) > WrapMaxAge {
+		return ErrExpired
+	}
+	if m.db.Has(bucketWraps, wrap.ID) {
+		return nil
 	}
 	// only an id that is the hash of this very wrap may be remembered as seen: a relay could otherwise send junk
 	// under the id of a real wrap and have us drop the real one (the pool checks this too)
 	if wrap.Kind != giftwrap.KindWrap || giftwrap.Verify(wrap) != nil {
 		m.log.Debug("dropping an event with a wrong id or signature", "id", wrap.ID, "relay", relay)
-		return
+		return ErrInvalidWrap
 	}
 	inner, err := giftwrap.Unwrap(m.secret, wrap)
 	if err != nil {
 		m.seen(wrap)
 		m.log.Debug("dropping wrap", "id", wrap.ID, "relay", relay, "err", err)
-		return
+		return ErrUnwrap
 	}
 	typ := giftwrap.Type(inner)
 	msg := &Message{Inner: inner, From: inner.PubKey, Type: typ, OrderID: giftwrap.OrderID(inner), Relay: relay}
 	if typ == proto.TypeAck {
 		m.seen(wrap)
 		m.markAcked(msg)
-		return
+		return nil
 	}
 	// a message we already stored (a resend in a new wrap, or the copy on another relay) costs no rate limit
 	// tokens: it is only acked again, because the sender resends until one of our acks arrives
 	if m.db.Has(bucketInbox, inner.ID) {
 		m.seen(wrap)
 		m.queueAck(msg, false)
-		return
+		return nil
 	}
 	if m.isCounterparty(msg.From, msg.OrderID) {
 		if !m.parties.allow(msg.From+"|"+msg.OrderID, time.Now()) {
 			m.log.Warn("counterparty flooding its order, dropping", "from", short(msg.From), "order", msg.OrderID, "type", typ)
-			return
+			return ErrRateLimited
 		}
 	} else {
 		// §4.10: what no role takes from a stranger is neither stored nor acked. The wrap is not remembered as seen,
 		// so that it is looked at again at the next reconnect (the order may exist by then).
 		if m.accepts != nil && !m.accepts(msg) {
 			m.log.Debug("not accepted from a non-counterparty, dropping", "from", short(msg.From), "type", typ, "order", msg.OrderID)
-			return
+			return ErrNotAccepted
 		}
 		// not remembered as seen either: the sender's resend (or this wrap at our next reconnect) gets another chance
 		now := time.Now()
 		if !m.senders.allow(inner.PubKey, now) {
 			m.log.Debug("sender over the rate limit, dropping", "from", short(inner.PubKey), "type", typ)
-			return
+			return ErrRateLimited
 		}
 		if !m.strangers.allow("", now) {
 			m.log.Debug("non-counterparty senders over the global rate limit, dropping", "from", short(inner.PubKey), "type", typ)
-			return
+			return ErrRateLimited
 		}
 	}
 	// store before acking and before handling, so that neither a crash nor a full queue loses it
@@ -624,16 +713,20 @@ func (m *Messenger) receive(ctx context.Context, relay string, wrap *nostr.Event
 		if ctx.Err() == nil { // at shutdown the store closes before the subscriptions end
 			m.log.Error("store inbox", "err", err)
 		}
-		return
+		return ErrStore
 	}
 	m.seen(wrap)
 	m.remember(msg.From, msg.OrderID)
+	if fresh && m.observe != nil {
+		m.observe(msg)
+	}
 	m.queueAck(msg, fresh)
 	if !fresh {
-		return
+		return nil
 	}
-	m.log.Info("received", "type", typ, "from", short(inner.PubKey), "order", msg.OrderID, "relay", relay)
+	m.log.Info("received", "type", typ, "from", short(inner.PubKey), "order", msg.OrderID, "via", relay)
 	m.disp.enqueue(msg)
+	return nil
 }
 
 func (m *Messenger) seen(wrap *nostr.Event) { _ = m.db.Put(bucketWraps, wrap.ID, time.Now().Unix()) }
@@ -705,7 +798,7 @@ func (m *Messenger) queueAck(msg *Message, fresh bool) {
 	if m.hints != nil {
 		hints = m.hints(msg)
 	}
-	if msg.Relay != "" && !slices.Contains(hints, msg.Relay) {
+	if msg.Relay != "" && msg.Relay != ViaP2P && !slices.Contains(hints, msg.Relay) {
 		hints = append(hints, msg.Relay)
 	}
 	m.ackMu.Lock()

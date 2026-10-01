@@ -32,3 +32,32 @@ func TestRequestCommitsToTheEscrowKey(t *testing.T) {
 		t.Fatalf("request: %s", data)
 	}
 }
+
+func TestReplyP2PValidate(t *testing.T) {
+	const id = "16Uiu2HAmE2FwVbZbrdbXNM6UsSRZwM4tQJ696kUmfpCNXYuz5HSa"
+	const relay = "16Uiu2HAmFngaVFK4D5fix5qN2c6guh3LNyBkmuB42vTFW9aaeDZh"
+	ok := []P2PContact{
+		{PeerID: id},
+		{PeerID: id, Addrs: []string{"/dns4/r.example/tcp/443/tls/ws/p2p/" + relay + "/p2p-circuit/p2p/" + id, "/ip4/1.2.3.4/tcp/4001"}},
+	}
+	for _, c := range ok {
+		if err := c.Validate(); err != nil {
+			t.Errorf("%+v: %v", c, err)
+		}
+	}
+	many := P2PContact{PeerID: id}
+	for i := 0; i <= MaxReplyP2PAddrs; i++ {
+		many.Addrs = append(many.Addrs, "/ip4/1.2.3.4/tcp/4001")
+	}
+	bad := []P2PContact{
+		{PeerID: "nope"},
+		{PeerID: id, Addrs: []string{"not a multiaddr"}},
+		{PeerID: id, Addrs: []string{"/ip4/1.2.3.4/tcp/4001/p2p/" + relay}},
+		many,
+	}
+	for _, c := range bad {
+		if err := c.Validate(); err == nil {
+			t.Errorf("%+v accepted", c)
+		}
+	}
+}

@@ -5,7 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 
+	"github.com/libp2p/go-libp2p/core/peer"
+	ma "github.com/multiformats/go-multiaddr"
 	"github.com/nbd-wtf/go-nostr"
 
 	"github.com/pad01g/proxy-shopping-go/node/internal/evm"
@@ -90,6 +94,42 @@ type OrderRequest struct {
 	UserBTCAddress string   `json:"user_btc_address,omitempty"`
 	UserEVMAddress string   `json:"user_evm_address,omitempty"`
 	Relays         []string `json:"relays,omitempty"`
+	// ReplyP2P is the user's libp2p address (§4.4, §10), signed with the request.
+	ReplyP2P *P2PContact `json:"reply_p2p,omitempty"`
+}
+
+// P2PContact is a libp2p address: the reply_p2p of an order.request (§4.4).
+type P2PContact struct {
+	PeerID string   `json:"peer_id"`
+	Addrs  []string `json:"addrs"`
+}
+
+// MaxReplyP2PAddrs bounds the addresses of a reply_p2p.
+const MaxReplyP2PAddrs = 8
+
+// Validate checks a reply_p2p: a libp2p peer id, and at most MaxReplyP2PAddrs multiaddrs (each at most 1024
+// bytes) that end in that peer id when they end in one.
+func (c *P2PContact) Validate() error {
+	id, err := peer.Decode(c.PeerID)
+	if err != nil {
+		return fmt.Errorf("reply_p2p.peer_id: %w", err)
+	}
+	if len(c.Addrs) > MaxReplyP2PAddrs {
+		return fmt.Errorf("reply_p2p has %d addrs, at most %d", len(c.Addrs), MaxReplyP2PAddrs)
+	}
+	for _, s := range c.Addrs {
+		if len(s) > 1024 {
+			return errors.New("reply_p2p address longer than 1024 bytes")
+		}
+		a, err := ma.NewMultiaddr(s)
+		if err != nil {
+			return fmt.Errorf("reply_p2p address %q: %w", s, err)
+		}
+		if _, last := peer.SplitAddr(a); last != "" && last != id {
+			return fmt.Errorf("reply_p2p address %q is not of peer %s", s, c.PeerID)
+		}
+	}
+	return nil
 }
 
 type Price struct {

@@ -5,8 +5,10 @@ package p2p
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -34,7 +36,9 @@ type Options struct {
 	Relays       []string // static circuit relays
 	Reachability string   // auto | public | private
 	RelayService bool     // run a circuit relay v2 service
-	Log          *slog.Logger
+	// TLS is the client configuration of WSS dials (/tls/ws, /wss): the lab adds its CA. nil: the system roots.
+	TLS *tls.Config
+	Log *slog.Logger
 }
 
 // Host is a running libp2p host.
@@ -47,6 +51,9 @@ type Host struct {
 	mu       sync.RWMutex
 	reach    network.Reachability
 	reserved map[peer.ID]time.Time // relay → expiry of our reservation
+	extra    []peer.AddrInfo       // relays added at run time (p2p_relays of the lists, §2.3)
+	runCtx   context.Context       // of Start, for the loops of added relays
+	changed  chan struct{}         // signalled (coalesced) when the reservations change
 }
 
 func parseAddrInfos(list []string) ([]peer.AddrInfo, error) {
@@ -86,7 +93,7 @@ func NewHost(o Options) (*Host, error) {
 		libp2p.Identity(o.Key),
 		listen,
 		libp2p.Transport(tcp.NewTCPTransport),
-		libp2p.Transport(websocket.New),
+		libp2p.Transport(websocket.New, websocket.WithTLSClientConfig(wssConfig(o.TLS))),
 		libp2p.EnableRelay(),
 		libp2p.EnableHolePunching(),
 		libp2p.EnableNATService(),
@@ -118,16 +125,30 @@ func NewHost(o Options) (*Host, error) {
 	if err != nil {
 		return nil, fmt.Errorf("libp2p host: %w", err)
 	}
-	ph := &Host{Host: h, log: o.Log.With("component", "p2p"), bootstrap: boot, relays: relays, reach: reach, reserved: map[peer.ID]time.Time{}}
+	ph := &Host{Host: h, log: o.Log.With("component", "p2p"), bootstrap: boot, relays: relays, reach: reach, reserved: map[peer.ID]time.Time{}, changed: make(chan struct{}, 1)}
 	ph.log.Info("libp2p host started", "peer_id", h.ID().String(), "addrs", h.Addrs(), "relay_service", o.RelayService)
 	return ph, nil
 }
 
+// wssConfig is the TLS client configuration of WSS dials; the websocket transport sets the server name per dial.
+func wssConfig(c *tls.Config) *tls.Config {
+	if c == nil {
+		return &tls.Config{MinVersion: tls.VersionTLS12}
+	}
+	c = c.Clone()
+	c.ServerName = ""
+	return c
+}
+
 // Start keeps connections to the bootstrap peers and relays and tracks reachability.
 func (h *Host) Start(ctx context.Context) {
+	h.mu.Lock()
+	h.runCtx = ctx
+	extra := slices.Clone(h.extra) // relays added later start their own loops
+	h.mu.Unlock()
 	go h.watchReachability(ctx)
 	seen := map[peer.ID]bool{}
-	for _, list := range [][]peer.AddrInfo{h.bootstrap, h.relays} {
+	for _, list := range [][]peer.AddrInfo{h.bootstrap, h.relays, extra} {
 		for _, p := range list {
 			if seen[p.ID] || p.ID == h.ID() {
 				continue
@@ -136,7 +157,7 @@ func (h *Host) Start(ctx context.Context) {
 			go h.keepConnected(ctx, p)
 		}
 	}
-	for _, r := range h.relays {
+	for _, r := range append(slices.Clone(h.relays), extra...) {
 		if r.ID != h.ID() {
 			go h.reserveLoop(ctx, r)
 		}
@@ -154,12 +175,22 @@ func (h *Host) reserveLoop(ctx context.Context, r peer.AddrInfo) {
 			cancel()
 			if err != nil {
 				h.log.Debug("relay reservation failed", "relay", r.ID, "err", err)
+				h.mu.Lock()
+				lapsed := !h.reserved[r.ID].IsZero() && time.Now().After(h.reserved[r.ID])
+				if lapsed {
+					delete(h.reserved, r.ID)
+				}
+				h.mu.Unlock()
+				if lapsed {
+					h.signal()
+				}
 			} else {
 				h.mu.Lock()
-				first := h.reserved[r.ID].IsZero()
+				first := h.reserved[r.ID].IsZero() || time.Now().After(h.reserved[r.ID])
 				h.reserved[r.ID] = res.Expiration
 				h.mu.Unlock()
 				if first {
+					h.signal()
 					h.log.Info("reserved a slot on relay", "relay", r.ID, "until", res.Expiration.Format(time.RFC3339))
 				}
 				wait = min(max(time.Until(res.Expiration)-2*time.Minute, 30*time.Second), 5*time.Minute)
@@ -172,12 +203,96 @@ func (h *Host) reserveLoop(ctx context.Context, r peer.AddrInfo) {
 	}
 }
 
+// signal tells the watchers of Changes that our addresses may have changed.
+func (h *Host) signal() {
+	select {
+	case h.changed <- struct{}{}:
+	default:
+	}
+}
+
+// Changes is signalled (coalesced) when a relay reservation was made anew, so that the profile carrying our
+// addresses can be published again (§3, §12).
+func (h *Host) Changes() <-chan struct{} { return h.changed }
+
+// allRelaysLocked lists the configured and the added relays (h.mu held).
+func (h *Host) allRelaysLocked() []peer.AddrInfo {
+	out := make([]peer.AddrInfo, 0, len(h.relays)+len(h.extra))
+	out = append(out, h.relays...)
+	return append(out, h.extra...)
+}
+
+// AddRelays dials, keeps connected and reserves on further relays (the p2p_relays of the effective lists, §2.3),
+// like the configured p2p.relays. Addresses that do not parse, ourselves and relays already known are skipped. It
+// returns how many were added. It may be called before or after Start.
+func (h *Host) AddRelays(addrs []string) int {
+	var infos []peer.AddrInfo
+	for _, s := range addrs {
+		info, err := peer.AddrInfoFromString(strings.TrimSpace(s))
+		if err != nil {
+			h.log.Debug("ignoring a p2p relay address", "addr", s, "err", err)
+			continue
+		}
+		infos = append(infos, *info)
+	}
+	h.mu.Lock()
+	var added []peer.AddrInfo
+	for _, info := range infos {
+		if info.ID == h.ID() {
+			continue
+		}
+		known := false
+		for i, r := range h.allRelaysLocked() {
+			if r.ID == info.ID {
+				known = true
+				// another address of a known relay: remember it (the circuit addresses list every one)
+				for _, a := range info.Addrs {
+					if !slices.ContainsFunc(r.Addrs, a.Equal) {
+						if i < len(h.relays) {
+							h.relays[i].Addrs = append(h.relays[i].Addrs, a)
+						} else {
+							h.extra[i-len(h.relays)].Addrs = append(h.extra[i-len(h.relays)].Addrs, a)
+						}
+						h.Peerstore().AddAddr(info.ID, a, peerstore.PermanentAddrTTL)
+					}
+				}
+				break
+			}
+		}
+		if !known {
+			h.extra = append(h.extra, info)
+			added = append(added, info)
+		}
+	}
+	ctx := h.runCtx
+	h.mu.Unlock()
+	for _, info := range added {
+		h.log.Info("added a p2p relay from the lists", "relay", info.ID, "addrs", info.Addrs)
+		if ctx != nil {
+			go h.keepConnected(ctx, info)
+			go h.reserveLoop(ctx, info)
+		}
+	}
+	return len(added)
+}
+
+// Relays lists the peer ids of the configured and added relays.
+func (h *Host) Relays() []peer.ID {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	var out []peer.ID
+	for _, r := range h.allRelaysLocked() {
+		out = append(out, r.ID)
+	}
+	return out
+}
+
 // CircuitAddrs lists the circuit addresses of our current relay reservations.
 func (h *Host) CircuitAddrs() []string {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	var out []string
-	for _, r := range h.relays {
+	for _, r := range h.allRelaysLocked() {
 		if time.Now().After(h.reserved[r.ID]) || h.Network().Connectedness(r.ID) != network.Connected {
 			continue
 		}
@@ -258,7 +373,10 @@ func (h *Host) ConnectPeer(ctx context.Context, id peer.ID) error {
 	if h.Network().Connectedness(id) == network.Connected {
 		return nil
 	}
-	for _, r := range h.relays {
+	h.mu.RLock()
+	relays := h.allRelaysLocked()
+	h.mu.RUnlock()
+	for _, r := range relays {
 		circuit, err := ma.NewMultiaddr("/p2p/" + r.ID.String() + "/p2p-circuit")
 		if err != nil {
 			continue

@@ -61,6 +61,15 @@ func (e *Engine) onRequest(ctx context.Context, msg *messenger.Message) {
 		ID: msg.OrderID, User: msg.From, Created: time.Now().Unix(), Request: req, Relays: req.Relays,
 		Events: map[string]*nostr.Event{"request": msg.Inner},
 	}
+	if req.ReplyP2P != nil {
+		// optional: a bad one only costs the P2P path, replies go to the mailbox (§4.2)
+		if err := req.ReplyP2P.Validate(); err != nil {
+			e.log.Info("ignoring the reply_p2p of a request", "order", msg.OrderID, "err", err)
+			o.note("reply_p2p ignored: " + err.Error())
+		} else {
+			o.ReplyP2P = req.ReplyP2P
+		}
+	}
 	o.set(StateRequested, "")
 	o.addPending(ActQuote, &Action{})
 	// an order id is used once; a repeated request of the same user gets the stored answer again

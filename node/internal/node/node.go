@@ -61,7 +61,11 @@ type Node struct {
 	msgr  *messenger.Messenger
 
 	inboxes  *inboxCache
+	contacts *contactCache // reply_p2p of order requests (§4.4)
+	failed   directFailed  // recent failed P2P deliveries
 	debounce time.Duration // of the bridge (BridgeDebounce at New)
+	ownMu    sync.Mutex    // one publishOwn at a time
+	addrWait time.Duration // AddrRepublishInterval at New
 
 	esplora *btc.Esplora
 	evm     *evm.Client
@@ -89,7 +93,7 @@ func New(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Node, erro
 	if log == nil {
 		log = slog.Default()
 	}
-	n := &Node{cfg: cfg, log: log.With("node", cfg.Name, "role", cfg.Role), debounce: BridgeDebounce}
+	n := &Node{cfg: cfg, log: log.With("node", cfg.Name, "role", cfg.Role), debounce: BridgeDebounce, addrWait: AddrRepublishInterval}
 	var err error
 	if n.keys, err = keys.LoadMnemonicFile(cfg.MnemonicFile); err != nil {
 		return nil, err
@@ -118,6 +122,7 @@ func New(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Node, erro
 	}
 	n.pool = nostrnet.NewPoolWith(nostrnet.Options{TLS: n.tls, Log: n.log, AllowPrivate: cfg.Nostr.AllowPrivateRelays})
 	n.inboxes = newInboxCache(n.trust, n.pool, func() []string { return n.cfg.Nostr.Relays })
+	n.contacts = newContactCache()
 
 	key, err := n.keys.Libp2pKey()
 	if err != nil {
@@ -125,7 +130,7 @@ func New(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Node, erro
 	}
 	n.host, err = p2p.NewHost(p2p.Options{
 		Key: key, Listen: cfg.P2P.Listen, Bootstrap: cfg.P2P.Bootstrap, Relays: cfg.P2P.Relays,
-		Reachability: cfg.P2P.Reachability, RelayService: cfg.Role == config.RoleRelay, Log: n.log,
+		Reachability: cfg.P2P.Reachability, RelayService: cfg.Role == config.RoleRelay, TLS: n.tls, Log: n.log,
 	})
 	if err != nil {
 		return nil, err
@@ -148,11 +153,14 @@ func New(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Node, erro
 	if cfg.Role != config.RoleRelay {
 		n.msgr, err = messenger.New(messenger.Config{
 			Secret: n.keys.NostrSecretHex(), Pool: n.pool, DB: n.db, Inbox: cfg.Nostr.Relays, K: cfg.Nostr.K,
-			Resolve: n.inboxes.resolve, Retry: n.hasOrderWith, Accepts: n.accepts, Hints: n.hints, Log: n.log,
+			Resolve: n.inboxes.resolve, Retry: n.hasOrderWith, Accepts: n.accepts, Hints: n.hints,
+			Direct: n.sendDirect, Observe: n.observe, Log: n.log,
 		})
 		if err != nil {
 			return nil, err
 		}
+		// §4.2, §10: wraps over libp2p go into the same pipeline as those from the relays
+		n.p2p.HandleMessages(n.keys.NostrPubHex(), n.receiveDirect)
 	}
 	if err := n.buildRole(); err != nil {
 		return nil, err
@@ -266,6 +274,10 @@ func (n *Node) Run(ctx context.Context) error {
 	n.pauseMu.Unlock()
 	go n.publishOwnLoop(ctx)
 	go n.bundleLoop(ctx)
+	go n.addrLoop(ctx)
+	if n.cfg.Role != config.RoleRelay {
+		go n.p2pRelaysLoop(ctx)
+	}
 
 	id := n.host.ID().String()
 	n.log.Info("psnode running", "pubkey", n.keys.NostrPubHex(), "peer_id", id, "admin", n.cfg.Admin.Listen)
@@ -446,6 +458,8 @@ func contains(list []string, s string) bool {
 }
 
 func (n *Node) publishOwn(ctx context.Context) error {
+	n.ownMu.Lock()
+	defer n.ownMu.Unlock()
 	sk := n.keys.NostrSecretHex()
 	if n.msgr != nil && len(n.cfg.Nostr.Relays) > 0 {
 		if err := n.publishVersioned(ctx, "10050", n.cfg.Nostr.Relays, func(v int64) (*nostr.Event, error) {
